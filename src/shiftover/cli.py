@@ -246,7 +246,68 @@ def cmd_init(ns) -> int:
     print(f"wrote {path}")
     for a in cfg.ordered():
         print(f"  {a.name:<12} {a.dir:<22} {a.email or t('not_logged_in')}" + ("  (main)" if a.name == cfg.main else ""))
-    print("next: `shiftover install`, then add `eval \"$(shiftover shell-init)\"` to your shell rc")
+    print("next: `shiftover setup` does the rest (or `shiftover install` + `eval \"$(shiftover shell-init)\"` by hand)")
+    return 0
+
+
+def cmd_setup(ns) -> int:
+    path = paths.config_file()
+    existing = config.load_or_none(path)
+    cfg = existing or config.Config(lang=i18n.system_lang())
+    i18n.set_lang(cfg.lang)
+    added = config.merge_discovered(cfg)
+    accts = cfg.ordered() if cfg.accounts else []
+    if not accts:
+        return _err(t("setup_found_none"))
+    print(t("setup_found_1") if len(accts) == 1 else t("setup_found", n=len(accts)))
+    print()
+    name_w = max(len(a.name) for a in accts)
+    email_w = max(len(a.email or t("not_logged_in")) for a in accts)
+    for i, a in enumerate(accts, 1):
+        tag = f"  ({t('setup_new')})" if a in added and existing else ""
+        print(f"  {i}. {a.name:<{name_w}}   {(a.email or t('not_logged_in')):<{email_w}}   ({a.dir}){tag}")
+    print()
+    main = cfg.resolve(ns.main) if ns.main else None
+    if not main:
+        cur = cfg.main_account()
+        default = accts.index(cur) + 1 if cur in accts else 1
+        if sys.stdin.isatty() and len(accts) > 1:
+            print(t("setup_ask"))
+            while True:
+                try:
+                    raw = input(t("setup_ask_prompt", default=default)).strip()
+                except EOFError:
+                    raw = ""
+                main = accts[default - 1] if not raw else cfg.resolve(raw)
+                if main:
+                    break
+                print(t("setup_not_account", raw=raw))
+            print()
+        else:
+            main = accts[default - 1]
+    cfg.main = main.name
+    config.save(cfg, path)
+    backup = None
+    if not ns.no_install:
+        report = installer.install(cfg)
+        backup = next((r.split("backup ", 1)[1] for r in report if "backup " in r), None)
+    shell_state = None if ns.no_shell else installer.ensure_shell_init(installer.shell_rc())
+    print(t("setup_done"))
+    bullets = [t("setup_b_claude", main=main.name)]
+    if len(accts) > 1:
+        bullets += [t("setup_b_handoff", main=main.name), t("setup_b_inside")]
+    bullets.append(t("setup_b_status"))
+    if backup:
+        bullets.append(t("setup_b_settings", backup=backup))
+    for b in bullets:
+        print(f"  • {b}")
+    print()
+    if shell_state == "unsupported":
+        print(t("setup_shell_manual", line=installer.SHELL_LINE))
+    if len(accts) < 2:
+        print(t("setup_one_account"))
+    print(t("setup_open_tab"))
+    print(t("setup_more"))
     return 0
 
 
@@ -449,6 +510,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check accounts, sharing, hooks, MCP registration")
 
+    s = sub.add_parser("setup", help="one-shot setup: scan accounts, ask for the main one, install, wire the shell")
+    s.add_argument("--main", help="main account (skips the question)")
+    s.add_argument("--no-install", action="store_true")
+    s.add_argument("--no-shell", action="store_true")
+
     s = sub.add_parser("init", help="create the config from existing ~/.claude* dirs")
     s.add_argument("--import", dest="do_import", action="store_true", help="(default) discover existing config dirs")
     s.add_argument("--main", help="name of the main account")
@@ -531,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     if ns.cmd == "map" and ns.action == "add" and not ns.account:
         p.error("map add DIR ACCOUNT")
     handlers = {
-        "status": cmd_status, "doctor": cmd_doctor, "init": cmd_init, "add": cmd_add, "remove": cmd_remove,
+        "status": cmd_status, "doctor": cmd_doctor, "init": cmd_init, "setup": cmd_setup, "add": cmd_add, "remove": cmd_remove,
         "install": cmd_install, "uninstall": cmd_uninstall, "shell-init": cmd_shell_init, "map": cmd_map,
         "sync-mcp": cmd_sync_mcp, "handoff": cmd_handoff, "jobs": cmd_jobs, "usage": cmd_usage,
     }

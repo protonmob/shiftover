@@ -196,23 +196,43 @@ def discover_dirs() -> list[Path]:
     return out
 
 
-def default_name(d: Path) -> str:
-    if claude.is_default(d):
-        return "main"
-    n = d.name[len(".claude-"):] if d.name.startswith(".claude-") else d.name.lstrip(".")
-    return n or "account"
+def default_name(d: Path, email: str = "", taken=()) -> str:
+    """The email's local part reads better in `/handoff yusa` than a directory suffix."""
+    import re
+    local = re.sub(r"[^a-z0-9]+", "-", (email.split("@")[0] if email else "").lower()).strip("-")
+    base = local or ("main" if claude.is_default(d) else (d.name[len(".claude-"):] if d.name.startswith(".claude-") else d.name.lstrip(".")) or "account")
+    name, i = base, 2
+    while name in taken:
+        name, i = f"{base}{i}", i + 1
+    return name
 
 
 def import_existing(names: dict[str, str] | None = None, main: str | None = None) -> Config:
     names = {str(claude.norm(k)): v for k, v in (names or {}).items()}
     cfg = Config()
     for d in discover_dirs():
-        name = names.get(str(claude.norm(d))) or default_name(d)
+        em = claude.email(d)
+        name = names.get(str(claude.norm(d))) or default_name(d, em, cfg.accounts)
         home = str(Path.home())
         shown = "~" + str(d)[len(home):] if str(d).startswith(home) else str(d)
-        cfg.accounts[name] = Account(name=name, dir=shown, email=claude.email(d))
+        cfg.accounts[name] = Account(name=name, dir=shown, email=em)
     if main and main in cfg.accounts:
         cfg.main = main
     elif cfg.accounts:
         cfg.main = next((a.name for a in cfg.accounts.values() if claude.is_default(a.path)), next(iter(cfg.accounts)))
     return cfg
+
+
+def merge_discovered(cfg: Config) -> list[Account]:
+    """Adds signed-in dirs the config does not know yet; returns the new accounts."""
+    added = []
+    for d in discover_dirs():
+        if cfg.by_dir(d):
+            continue
+        em = claude.email(d)
+        name = default_name(d, em, cfg.accounts)
+        home = str(Path.home())
+        shown = "~" + str(d)[len(home):] if str(d).startswith(home) else str(d)
+        cfg.accounts[name] = Account(name=name, dir=shown, email=em)
+        added.append(cfg.accounts[name])
+    return added

@@ -1,5 +1,6 @@
 """Wires shiftover into Claude Code: hooks, status line, the MCP server, the /handoff command and the skill."""
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -110,13 +111,16 @@ def _read_settings(p: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _write_settings(p: Path, data: dict) -> None:
+def _write_settings(p: Path, data: dict) -> Path | None:
     paths.ensure_dir(p.parent, 0o755)
+    backup = None
     if p.exists():
-        shutil.copy2(p, p.with_name(f"{p.name}.bak-shiftover-{time.strftime('%Y%m%d-%H%M%S')}"))
+        backup = p.with_name(f"{p.name}.bak-shiftover-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(p, backup)
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(p.resolve() if p.exists() else p)
+    return backup
 
 
 def _mcp_registered(d) -> bool:
@@ -170,7 +174,9 @@ def install(cfg: Config, dry_run: bool = False, with_mcp: bool = True, with_file
             report.append(f"config: statusline.wrap = {previous}")
         report.append(f"{p}: " + "; ".join(changes))
         if not dry_run:
-            _write_settings(p, data)
+            backup = _write_settings(p, data)
+            if backup:
+                report.append(f"{p}: backup {backup}")
     if with_mcp:
         for a in cfg.ordered():
             if _mcp_registered(a.path):
@@ -253,3 +259,32 @@ def installed_state(cfg: Config) -> dict:
     for d in _file_targets(cfg, "skills"):
         state["skills"][str(d)] = (d / "shiftover" / "SKILL.md").exists()
     return state
+
+
+SHELL_LINE = 'eval "$(shiftover shell-init)"'
+
+
+def shell_rc() -> Path | None:
+    shell = Path(os.environ.get("SHELL", "")).name
+    if shell == "zsh":
+        return Path.home() / ".zshrc"
+    if shell == "bash":
+        prof = Path.home() / ".bash_profile"
+        return prof if sys.platform == "darwin" and prof.exists() else Path.home() / ".bashrc"
+    return None
+
+
+def ensure_shell_init(rc: Path | None = None) -> str:
+    """Returns 'added', 'present' or 'unsupported'."""
+    rc = rc or shell_rc()
+    if rc is None:
+        return "unsupported"
+    try:
+        text = rc.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    if "shiftover shell-init" in text:
+        return "present"
+    with open(rc, "a", encoding="utf-8") as f:
+        f.write(("" if text.endswith("\n") or not text else "\n") + "# shiftover: route `claude` through the account pool\n" + SHELL_LINE + "\n")
+    return "added"

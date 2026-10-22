@@ -29,6 +29,23 @@ STRINGS = {
         "no_claude": "claude binary not found on PATH (set SHIFTOVER_CLAUDE_BIN)",
         "no_config": "no config yet: run `shiftover init --import`",
         "disabled": "(disabled)",
+        "setup_found": "I found {n} Claude Code accounts on this machine:",
+        "setup_found_1": "I found one Claude Code account on this machine:",
+        "setup_found_none": "No signed-in Claude Code account found (looked in ~/.claude and ~/.claude-*).\nRun `claude` once, sign in, then run `shiftover setup` again.",
+        "setup_new": "new",
+        "setup_ask": "Which one is your main account?\n`claude` will always open it; the others step in when it runs out of usage.",
+        "setup_ask_prompt": "Main account [{default}]: ",
+        "setup_not_account": "  {raw} is not one of the accounts above — type a number or a name.",
+        "setup_done": "Done. What changed:",
+        "setup_b_claude": "`claude` opens {main}. `cl` lets you pick an account by hand.",
+        "setup_b_handoff": "When {main} runs out, your conversation continues on another account by itself.",
+        "setup_b_inside": "Inside Claude: type /handoff to switch, or ask Claude to \"delegate\" a task to another account.",
+        "setup_b_status": "The status line shows how much of each account is used.",
+        "setup_b_settings": "Your Claude settings were backed up first ({backup}).",
+        "setup_shell_manual": "I could not find your shell's startup file. Add this line to it yourself:\n  {line}",
+        "setup_one_account": "Only one account so far: switching needs a second one. `shiftover add <name>` signs one in; then run `shiftover setup` again.",
+        "setup_open_tab": "Open a new terminal tab to start.",
+        "setup_more": "`shiftover status` shows all accounts.  `shiftover uninstall` undoes everything.",
     },
     "tr": {
         "col_account": "HESAP",
@@ -58,8 +75,35 @@ STRINGS = {
         "no_claude": "claude PATH'te bulunamadı (SHIFTOVER_CLAUDE_BIN ayarla)",
         "no_config": "config yok: `shiftover init --import` çalıştır",
         "disabled": "(kapalı)",
+        "setup_found": "Bu bilgisayarda {n} Claude Code hesabı buldum:",
+        "setup_found_1": "Bu bilgisayarda 1 Claude Code hesabı buldum:",
+        "setup_found_none": "Giriş yapılmış Claude Code hesabı bulamadım (~/.claude ve ~/.claude-* dizinlerine baktım).\nBir kez `claude` çalıştırıp giriş yap, sonra `shiftover setup` komutunu tekrar çalıştır.",
+        "setup_new": "yeni",
+        "setup_ask": "Hangisi ana hesabın?\n`claude` her zaman onu açar; limiti dolunca diğerleri devreye girer.",
+        "setup_ask_prompt": "Ana hesap [{default}]: ",
+        "setup_not_account": "  {raw} yukarıdaki hesaplardan değil — numara ya da ad yaz.",
+        "setup_done": "Bitti. Ne değişti:",
+        "setup_b_claude": "`claude` artık {main} ile açılır. `cl` ile elle hesap seçersin.",
+        "setup_b_handoff": "{main} dolunca konuşman kendiliğinden başka hesapta devam eder.",
+        "setup_b_inside": "Claude içinde: /handoff ile hesap değiştir, ya da Claude'dan bir işi başka hesaba \"delegate\" etmesini iste.",
+        "setup_b_status": "Durum satırında her hesabın ne kadarının kullanıldığını görürsün.",
+        "setup_b_settings": "Önce Claude ayarlarının yedeği alındı ({backup}).",
+        "setup_shell_manual": "Kabuğunun başlangıç dosyasını bulamadım. Şu satırı kendin ekle:\n  {line}",
+        "setup_one_account": "Şimdilik tek hesap var: geçiş için ikinci hesap gerekir. `shiftover add <ad>` ile giriş yap, sonra `shiftover setup` komutunu tekrar çalıştır.",
+        "setup_open_tab": "Başlamak için yeni bir terminal sekmesi aç.",
+        "setup_more": "`shiftover status` tüm hesapları gösterir.  `shiftover uninstall` her şeyi geri alır.",
     },
 }
+
+
+def system_lang() -> str:
+    """Picks the UI language from the OS locale when no config exists yet."""
+    import os
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        v = os.environ.get(var, "")
+        if v:
+            return "tr" if v.lower().startswith("tr") else "en"
+    return "en"
 
 
 def set_lang(lang: str | None) -> None:

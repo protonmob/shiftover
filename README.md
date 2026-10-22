@@ -1,23 +1,62 @@
 # shiftover
 
-Pool several Claude Code subscriptions on one machine. Your main account always drives; when it runs out of room the
-*same conversation* continues on another account, and from inside any session Claude can hand self-contained work to
-another account with the model and effort you choose.
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
+[![No dependencies](https://img.shields.io/badge/dependencies-none-success)](pyproject.toml)
+[![Claude Code ≥ 2.1.224](https://img.shields.io/badge/Claude%20Code-%E2%89%A5%202.1.224-8A63D2)](https://docs.claude.com/en/docs/claude-code)
+[![MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
-- **Main first.** `claude` opens your main account. If one of its windows is full, it opens the account with the most
-  headroom and says why in one line. Model-aware: `--model opus` looks at each account's Opus window.
-- **Hand-off, not restart.** At the end of a turn, when the active account crosses a threshold or hits a rate limit, the
-  conversation is resumed on the next account with the same history, model and effort. `/handoff [account] [model] [effort]`
-  does it on demand.
-- **Delegate.** An MCP server gives Claude three tools: `accounts`, `delegate` and `monitor`. A delegate is a headless
-  Claude Code run on another account; its answer comes back into the calling session, long jobs run in the background.
-- **Tips.** When it matters, Claude gets one factual line such as *account X has used 88% of its 5-hour window; Y has 80%
-  headroom*, and passes it on to you. The status line shows the active account and its windows all the time.
-- **Quality of life.** Directory → account map, `sync-mcp` to copy local MCP server definitions between accounts,
-  `doctor`, an arrow-key picker, English or Turkish messages.
+**Several Claude Code accounts on one Mac, used like one.** Your main account always drives. When it runs out of
+usage, the *same conversation* continues on the next account by itself. From inside any session, Claude can hand a heavy
+task to another account with the model and effort you choose, and bring the answer back.
 
-Everything runs locally. No credentials are copied, moved or shared: each account lives in its own `CLAUDE_CONFIG_DIR`
-and spends its own quota.
+```mermaid
+flowchart LR
+    you([you]) -->|"claude"| main["main account"]
+    main -.->|"usage limit reached<br/>same conversation continues"| second["second account"]
+    main -->|"delegate: heavy task,<br/>any model / effort"| third["third account"]
+    third -->|"result"| main
+    style main fill:#8A63D2,color:#fff,stroke:none
+    style second fill:#2d333b,color:#fff,stroke:none
+    style third fill:#2d333b,color:#fff,stroke:none
+```
+
+Everything runs locally and nothing is copied between accounts: each one keeps its own sign-in, its own directory and
+its own quota. shiftover only decides which one `claude` starts and keeps the conversation moving.
+
+## Install
+
+```bash
+pipx install git+https://github.com/protonmob/shiftover   # or: uv tool install git+https://github.com/protonmob/shiftover
+shiftover setup
+```
+
+`setup` finds every signed-in account, asks one question, wires everything and tells you what changed:
+
+<p align="center"><img src="docs/setup.svg" alt="shiftover setup output" width="820"></p>
+
+Open a new terminal tab afterwards; `claude` now goes through shiftover. Don't have a second account directory yet?
+`shiftover add work` creates `~/.claude-work`, shares your skills, settings and sessions with it, and opens the sign-in.
+Run `shiftover setup` again when an account is added or removed; every step is idempotent.
+
+## What you'll see
+
+**Hand-off.** At the end of a turn, when the active account is at the threshold (95 % by default) or Claude Code
+reports a rate limit, the conversation is resumed on the account with the most room, same history, same model, same
+effort. One line tells you it happened. `/handoff [account] [model] [effort]` does it on demand.
+
+<p align="center"><img src="docs/handoff.svg" alt="a conversation continuing on another account" width="820"></p>
+
+**Delegate.** Claude gets three tools (`accounts`, `delegate`, `monitor`). A delegate is a headless Claude Code run on
+another account; the answer comes back into your session, long jobs run in the background.
+
+<p align="center"><img src="docs/delegate.svg" alt="delegating a task to another account" width="820"></p>
+
+**Tips and status.** When it matters, Claude hears one factual line, such as *alex has used 88 % of its 5-hour window;
+spare has 80 % room*, and passes it on. The status line always shows the active account and its windows
+(`alex 5h 78% wk 41%`). `shiftover status` prints every account.
+
+**Quality of life.** Directory → account rules, `sync-mcp` to copy local MCP servers between accounts, `doctor`, an
+arrow-key picker (`cl`), English or Turkish messages.
 
 ## Requirements
 
@@ -26,31 +65,25 @@ and spends its own quota.
 - Python ≥ 3.11 (`pipx` or `uv` bring their own)
 - Two or more claude.ai accounts you own, each signed into its own config directory
 
-## Install
-
-```bash
-pipx install git+https://github.com/protonmob/shiftover   # or: uv tool install git+https://github.com/protonmob/shiftover
-shiftover init --import           # finds ~/.claude and ~/.claude-* and writes ~/.config/shiftover/config.toml
-shiftover install                 # hooks + status line + MCP server + /handoff + skill (backs up settings.json first)
-echo 'eval "$(shiftover shell-init)"' >> ~/.zshrc   # `claude` now goes through the pool; `cl` opens the picker
-shiftover doctor
-```
-
-Don't have a second account directory yet?
-
-```bash
-shiftover add second              # creates ~/.claude-second, shares skills/settings/sessions with main, opens the sign-in
-```
-
-Restart any open Claude Code sessions afterwards so they pick up the hooks.
-
 ## How it works
 
-```
-shiftover run  ──spawns──▶  claude (CLAUDE_CONFIG_DIR=<account>)
-      ▲                        │ status line → sessions/<sid>.json  (rate_limits, model)      official data
-      │ SIGUSR1                │ Stop / StopFailure hook → "hand off to <account>"             official hooks
-      └────────────────────────┘ resumes `claude --resume <sid>` under the next account
+Under the hood `setup` does four things: installs four hooks and a status-line command into Claude Code's
+`settings.json` (backed up first), registers the `shiftover` MCP server in every account, copies the `/handoff` command
+and a skill, and adds `eval "$(shiftover shell-init)"` to your shell rc so that `claude` runs `shiftover run`.
+The pieces are available separately as `shiftover init --import`, `shiftover install` and `shiftover shell-init`.
+
+```mermaid
+sequenceDiagram
+    participant W as shiftover run
+    participant A as claude (main)
+    participant H as hooks + status line
+    participant B as claude (second)
+    W->>A: start with CLAUDE_CONFIG_DIR=~/.claude
+    A-->>H: after each reply: 5h 96 % used
+    H->>H: Stop hook: over threshold → pick the account with the most room
+    H-->>W: hand-off request (SIGUSR1)
+    W->>A: SIGTERM, waits for a clean exit
+    W->>B: claude --resume <session> with the same model and effort
 ```
 
 - The status line Claude Code already renders carries `rate_limits.five_hour` / `seven_day` for the active account.
@@ -73,7 +106,8 @@ shiftover run  ──spawns──▶  claude (CLAUDE_CONFIG_DIR=<account>)
 | `shiftover run [--menu] [-a ACCOUNT] [claude args…]` | what the `claude` shell function calls; `--menu` shows the picker, `SHIFTOVER_ACCOUNT=name` forces an account |
 | `shiftover status [--refresh] [--json]` | accounts with their windows |
 | `shiftover doctor` | sign-in drift, shared directories, hooks, MCP registration, shell wiring |
-| `shiftover init --import [--main NAME] [--name DIR=NAME…]` | create the config from existing directories |
+| `shiftover setup [--main NAME] [--no-install] [--no-shell]` | scan, pick the main account, install, wire the shell |
+| `shiftover init --import [--main NAME] [--name DIR=NAME…]` | create the config only |
 | `shiftover add NAME [--dir D] [--no-share] [--main]` / `remove NAME` | manage account directories |
 | `shiftover install [--dry-run]` / `uninstall` | wire into / out of Claude Code |
 | `shiftover handoff [ACCOUNT] [--model M] [--effort E]` | what `/handoff` runs; takes effect when the turn ends |

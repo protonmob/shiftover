@@ -21,10 +21,28 @@ def test_roundtrip(home):
 
 def test_import_existing_discovers_dirs(home):
     cfg = config.import_existing({"~/.claude-second": "work"}, main=None)
-    assert set(cfg.accounts) == {"main", "work", "third"}
-    assert cfg.main == "main"
+    assert set(cfg.accounts) == {"one", "work", "three"}
+    assert cfg.main == "one"
     assert cfg.accounts["work"].email == "two@example.com"
     assert cfg.accounts["work"].dir == "~/.claude-second"
+
+
+def test_names_come_from_emails_and_stay_unique(home):
+    from pathlib import Path
+    assert config.default_name(Path("~/.claude"), "Kadir.Aktas@example.com") == "kadir-aktas"
+    assert config.default_name(Path("~/.claude-x"), "", ()) == "x"
+    assert config.default_name(Path("~/.claude"), "one@example.com", ("one",)) == "one2"
+
+
+def test_merge_discovered_adds_only_new_dirs(home):
+    cfg = config.load()
+    assert config.merge_discovered(cfg) == []
+    import json
+    d = home / ".claude-fourth"
+    d.mkdir()
+    (d / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "four@example.com"}}))
+    added = config.merge_discovered(cfg)
+    assert [a.name for a in added] == ["four"] and cfg.accounts["four"].dir == "~/.claude-fourth"
 
 
 def test_import_skips_dirs_without_login(home):

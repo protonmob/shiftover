@@ -47,3 +47,29 @@ def test_share_symlinks(home):
     assert "skills" in linked and (new / "skills").is_symlink()
     assert (new / "projects").is_symlink() and (main / "projects").is_dir()
     assert "settings.json" in linked
+
+
+def test_ensure_shell_init_is_idempotent(home):
+    rc = home / ".zshrc"
+    rc.write_text("export A=1")
+    assert install.ensure_shell_init(rc) == "added"
+    assert install.ensure_shell_init(rc) == "present"
+    assert rc.read_text().count("shiftover shell-init") == 1 and rc.read_text().startswith("export A=1\n")
+
+
+def test_setup_asks_only_for_main(home, fake_claude, monkeypatch, capsys):
+    from shiftover import cli
+    monkeypatch.setattr(install, "exe", lambda: "/opt/shiftover")
+    monkeypatch.setattr(install, "_mcp_add", lambda acct, exe_path, dry_run: "Added")
+    (home / ".config" / "shiftover" / "config.toml").unlink()
+    rc = home / ".zshrc"
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setattr("sys.stdin", type("T", (), {"isatty": staticmethod(lambda: True)})())
+    monkeypatch.setattr("builtins.input", lambda prompt: "2")
+    assert cli.main(["setup"]) == 0
+    out = capsys.readouterr().out
+    assert "I found 3 Claude Code account" in out and "`claude` opens two." in out and "backed up" in out
+    cfg = config.load()
+    assert cfg.main == "two" and set(cfg.accounts) == {"one", "two", "three"}
+    assert "shiftover shell-init" in rc.read_text()
+    assert (home / ".claude" / "commands" / "handoff.md").exists()
