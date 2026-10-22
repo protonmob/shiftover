@@ -32,6 +32,14 @@ def _current(cfg, st: dict):
     return cfg.resolve(os.environ.get("SHIFTOVER_ACCOUNT")) or (cfg.by_dir(st.get("dir")) if st.get("dir") else None) or cfg.by_dir(claude.current_dir())
 
 
+def _effort(data: dict) -> str | None:
+    """Hook payloads carry effort either as a plain level or as an object describing it."""
+    e = data.get("effort")
+    if isinstance(e, dict):
+        e = e.get("level") or e.get("value") or e.get("effort")
+    return e if isinstance(e, str) and e else None
+
+
 def _over(cfg, rl: dict) -> str:
     reasons = []
     for key, lab in (("five_hour", "5h window"), ("seven_day", "weekly window")):
@@ -44,6 +52,8 @@ def _over(cfg, rl: dict) -> str:
 def _switch(cfg, rd, st: dict, reason: str, effort: str | None, target_name: str = "", model: str | None = None) -> None:
     cur = _current(cfg, st)
     model = model or (st.get("model") or {}).get("id")
+    if not isinstance(model, str):
+        model = None
     family = usage.model_family(model)
     target = cfg.accounts.get(target_name) if target_name else None
     if target is None:
@@ -65,14 +75,14 @@ def stop(data: dict) -> None:
     st = runstate.session_state(sid)
     pending = paths.read_json(rd / "pending.json")
     if pending:
-        _switch(cfg, rd, st, pending.get("reason") or "manual hand-off", pending.get("effort") or data.get("effort"),
+        _switch(cfg, rd, st, pending.get("reason") or "manual hand-off", pending.get("effort") or _effort(data),
                 pending.get("target") or "", pending.get("model"))
         return
     if cfg.handoff_mode != "auto":
         return
     reason = _over(cfg, st.get("rate_limits") or {})
     if reason:
-        _switch(cfg, rd, st, reason, data.get("effort"))
+        _switch(cfg, rd, st, reason, _effort(data))
 
 
 def stop_failure(data: dict) -> None:
@@ -83,7 +93,7 @@ def stop_failure(data: dict) -> None:
     if not rd or not cfg or cfg.handoff_mode != "auto":
         return
     sid = data.get("session_id") or runstate.session_id(rd)
-    _switch(cfg, rd, runstate.session_state(sid), "rate limit reached", data.get("effort"))
+    _switch(cfg, rd, runstate.session_state(sid), "rate limit reached", _effort(data))
 
 
 def _best_other(cfg, cur_name: str, family: str | None):

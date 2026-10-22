@@ -43,7 +43,7 @@ def test_stop_hands_off_over_threshold(home, monkeypatch):
     paths.write_json(paths.sessions_dir() / "sid-1.json", {"dir": str(home / ".claude"), "model": {"id": "claude-fable-5-1"},
                                                            "rate_limits": {"five_hour": {"used_percentage": 97, "resets_at": 0}}})
     _usage_cache(home, {"main": 97, "second": 80, "third": 20})
-    hooks.stop({"session_id": "sid-1", "effort": "max"})
+    hooks.stop({"session_id": "sid-1", "effort": {"level": "max", "source": "session"}})
     req = paths.read_json(rd / "handoff.json")
     assert req["target"] == "third" and req["model"] == "claude-fable-5-1" and req["effort"] == "max"
     assert "5h window 97%" in req["reason"]

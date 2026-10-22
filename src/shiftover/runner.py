@@ -71,6 +71,31 @@ def spawn(acct: Account, args: list[str], extra_env: dict | None = None, interac
             signal.signal(sig, h)
 
 
+def pretrust(src: Account, dst: Account, cwd: str) -> bool:
+    """Folder trust lives per config dir; without this the resumed session opens on the trust dialog."""
+    import json
+    src_cfg = claude.read_config_json(src.path)
+    entry = (src_cfg.get("projects") or {}).get(cwd) or {}
+    if not entry.get("hasTrustDialogAccepted"):
+        return False
+    cj = claude.config_json(dst.path)
+    dst_cfg = paths.read_json(cj, None)
+    if not isinstance(dst_cfg, dict):
+        return False
+    projects = dst_cfg.setdefault("projects", {})
+    if (projects.get(cwd) or {}).get("hasTrustDialogAccepted"):
+        return False
+    projects.setdefault(cwd, {})["hasTrustDialogAccepted"] = True
+    tmp = cj.with_name(cj.name + ".shiftover-tmp")
+    try:
+        tmp.write_text(json.dumps(dst_cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, cj)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
+
+
 def resume_args(flags: list[str], sid: str, model: str | None, effort: str | None) -> list[str]:
     out = list(flags)
     if model:
@@ -127,12 +152,14 @@ def run(cfg: Config, acct: Account, args: list[str], interactive: bool | None = 
                     print(t("handoff_line", src=cur.name, reason=req.get("reason", ""), dst=target.name,
                             detail=f" ({detail})" if detail else ""), file=sys.stderr)
                     paths.write_json(rdir / "notice.json", {"src": cur.name, "dst": target.name, "reason": req.get("reason", "")})
+                    pretrust(cur, target, os.getcwd())
                     cur_args = resume_args(flags, sid, req.get("model"), req.get("effort"))
                     cur = target
                     continue
             if cfg.handoff_mode == "ask" and sid and _has_transcript(cfg, sid):
                 target = _ask_switch(cfg, cur)
                 if target:
+                    pretrust(cur, target, os.getcwd())
                     cur_args = resume_args(flags, sid, None, None)
                     cur = target
                     continue
