@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shiftover"
+version = "0.1.0"
+description = "Pool several Claude Code subscriptions on one machine: main account first, automatic hand-off when a limit is hit, delegate work to other accounts from inside a session."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Kadir Aktaş" }]
+keywords = ["claude", "claude-code", "accounts", "rate-limit", "mcp"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/kadiraktastr/shiftover"
+
+[project.scripts]
+shiftover = "shiftover.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+shiftover = ["resources/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
