@@ -10,8 +10,13 @@ windows. The session you are in runs on one of them; the others can do work for 
 
 ## Delegate a task (MCP server `shiftover`)
 
-- `accounts()` lists every account with its usage windows and headroom. Call it before choosing an account by hand;
-  `delegate(account="auto")` already picks the account with the most headroom for the requested model.
+- `accounts()` lists every account with its usage windows and headroom, and the Codex CLI backend when it is installed.
+  Call it before choosing an account by hand; `delegate(account="auto")` already picks the account with the most
+  headroom for the requested model. Accounts marked `pinned` are kept out of the pool on purpose: never use them unless
+  the user names one.
+- `delegate(account="codex")` runs the task on the OpenAI Codex CLI (its own subscription, no Claude quota). Good for a
+  second opinion, a review, or when every Claude account is low. `permission_mode` becomes Codex's sandbox;
+  `allowed_tools`, `mcp` and `max_budget_usd` do not apply there.
 - `delegate(prompt, account="auto", model=None, effort=None, cwd=None, background=False, wait_seconds=90,
   permission_mode="default", allowed_tools=[], mcp="none", json_schema=None, max_budget_usd=None, resume_session_id=None,
   label=None)` runs a headless Claude Code session on that account and returns its answer.

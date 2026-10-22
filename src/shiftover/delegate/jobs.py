@@ -1,4 +1,4 @@
-"""Headless `claude -p` runs on another account, tracked as jobs on disk."""
+"""Headless `claude -p` (or `codex exec`) runs on another account, tracked as jobs on disk."""
 import json
 import os
 import secrets
@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 
 from .. import claude, paths
 from ..config import Account
+from . import codex
 
 _procs: dict[str, subprocess.Popen] = {}
 RESULT_MAX = 8000
@@ -37,6 +38,8 @@ class Job:
     permission_denials: list = field(default_factory=list)
     mcp_file: str = ""
     prompt_chars: int = 0
+    backend: str = "claude"
+    usage: dict | None = None
 
 
 def _p(job_id: str, ext: str):
@@ -73,7 +76,7 @@ def purge(max_age: float = 86400.0) -> int:
     for j in list_all():
         refresh(j)
         if j.status != "running" and time.time() - (j.finished or j.started) > max_age:
-            for ext in ("json", "out", "err"):
+            for ext in ("json", "out", "err", "last", "schema"):
                 _p(j.id, ext).unlink(missing_ok=True)
             n += 1
     return n
@@ -115,26 +118,60 @@ def start(acct: Account, prompt: str, *, model=None, effort=None, cwd=None, perm
         raise RuntimeError("claude binary not found")
     job = Job(id=new_id(), account=acct.name, dir=str(acct.path), model=model, effort=effort,
               cwd=str(cwd or os.getcwd()), label=label or "", started=time.time(), prompt_chars=len(prompt))
-    if mcp_servers:
-        f = paths.tmp_dir() / f"mcp-{job.id}.json"
-        paths.write_json(f, {"mcpServers": mcp_servers})
-        job.mcp_file = str(f)
+    # An explicit (possibly empty) strict config is the only way to keep user/project servers out.
+    f = paths.tmp_dir() / f"mcp-{job.id}.json"
+    paths.write_json(f, {"mcpServers": mcp_servers or {}})
+    job.mcp_file = str(f)
     env = claude.env_for(acct.path, {"SHIFTOVER_DEPTH": "1", "SHIFTOVER_ACCOUNT": acct.name,
                                      "SHIFTOVER_ACCOUNT_DIR": str(acct.path)})
-    for k in ("SHIFTOVER_RUN_ID", "SHIFTOVER_PID"):
-        env.pop(k, None)
     args = build_args(model=model, effort=effort, permission_mode=permission_mode, allowed_tools=allowed_tools,
                       json_schema=json_schema, max_budget_usd=max_budget_usd, resume_session_id=resume_session_id,
                       label=label, mcp_file=job.mcp_file)
+    return _launch(job, [binary, *args], env, prompt)
+
+
+def start_codex(binary: str, prompt: str, *, model=None, effort=None, cwd=None, permission_mode=None, json_schema=None,
+                resume_session_id=None, label="") -> Job:
+    job = Job(id=new_id(), account="codex", dir="", model=model, effort=effort, cwd=str(cwd or os.getcwd()),
+              label=label or "", started=time.time(), prompt_chars=len(prompt), backend="codex")
     paths.ensure_dir(paths.jobs_dir())
-    out = open(_p(job.id, "out"), "wb")
-    err = open(_p(job.id, "err"), "wb")
+    schema_file = None
+    if json_schema:
+        schema_file = _p(job.id, "schema")
+        paths.write_json(schema_file, json_schema)
+    args = codex.build_args(model=model, effort=effort, cwd=job.cwd, permission_mode=permission_mode,
+                            resume_session_id=resume_session_id, last_message_file=_p(job.id, "last"), schema_file=schema_file)
+    env = dict(os.environ)
+    for k in ("SHIFTOVER_RUN_ID", "SHIFTOVER_PID", "CLAUDE_CONFIG_DIR"):
+        env.pop(k, None)
+    env["SHIFTOVER_DEPTH"] = "1"
+    return _launch(job, [binary, *args], env, prompt)
+
+
+def _private_file(path):
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb")
+
+
+def _launch(job: Job, argv: list[str], env: dict, prompt: str) -> Job:
+    for k in ("SHIFTOVER_RUN_ID", "SHIFTOVER_PID"):
+        env.pop(k, None)
+    paths.ensure_dir(paths.jobs_dir())
+    out = _private_file(_p(job.id, "out"))
+    err = _private_file(_p(job.id, "err"))
     try:
-        proc = subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=out, stderr=err,
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err,
                                 cwd=job.cwd, env=env, start_new_session=True)
-    finally:
+    except OSError as e:
         out.close()
         err.close()
+        job.status, job.error, job.finished = "failed", f"cannot start {argv[0]}: {e}", time.time()
+        _cleanup(job)
+        save(job)
+        return job
+    finally:
+        if not out.closed:
+            out.close()
+            err.close()
     job.pid = proc.pid
     _procs[job.id] = proc
     try:
@@ -146,22 +183,69 @@ def start(acct: Account, prompt: str, *, model=None, effort=None, cwd=None, perm
     return job
 
 
+def _command_of(pid: int) -> str:
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def alive(job: Job) -> bool:
     proc = _procs.get(job.id)
     if proc is not None:
         return proc.poll() is None
-    return bool(job.pid) and claude.pid_alive(job.pid)
+    if not job.pid or not claude.pid_alive(job.pid):
+        return False
+    # After a restart the pid may belong to anything; only our own backend binary counts.
+    return job.backend in _command_of(job.pid) or "claude" in _command_of(job.pid)
 
 
 def _tail(path, n=2000) -> str:
     try:
-        data = path.read_bytes()
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            data = f.read()
     except OSError:
         return ""
-    return data[-n:].decode("utf-8", "replace").strip()
+    return data.decode("utf-8", "replace").strip()
+
+
+def _cleanup(job: Job) -> None:
+    if job.mcp_file:
+        try:
+            os.unlink(job.mcp_file)
+        except OSError:
+            pass
+        job.mcp_file = ""
+    _procs.pop(job.id, None)
+
+
+def _finalize_codex(job: Job) -> Job:
+    ev = codex.parse_events(_tail(_p(job.id, "out"), 50_000_000))
+    job.session_id = ev["session_id"] or job.session_id
+    job.result = ev["result"]
+    if not job.result:
+        job.result = _tail(_p(job.id, "last"), 50_000_000)
+    job.num_turns = ev["turns"] or None
+    job.usage = ev["usage"]
+    if job.status != "cancelled":
+        job.status = "failed" if (ev["error"] and not job.result) else "done"
+    if ev["error"]:
+        job.error = ev["error"]
+    elif job.status == "failed":
+        job.error = _tail(_p(job.id, "err")) or "no output"
+    job.finished = job.finished or time.time()
+    job.duration_ms = int((job.finished - job.started) * 1000)
+    _cleanup(job)
+    save(job)
+    return job
 
 
 def finalize(job: Job) -> Job:
+    if job.backend == "codex":
+        return _finalize_codex(job)
     raw = _tail(_p(job.id, "out"), 50_000_000)
     data = None
     try:
@@ -175,7 +259,11 @@ def finalize(job: Job) -> Job:
                 continue
     if isinstance(data, dict):
         job.session_id = data.get("session_id") or job.session_id
-        job.result = data.get("result") if isinstance(data.get("result"), str) else json.dumps(data.get("result"))
+        structured = data.get("structured_output")
+        if structured is not None:
+            job.result = json.dumps(structured, ensure_ascii=False)
+        else:
+            job.result = data.get("result") if isinstance(data.get("result"), str) else json.dumps(data.get("result"))
         job.cost_usd = data.get("total_cost_usd")
         job.num_turns = data.get("num_turns")
         job.duration_ms = data.get("duration_ms")
@@ -190,13 +278,7 @@ def finalize(job: Job) -> Job:
             job.status = "failed"
         job.error = _tail(_p(job.id, "err")) or (raw[-2000:] if raw else "no output")
     job.finished = job.finished or time.time()
-    if job.mcp_file:
-        try:
-            os.unlink(job.mcp_file)
-        except OSError:
-            pass
-        job.mcp_file = ""
-    _procs.pop(job.id, None)
+    _cleanup(job)
     save(job)
     return job
 
@@ -224,33 +306,49 @@ def wait(job: Job, seconds: float) -> Job:
     return refresh(job)
 
 
-def cancel(job: Job) -> Job:
-    if job.status == "running" and alive(job):
+def _signal_group(job: Job, sig) -> None:
+    # The job started its own session, so its pid is the process group: children go with it.
+    try:
+        os.killpg(job.pid, sig)
+    except OSError:
         try:
-            os.kill(job.pid, signal.SIGTERM)
+            os.kill(job.pid, sig)
         except OSError:
             pass
+
+
+def cancel(job: Job) -> Job:
+    refresh(job)
+    if job.status == "running" and alive(job):
+        _signal_group(job, signal.SIGTERM)
         job.status = "cancelled"
-        time.sleep(0.5)
+        deadline = time.time() + 3
+        while alive(job) and time.time() < deadline:
+            time.sleep(0.1)
         if alive(job):
-            try:
-                os.kill(job.pid, signal.SIGKILL)
-            except OSError:
-                pass
+            _signal_group(job, signal.SIGKILL)
             time.sleep(0.2)
+        proc = _procs.get(job.id)
+        if proc is not None:
+            try:
+                proc.wait(1)
+            except subprocess.TimeoutExpired:
+                pass
         finalize(job)
     return job
 
 
 def summary(job: Job, max_chars: int = RESULT_MAX) -> dict:
     d = {
-        "job_id": job.id, "status": job.status, "account": job.account, "model": job.model, "effort": job.effort,
-        "label": job.label, "cwd": job.cwd, "session_id": job.session_id,
+        "job_id": job.id, "status": job.status, "account": job.account, "backend": job.backend, "model": job.model,
+        "effort": job.effort, "label": job.label, "cwd": job.cwd, "session_id": job.session_id,
         "elapsed_s": round((job.finished or time.time()) - job.started, 1),
     }
     if job.status != "running":
         d.update({"cost_usd": job.cost_usd, "num_turns": job.num_turns, "duration_ms": job.duration_ms,
                   "permission_denials": job.permission_denials})
+        if job.usage:
+            d["usage"] = job.usage
         res = job.result or ""
         if len(res) > max_chars:
             d["result"] = res[:max_chars]

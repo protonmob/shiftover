@@ -47,10 +47,16 @@ def eligible(row: dict, family: str | None = None) -> bool:
 
 
 def choose(cfg: Config, rows: list[dict], prefer=None, family: str | None = None, exclude=()) -> tuple[dict | None, str]:
-    """First account in order that is logged in and not at 100% on any applicable window."""
+    """First account in order that is logged in and not at 100% on any applicable window.
+    A pinned account (pool = false) is opened as asked, full or not: it exists to stay separate."""
     order = [r for r in rows if r["name"] not in exclude]
     if prefer:
-        order = [r for r in order if r["name"] == prefer] + [r for r in order if r["name"] != prefer]
+        pinned = next((r for r in order if r["name"] == prefer and not r["account"].pool), None)
+        if pinned:
+            return pinned, t("opening", name=pinned["name"], summary=summary(pinned) if "limits" in pinned else t("no_limit_info"))
+        order = [r for r in order if r["name"] == prefer] + [r for r in order if r["name"] != prefer and r["account"].pool]
+    else:
+        order = [r for r in order if r["account"].pool]
     known = [r for r in order if "limits" in r and eligible(r, family)]
     unknown = [r for r in order if r.get("email") and "limits" not in r and eligible(r, family)]
     if not known:
@@ -78,7 +84,7 @@ def choose(cfg: Config, rows: list[dict], prefer=None, family: str | None = None
 
 
 def best(cfg: Config, rows: list[dict], family: str | None = None, exclude=(), min_headroom: float = 0.0) -> dict | None:
-    cands = [r for r in rows if r["name"] not in exclude and "limits" in r and eligible(r, family)
+    cands = [r for r in rows if r["name"] not in exclude and r["account"].pool and "limits" in r and eligible(r, family)
              and not usage.blocking(r["limits"], family)]
     cands = [r for r in cands if usage.headroom(r["limits"], family) > min_headroom]
     if not cands:

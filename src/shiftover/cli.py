@@ -149,6 +149,14 @@ def cmd_status(ns) -> int:
     ui.render(rows, sys.stdout)
     for w in pick.warnings(cfg, rows):
         print((Y + w + R) if _color(sys.stdout) else w)
+    pinned = [a.name for a in cfg.ordered() if not a.pool]
+    if pinned:
+        print((D + f"kept out of the pool: {', '.join(pinned)}" + R) if _color(sys.stdout) else f"kept out of the pool: {', '.join(pinned)}")
+    from .delegate import codex
+    cx = codex.binary(cfg)
+    if cx:
+        line = f"codex: {codex.version(cx) or 'installed'} · delegate(account=\"codex\")"
+        print((D + line + R) if _color(sys.stdout) else line)
     return 0
 
 
@@ -164,6 +172,11 @@ def cmd_doctor(ns) -> int:
     cfg = _cfg()
     problems = 0
     print(f"config: {cfg.path}  ({len(cfg.accounts)} accounts, main = {cfg.main})")
+    learned = config.adopt_emails(cfg)
+    if learned:
+        config.save(cfg)
+        for a in learned:
+            _ok(f"{a.name}: recorded {a.email} from its sign-in")
     b = claude.claude_bin()
     if b:
         _ok(f"claude: {b} ({claude.version() or 'version unknown'})")
@@ -183,12 +196,22 @@ def cmd_doctor(ns) -> int:
             problems += 1
         else:
             _ok(f"{a.name}: {r.get('email')} · {pick.summary(r)}")
+        if not a.pool:
+            _ok(f"{a.name}: kept out of the pool (opened only on request)")
         if main and a.name != main.name:
-            shared = [i for i in installer.SHARED if (a.path / i).is_symlink()]
-            missing = [i for i in ("projects", "settings.json", "skills", "commands") if not (a.path / i).is_symlink()]
-            if missing:
-                _warn(f"{a.name}: not shared with {main.name}: {', '.join(missing)}"
-                      + (" (cross-account resume needs a shared projects dir)" if "projects" in missing else ""))
+            def _same(item):
+                try:
+                    return (a.path / item).resolve() == (main.path / item).resolve() and (main.path / item).exists()
+                except OSError:
+                    return False
+            shared = [i for i in installer.SHARED if _same(i)]
+            missing = [i for i in ("projects", "settings.json", "skills", "commands") if not _same(i)]
+            if "projects" in missing and a.pool:
+                _warn(f"{a.name}: projects/ is not shared with {main.name}, so a conversation cannot continue there "
+                      f"(`ln -s {main.path / 'projects'} {a.path / 'projects'}` after moving the old folder aside)")
+                problems += 1
+            elif missing:
+                _warn(f"{a.name}: not shared with {main.name}: {', '.join(missing)}")
             elif shared:
                 _ok(f"{a.name}: shares {len(shared)} items with {main.name}")
     for w in pick.warnings(cfg, rows):
@@ -204,23 +227,27 @@ def cmd_doctor(ns) -> int:
             _ok(f"{p}: hooks installed")
         if not st["statusline"].get(p):
             _warn(f"{p}: status line not routed through shiftover (run `shiftover install`)")
+            problems += 1
     for name, reg in st["mcp"].items():
         (_ok if reg else _warn)(f"mcp {name}: {'registered' if reg else 'not registered (run `shiftover install`)'}")
         problems += 0 if reg else 1
     for d, have in st["commands"].items():
-        (_ok if have else _warn)(f"{d}/handoff.md {'present' if have else 'missing'}")
+        (_ok if have else _warn)(f"{d}/handoff.md {'present' if have else 'missing (run `shiftover install`)'}")
+        problems += 0 if have else 1
     for d, have in st["skills"].items():
-        (_ok if have else _warn)(f"{d}/shiftover/SKILL.md {'present' if have else 'missing'}")
+        (_ok if have else _warn)(f"{d}/shiftover/SKILL.md {'present' if have else 'missing (run `shiftover install`)'}")
+        problems += 0 if have else 1
     rc = ""
     for f in ("~/.zshrc", "~/.bashrc", "~/.bash_profile", "~/.config/fish/config.fish"):
-        p = Path(os.path.expanduser(f))
-        try:
-            if "shiftover shell-init" in p.read_text(encoding="utf-8"):
-                rc = f
-                break
-        except OSError:
-            continue
+        if installer.shell_wired(Path(os.path.expanduser(f))):
+            rc = f
+            break
     (_ok if rc else _warn)(f"shell: {'`claude` routed via ' + rc if rc else 'add `eval \"$(shiftover shell-init)\"` to your shell rc'}")
+    problems += 0 if rc else 1
+    from .delegate import codex
+    cx = codex.binary(cfg)
+    if cx:
+        _ok(f"codex: {cx} ({codex.version(cx) or 'version unknown'}) available as delegate target \"codex\"")
     print("ok" if not problems else f"{problems} problem(s)")
     return 0 if not problems else 1
 
@@ -250,7 +277,16 @@ def cmd_init(ns) -> int:
     return 0
 
 
+def _parse_picks(raw: str, cfg: Config) -> tuple[list[Account], list[str]]:
+    picks, bad = [], []
+    for tok in raw.replace(",", " ").split():
+        a = cfg.resolve(tok)
+        (picks if a else bad).append(a or tok)
+    return picks, bad
+
+
 def cmd_setup(ns) -> int:
+    from .delegate import codex
     path = paths.config_file()
     existing = config.load_or_none(path)
     cfg = existing or config.Config(lang=i18n.system_lang())
@@ -267,44 +303,86 @@ def cmd_setup(ns) -> int:
         tag = f"  ({t('setup_new')})" if a in added and existing else ""
         print(f"  {i}. {a.name:<{name_w}}   {(a.email or t('not_logged_in')):<{email_w}}   ({a.dir}){tag}")
     print()
-    main = cfg.resolve(ns.main) if ns.main else None
-    if not main:
+    names = ", ".join(a.name for a in accts)
+    interactive = sys.stdin.isatty() and len(accts) > 1
+    main = None
+    if ns.main:
+        main = cfg.resolve(ns.main)
+        if not main:
+            return _err(t("setup_bad_main", raw=ns.main, names=names))
+    elif interactive:
         cur = cfg.main_account()
         default = accts.index(cur) + 1 if cur in accts else 1
-        if sys.stdin.isatty() and len(accts) > 1:
-            print(t("setup_ask"))
-            while True:
-                try:
-                    raw = input(t("setup_ask_prompt", default=default)).strip()
-                except EOFError:
-                    raw = ""
-                main = accts[default - 1] if not raw else cfg.resolve(raw)
-                if main:
-                    break
-                print(t("setup_not_account", raw=raw))
-            print()
-        else:
-            main = accts[default - 1]
+        print(t("setup_ask"))
+        while True:
+            try:
+                raw = input(t("setup_ask_prompt", default=default)).strip()
+            except EOFError:
+                raw = ""
+            main = accts[default - 1] if not raw else cfg.resolve(raw)
+            if main:
+                break
+            print(t("setup_not_account", raw=raw))
+        print()
+    elif len(accts) > 1 and not existing:
+        print(t("setup_noninteractive"))
+        return 2
+    else:
+        main = cfg.main_account() or accts[0]
     cfg.main = main.name
+    if interactive and not ns.main:
+        print(t("setup_ask_out"))
+        while True:
+            try:
+                raw = input(t("setup_ask_out_prompt")).strip()
+            except EOFError:
+                raw = ""
+            picks, bad = _parse_picks(raw, cfg)
+            if bad:
+                print(t("setup_not_account", raw=", ".join(bad)))
+                continue
+            if main in picks:
+                print(t("setup_main_out", name=main.name))
+                continue
+            if raw:
+                for a in accts:
+                    a.pool = a not in picks
+            break
+        print()
     config.save(cfg, path)
-    backup = None
+    backup, mcp_failed, mcp_err = None, [], ""
     if not ns.no_install:
-        report = installer.install(cfg)
+        try:
+            report = installer.install(cfg)
+        except installer.InstallError as e:
+            return _err(str(e))
         backup = next((r.split("backup ", 1)[1] for r in report if "backup " in r), None)
+        for r in report:
+            if r.startswith("mcp ") and ": failed: " in r:
+                mcp_failed.append(r[4:].split(":", 1)[0])
+                mcp_err = r.split(": failed: ", 1)[1]
     shell_state = None if ns.no_shell else installer.ensure_shell_init(installer.shell_rc())
+    pinned = [a for a in accts if not a.pool]
     print(t("setup_done"))
     bullets = [t("setup_b_claude", main=main.name)]
-    if len(accts) > 1:
+    if len([a for a in accts if a.pool]) > 1:
         bullets += [t("setup_b_handoff", main=main.name), t("setup_b_inside")]
+    if pinned:
+        bullets.append(t("setup_b_pinned", names=", ".join(a.name for a in pinned), first=pinned[0].name))
     bullets.append(t("setup_b_status"))
+    cx = codex.binary(cfg)
+    if cx and not ns.no_install:
+        bullets.append(t("setup_b_codex", version=codex.version(cx) or "installed"))
     if backup:
         bullets.append(t("setup_b_settings", backup=backup))
     for b in bullets:
         print(f"  • {b}")
     print()
+    if mcp_failed:
+        print(t("setup_warn_mcp", names=", ".join(mcp_failed), err=mcp_err))
     if shell_state == "unsupported":
         print(t("setup_shell_manual", line=installer.SHELL_LINE))
-    if len(accts) < 2:
+    if len([a for a in accts if a.pool]) < 2:
         print(t("setup_one_account"))
     print(t("setup_open_tab"))
     print(t("setup_more"))
@@ -317,7 +395,7 @@ def cmd_add(ns) -> int:
     if name in cfg.accounts:
         return _err(f"account {name} already exists")
     d = claude.norm(ns.dir or f"~/.claude-{name}")
-    paths.ensure_dir(d, 0o755)
+    d.mkdir(parents=True, exist_ok=True)
     main = cfg.main_account()
     if main and not ns.no_share and main.path != d:
         linked = installer.share(main.path, d)
@@ -329,13 +407,22 @@ def cmd_add(ns) -> int:
             return _err(t("no_claude"))
         print(f"signing in {name} ({d}) — a browser window opens; use the account you want in this slot")
         subprocess.call([b, "auth", "login"], env=claude.env_for(d))
-    home = str(Path.home())
-    shown = "~" + str(d)[len(home):] if str(d).startswith(home) else str(d)
+        if not claude.email(d):
+            print(f"⚠ sign-in did not complete; the slot stays empty until you run: CLAUDE_CONFIG_DIR={d} claude /login")
+    shown = config.shown_dir(d)
     cfg.accounts[name] = Account(name=name, dir=shown, email=ns.email or claude.email(d))
+    cfg.ignore = [i for i in cfg.ignore if claude.norm(i) != d]
     if ns.main or not cfg.main:
         cfg.main = name
     config.save(cfg)
     print(f"added {name}: {shown} {cfg.accounts[name].email or t('not_logged_in')}")
+    if main and any(installer.installed_state(cfg)["statusline"].values()):
+        try:
+            for line in installer.install(cfg, with_files=False):
+                if line.startswith(f"mcp {name}"):
+                    print(line)
+        except installer.InstallError as e:
+            print(f"⚠ {e}")
     return 0
 
 
@@ -347,8 +434,11 @@ def cmd_remove(ns) -> int:
     if cfg.main == ns.name:
         cfg.main = next(iter(cfg.accounts), "")
     cfg.map = {k: v for k, v in cfg.map.items() if v != ns.name}
+    if a.dir not in cfg.ignore:
+        cfg.ignore.append(a.dir)
     config.save(cfg)
-    print(f"removed {ns.name} from the config (directory {a.dir} untouched)")
+    print(f"removed {ns.name}: {a.dir} is out of the pool and stays out when setup runs again (directory untouched; "
+          f"`shiftover add` brings it back)")
     return 0
 
 
@@ -356,7 +446,11 @@ def cmd_remove(ns) -> int:
 
 def cmd_install(ns) -> int:
     cfg = _cfg()
-    for line in installer.install(cfg, dry_run=ns.dry_run, with_mcp=not ns.no_mcp, with_files=not ns.no_files):
+    try:
+        report = installer.install(cfg, dry_run=ns.dry_run, with_mcp=not ns.no_mcp, with_files=not ns.no_files)
+    except installer.InstallError as e:
+        return _err(str(e))
+    for line in report:
         print(("would: " if ns.dry_run else "") + line)
     if not ns.dry_run:
         print("restart open claude sessions to pick up the hooks")
@@ -365,7 +459,11 @@ def cmd_install(ns) -> int:
 
 def cmd_uninstall(ns) -> int:
     cfg = _cfg()
-    for line in installer.uninstall(cfg, dry_run=ns.dry_run):
+    try:
+        report = installer.uninstall(cfg, dry_run=ns.dry_run)
+    except installer.InstallError as e:
+        return _err(str(e))
+    for line in report:
         print(("would: " if ns.dry_run else "") + line)
     return 0
 
@@ -373,10 +471,11 @@ def cmd_uninstall(ns) -> int:
 def cmd_shell_init(ns) -> int:
     lines = ["# shiftover: route `claude` through the account pool",
              "if command -v shiftover >/dev/null 2>&1; then",
+             "  unalias claude claude-status cl 2>/dev/null",
              '  claude() { shiftover run "$@"; }',
              '  claude-status() { shiftover status "$@"; }']
     if not ns.no_cl:
-        lines.append('  cl() { if [ -n "$1" ] && [ -d "$1" ]; then local _d="$1"; shift; shiftover run --menu -C "$_d" "$@"; '
+        lines.append('  cl() { if [ -n "${1-}" ] && [ -d "${1-}" ]; then local _d="$1"; shift; shiftover run --menu -C "$_d" "$@"; '
                      'else shiftover run --menu "$@"; fi; }')
     lines.append("fi")
     print("\n".join(lines))
@@ -430,10 +529,7 @@ def cmd_sync_mcp(ns) -> int:
             continue
         print(f"{a.name}: {'would add' if ns.dry_run else 'added'} {', '.join(added)}")
         if not ns.dry_run:
-            paths.ensure_dir(cj.parent, 0o755)
-            tmp = cj.with_name(cj.name + ".tmp")
-            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            tmp.replace(cj)
+            installer.write_json_preserving(cj, data)
     return 0
 
 

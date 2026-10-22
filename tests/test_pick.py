@@ -65,3 +65,15 @@ def test_dir_map_and_resolve(home):
     assert cfg.resolve("thi").name == "third"
     assert cfg.resolve("two@").name == "second"
     assert cfg.resolve("nope") is None
+
+
+def test_pinned_account_is_never_an_automatic_target(home):
+    from shiftover import config, pick
+    cfg = config.load()
+    cfg.accounts["third"].pool = False
+    rs = rows(cfg, {"main": {"session": 100}, "second": {"session": 100}, "third": {"session": 0}})
+    assert pick.best(cfg, rs, exclude=("main",)) is None
+    row, msg = pick.choose(cfg, rs, prefer="third")
+    assert row["name"] == "third"
+    row, msg = pick.choose(cfg, rs, prefer="main")
+    assert row["name"] != "third"

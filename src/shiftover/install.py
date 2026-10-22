@@ -1,9 +1,12 @@
 """Wires shiftover into Claude Code: hooks, status line, the MCP server, the /handoff command and the skill."""
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from importlib import resources
 from pathlib import Path
@@ -31,8 +34,16 @@ def exe() -> str:
     return f"{sys.executable} -m shiftover"
 
 
+class InstallError(Exception):
+    pass
+
+
+_OURS = re.compile(r"(?:^|[\s/])shiftover(?:\s+-m\s+shiftover)?\s+(?:hook\s+(?:session-start|stop|stop-failure|prompt)|statusline)\s*$")
+
+
 def is_ours(cmd: str) -> bool:
-    return ("shiftover" in cmd and (" hook " in cmd or cmd.endswith(" statusline"))) or "CL_RUN_ID" in cmd
+    """Only commands shiftover itself installs; a user's `my-shiftover-audit.sh` is not ours."""
+    return bool(_OURS.search(cmd.strip())) or "CL_RUN_ID" in cmd
 
 
 def merge_settings(settings: dict, exe_path: str) -> tuple[dict, list[str], str | None]:
@@ -57,10 +68,14 @@ def merge_settings(settings: dict, exe_path: str) -> tuple[dict, list[str], str 
     previous = None
     sl = settings.get("statusLine") or {}
     cmd = str(sl.get("command", "")) if isinstance(sl, dict) else ""
+    ours = f"{exe_path} statusline"
     if not cmd or not is_ours(cmd):
         previous = cmd or None
-        settings["statusLine"] = {"type": "command", "command": f"{exe_path} statusline"}
+        settings["statusLine"] = {"type": "command", "command": ours}
         changes.append("statusLine: shiftover statusline" + (f" (wrapping: {cmd})" if cmd else ""))
+    elif cmd != ours:
+        settings["statusLine"] = {"type": "command", "command": ours}
+        changes.append("statusLine: updated shiftover path")
     return settings, changes, previous
 
 
@@ -70,7 +85,7 @@ def unmerge_settings(settings: dict, restore_cmd: str) -> tuple[dict, list[str]]
     for event in list(hooks):
         kept = []
         for entry in hooks.get(event, []) or []:
-            inner = [h for h in entry.get("hooks", []) if not ("shiftover" in str(h.get("command", "")))]
+            inner = [h for h in entry.get("hooks", []) if not is_ours(str(h.get("command", "")))]
             if inner:
                 entry = dict(entry)
                 entry["hooks"] = inner
@@ -82,7 +97,7 @@ def unmerge_settings(settings: dict, restore_cmd: str) -> tuple[dict, list[str]]
         else:
             hooks.pop(event, None)
     sl = settings.get("statusLine") or {}
-    if isinstance(sl, dict) and "shiftover" in str(sl.get("command", "")):
+    if isinstance(sl, dict) and is_ours(str(sl.get("command", ""))):
         if restore_cmd:
             settings["statusLine"] = {"type": "command", "command": restore_cmd}
             changes.append(f"statusLine: restored {restore_cmd}")
@@ -107,19 +122,40 @@ def settings_targets(cfg: Config) -> list[Path]:
 
 
 def _read_settings(p: Path) -> dict:
+    if not p.exists():
+        return {}
     data = paths.read_json(p, None)
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        raise InstallError(f"{p} is not valid JSON; fix or move it first, shiftover will not overwrite it")
+    return data
+
+
+def write_json_preserving(p: Path, data: dict) -> None:
+    """Atomic replace that keeps the file's mode and never touches the parent directory's mode."""
+    target = p.resolve() if p.exists() else p
+    target.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _write_settings(p: Path, data: dict) -> Path | None:
-    paths.ensure_dir(p.parent, 0o755)
     backup = None
     if p.exists():
         backup = p.with_name(f"{p.name}.bak-shiftover-{time.strftime('%Y%m%d-%H%M%S')}")
         shutil.copy2(p, backup)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(p.resolve() if p.exists() else p)
+        os.chmod(backup, stat.S_IMODE(p.stat().st_mode))
+    write_json_preserving(p, data)
     return backup
 
 
@@ -134,7 +170,10 @@ def _mcp_add(acct, exe_path: str, dry_run: bool) -> str:
     if dry_run:
         return "would run: " + " ".join(cmd)
     r = subprocess.run(cmd, env=claude.env_for(acct.path), capture_output=True, text=True, timeout=60)
-    return (r.stdout + r.stderr).strip() or "registered"
+    text = (r.stdout + r.stderr).strip()
+    if r.returncode != 0 or not _mcp_registered(acct.path):
+        return "failed: " + (text or f"exit {r.returncode}")
+    return text or "registered"
 
 
 def _mcp_remove(acct, dry_run: bool) -> str:
@@ -188,13 +227,13 @@ def install(cfg: Config, dry_run: bool = False, with_mcp: bool = True, with_file
             target = d / "handoff.md"
             report.append(f"{target}: {'would write' if dry_run else 'written'}")
             if not dry_run:
-                paths.ensure_dir(d, 0o755)
+                d.mkdir(parents=True, exist_ok=True)
                 target.write_text(_resource("commands/handoff.md"), encoding="utf-8")
         for d in _file_targets(cfg, "skills"):
             target = d / "shiftover" / "SKILL.md"
             report.append(f"{target}: {'would write' if dry_run else 'written'}")
             if not dry_run:
-                paths.ensure_dir(target.parent, 0o755)
+                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(_resource("skills/shiftover/SKILL.md"), encoding="utf-8")
     return report
 
@@ -223,6 +262,11 @@ def uninstall(cfg: Config, dry_run: bool = False) -> list[str]:
             report.append(f"{f}: {'would remove' if dry_run else 'removed'}")
             if not dry_run:
                 shutil.rmtree(f, ignore_errors=True)
+    rc = shell_rc()
+    if rc and rc.exists() and "shiftover shell-init" in rc.read_text(encoding="utf-8", errors="replace"):
+        report.append(f"{rc}: {'would remove' if dry_run else 'removed'} the shiftover line")
+        if not dry_run:
+            remove_shell_init(rc)
     return report
 
 
@@ -234,7 +278,7 @@ def share(main_dir: Path, new_dir: Path) -> list[str]:
             continue
         if not src.exists():
             if item in ("projects", "skills", "commands", "agents", "hooks", "output-styles", "plugins"):
-                paths.ensure_dir(src, 0o755)
+                src.mkdir(parents=True, exist_ok=True)
             else:
                 continue
         dst.symlink_to(src)
@@ -245,13 +289,16 @@ def share(main_dir: Path, new_dir: Path) -> list[str]:
 def installed_state(cfg: Config) -> dict:
     state = {"hooks": {}, "statusline": {}, "mcp": {}, "commands": {}, "skills": {}}
     for p in settings_targets(cfg):
-        data = _read_settings(p)
+        try:
+            data = _read_settings(p)
+        except InstallError:
+            data = {}
         hooks = data.get("hooks") or {}
         have = [ev for ev in HOOK_EVENTS if any(is_ours(str(h.get("command", ""))) and "shiftover" in str(h.get("command", ""))
                                                 for e in hooks.get(ev, []) or [] for h in e.get("hooks", []))]
         state["hooks"][str(p)] = have
         sl = data.get("statusLine") or {}
-        state["statusline"][str(p)] = "shiftover" in str(sl.get("command", "")) if isinstance(sl, dict) else False
+        state["statusline"][str(p)] = is_ours(str(sl.get("command", ""))) if isinstance(sl, dict) else False
     for a in cfg.ordered():
         state["mcp"][a.name] = _mcp_registered(a.path)
     for d in _file_targets(cfg, "commands"):
@@ -262,6 +309,27 @@ def installed_state(cfg: Config) -> dict:
 
 
 SHELL_LINE = 'eval "$(shiftover shell-init)"'
+SHELL_MARK = "# shiftover: route `claude` through the account pool"
+
+
+def shell_wired(rc: Path | None) -> bool:
+    """An uncommented shell-init line; a commented-out one does not count."""
+    if not rc or not rc.exists():
+        return False
+    for line in rc.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if "shiftover shell-init" in s and not s.startswith("#"):
+            return True
+    return False
+
+
+def remove_shell_init(rc: Path) -> bool:
+    text = rc.read_text(encoding="utf-8")
+    kept = [l for l in text.splitlines() if l.strip() != SHELL_MARK and "shiftover shell-init" not in l]
+    if len(kept) == len(text.splitlines()):
+        return False
+    rc.write_text("\n".join(kept) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+    return True
 
 
 def shell_rc() -> Path | None:
@@ -286,5 +354,5 @@ def ensure_shell_init(rc: Path | None = None) -> str:
     if "shiftover shell-init" in text:
         return "present"
     with open(rc, "a", encoding="utf-8") as f:
-        f.write(("" if text.endswith("\n") or not text else "\n") + "# shiftover: route `claude` through the account pool\n" + SHELL_LINE + "\n")
+        f.write(("" if text.endswith("\n") or not text else "\n") + SHELL_MARK + "\n" + SHELL_LINE + "\n")
     return "added"

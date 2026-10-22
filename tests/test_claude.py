@@ -25,4 +25,16 @@ def test_launch_flags():
     args = ["--effort", "max", "-c", "--resume", "abc", "--model", "fable", "--dangerously-skip-permissions", "-p", "hello world", "--allowedTools", "Bash"]
     assert claude.launch_flags(args) == ["--effort", "max", "--model", "fable", "--dangerously-skip-permissions", "--allowedTools", "Bash"]
     assert claude.strip_flag(["--model", "a", "--effort", "b"], "--model") == ["--effort", "b"]
+    assert claude.launch_flags(["--session-id=abc", "--resume=old", "--model=opus", "--allowedTools", "Read", "Edit", "--effort", "low"]) \
+        == ["--model=opus", "--allowedTools", "Read", "Edit", "--effort", "low"]
+    assert claude.launch_flags(["--mcp-config", "a.json", "b.json", "--", "prompt text"]) == ["--mcp-config", "a.json", "b.json"]
+    assert claude.launch_flags(["--fork-session", "-r", "--model", "x"]) == ["--model", "x"]
+
+
+def test_env_for_drops_auth_overrides(home, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-other")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "t")
+    env = claude.env_for(home / ".claude-second")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
+    assert env["CLAUDE_CONFIG_DIR"].endswith(".claude-second")
     assert claude.wants_print(["-p", "x"]) and not claude.wants_print(["x"])

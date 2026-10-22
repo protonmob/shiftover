@@ -22,7 +22,11 @@ VALUE_FLAGS = {
     "--permission-prompt-tool", "--max-budget-usd", "--json-schema", "--output-format",
     "--input-format", "--file", "--environment",
 }
+VARIADIC_FLAGS = {"--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools",
+                  "--mcp-config", "--add-dir", "--plugin-dir", "--betas"}
 SESSION_SELECTORS = {"-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "-p", "--print"}
+# Any of these would make claude authenticate as someone other than the directory's sign-in.
+AUTH_OVERRIDES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 
 
 def norm(d) -> Path:
@@ -66,7 +70,7 @@ def access_token(d) -> str:
     try:
         blob = subprocess.run(
             ["security", "find-generic-password", "-s", keychain_service(d), "-w"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
@@ -115,7 +119,8 @@ def claude_bin() -> str | None:
 
 def env_for(d, extra: dict | None = None) -> dict:
     env = dict(os.environ)
-    env.pop("ANTHROPIC_API_KEY", None)
+    for k in AUTH_OVERRIDES:
+        env.pop(k, None)
     env.pop("CLAUDE_CONFIG_DIR", None)
     if not is_default(d):
         env["CLAUDE_CONFIG_DIR"] = str(norm(d))
@@ -146,12 +151,21 @@ def launch_flags(args: list[str]) -> list[str]:
     i = 0
     while i < len(args):
         a = args[i]
-        if a in SESSION_SELECTORS:
-            if a in ("-r", "--resume", "--session-id") and i + 1 < len(args) and not args[i + 1].startswith("-"):
+        if a == "--":
+            break
+        name, _, inline = a.partition("=") if a.startswith("--") else (a, "", "")
+        if name in SESSION_SELECTORS:
+            if name in ("-r", "--resume", "--session-id") and not inline and i + 1 < len(args) and not args[i + 1].startswith("-"):
                 i += 1
         elif a.startswith("-"):
             out.append(a)
-            if a in VALUE_FLAGS and i + 1 < len(args):
+            if inline:
+                pass
+            elif name in VARIADIC_FLAGS:
+                while i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    out.append(args[i + 1])
+                    i += 1
+            elif name in VALUE_FLAGS and i + 1 < len(args):
                 out.append(args[i + 1])
                 i += 1
         i += 1

@@ -99,3 +99,32 @@ def test_prompt_tips_fire_once_per_level(home, monkeypatch, capsys):
     paths.write_json(rd / "notice.json", {"src": "main", "dst": "second", "reason": "5h window 97% used"})
     hooks.prompt({"session_id": "sid-4"})
     assert "moved from account" in capsys.readouterr().out
+
+
+def test_stop_skips_targets_that_cannot_see_the_transcript(home, monkeypatch):
+    rd = _run_env(monkeypatch, home)
+    (rd / "sid").write_text("s9")
+    _usage_cache(home, {"main": 99, "second": 10, "third": 20})
+    paths.write_json(paths.sessions_dir() / "s9.json", {"ts": 10**12, "dir": str(home / ".claude"), "account": "main",
+                                                        "rate_limits": {"five_hour": {"used_percentage": 99}}})
+    tp = home / ".claude" / "projects" / "-x" / "s9.jsonl"
+    tp.parent.mkdir(parents=True)
+    tp.write_text("{}")
+    (home / ".claude-second" / "projects").symlink_to(home / ".claude" / "projects")
+    monkeypatch.setattr(hooks.handoff, "apply", lambda rd_, req: paths.write_json(rd_ / "handoff.json", req))
+    hooks.stop({"session_id": "s9", "transcript_path": str(tp)})
+    assert paths.read_json(rd / "handoff.json")["target"] == "second"
+
+
+def test_pinned_account_never_hands_off_by_itself(home, monkeypatch):
+    rd = _run_env(monkeypatch, home)
+    (rd / "sid").write_text("s8")
+    cfg = config.load()
+    cfg.accounts["main"].pool = False
+    config.save(cfg)
+    _usage_cache(home, {"main": 99, "second": 10, "third": 20})
+    paths.write_json(paths.sessions_dir() / "s8.json", {"ts": 10**12, "dir": str(home / ".claude"), "account": "main",
+                                                        "rate_limits": {"five_hour": {"used_percentage": 99}}})
+    monkeypatch.setattr(hooks.handoff, "apply", lambda rd_, req: paths.write_json(rd_ / "handoff.json", req))
+    hooks.stop({"session_id": "s8"})
+    assert not (rd / "handoff.json").exists()

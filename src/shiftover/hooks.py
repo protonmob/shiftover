@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from . import claude, config, handoff, paths, pick, runstate, usage
 
@@ -49,15 +50,30 @@ def _over(cfg, rl: dict) -> str:
     return "; ".join(reasons)
 
 
-def _switch(cfg, rd, st: dict, reason: str, effort: str | None, target_name: str = "", model: str | None = None) -> None:
+def can_resume(acct, transcript_path: str | None) -> bool:
+    """Resume works only where the transcript is visible, i.e. a shared projects/ dir."""
+    if not transcript_path:
+        return True
+    tp = Path(transcript_path)
+    return (acct.path / "projects" / tp.parent.name / tp.name).exists()
+
+
+def _switch(cfg, rd, st: dict, reason: str, effort: str | None, target_name: str = "", model: str | None = None,
+            transcript_path: str | None = None) -> None:
     cur = _current(cfg, st)
+    if cur and not cur.pool and not target_name:
+        return
     model = model or (st.get("model") or {}).get("id")
     if not isinstance(model, str):
         model = None
     family = usage.model_family(model)
     target = cfg.accounts.get(target_name) if target_name else None
+    if target is not None and not can_resume(target, transcript_path):
+        paths.write_json(rd / "notice.json", {"src": cur.name if cur else "?", "dst": "", "reason": reason,
+                                              "detail": f"{target.name} cannot see this conversation's transcript (projects/ is not shared)"})
+        return
     if target is None:
-        rows = _rows(cfg)
+        rows = [r for r in _rows(cfg) if can_resume(r["account"], transcript_path)]
         row = pick.best(cfg, rows, family, exclude=(cur.name,) if cur else (), min_headroom=max(5.0, 100.0 - cfg.threshold))
         target = row["account"] if row else None
     if target is None:
@@ -86,15 +102,16 @@ def stop(data: dict) -> None:
     sid = data.get("session_id") or runstate.session_id(rd)
     st = _settled_state(sid, started)
     pending = paths.read_json(rd / "pending.json")
+    tp = data.get("transcript_path")
     if pending:
         _switch(cfg, rd, st, pending.get("reason") or "manual hand-off", pending.get("effort") or _effort(data),
-                pending.get("target") or "", pending.get("model"))
+                pending.get("target") or "", pending.get("model"), tp)
         return
     if cfg.handoff_mode != "auto":
         return
     reason = _over(cfg, st.get("rate_limits") or {})
     if reason:
-        _switch(cfg, rd, st, reason, _effort(data))
+        _switch(cfg, rd, st, reason, _effort(data), transcript_path=tp)
 
 
 def stop_failure(data: dict) -> None:
@@ -105,7 +122,7 @@ def stop_failure(data: dict) -> None:
     if not rd or not cfg or cfg.handoff_mode != "auto":
         return
     sid = data.get("session_id") or runstate.session_id(rd)
-    _switch(cfg, rd, runstate.session_state(sid), "rate limit reached", _effort(data))
+    _switch(cfg, rd, runstate.session_state(sid), "rate limit reached", _effort(data), transcript_path=data.get("transcript_path"))
 
 
 def _best_other(cfg, cur_name: str, family: str | None):
@@ -131,6 +148,9 @@ def prompt(data: dict) -> None:
         if n.get("dst"):
             msgs.append(f'shiftover: this conversation was moved from account "{n.get("src")}" to "{n.get("dst")}" '
                         f'({n.get("reason")}); model and effort were kept. The user likes a one-line heads-up about this.')
+        elif n.get("detail"):
+            msgs.append(f'shiftover: account "{n.get("src")}" {n.get("reason")}, but no hand-off happened: {n.get("detail")}. '
+                        f'The user likes a one-line heads-up about this.')
         else:
             msgs.append(f'shiftover: account "{n.get("src")}" hit a usage limit and no other account had headroom, '
                         f'so Claude Code waited for the reset. The user likes a one-line heads-up about this.')

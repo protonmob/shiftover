@@ -73,3 +73,81 @@ def test_setup_asks_only_for_main(home, fake_claude, monkeypatch, capsys):
     assert cfg.main == "two" and set(cfg.accounts) == {"one", "two", "three"}
     assert "shiftover shell-init" in rc.read_text()
     assert (home / ".claude" / "commands" / "handoff.md").exists()
+
+def test_is_ours_is_precise():
+    assert install.is_ours("/opt/shiftover hook stop") and install.is_ours("/usr/bin/python3 -m shiftover statusline")
+    assert install.is_ours("shiftover hook prompt")
+    assert not install.is_ours("python /repo/shiftover-audit.py") and not install.is_ours("bash ~/shiftover/notify.sh hook stop")
+
+
+def test_unmerge_keeps_unrelated_hooks_mentioning_shiftover():
+    settings = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python /repo/shiftover-audit.py"},
+                                              {"type": "command", "command": "/opt/shiftover hook stop"}]}]},
+                "statusLine": {"type": "command", "command": "/opt/shiftover statusline"}}
+    out, _ = install.unmerge_settings(settings, "")
+    assert [h["command"] for e in out["hooks"]["Stop"] for h in e["hooks"]] == ["python /repo/shiftover-audit.py"]
+    assert "statusLine" not in out
+
+
+def test_reinstall_updates_a_moved_executable():
+    s1, _, _ = install.merge_settings({}, "/old/shiftover")
+    s2, changes, prev = install.merge_settings(s1, "/new/shiftover")
+    assert prev is None and s2["statusLine"]["command"] == "/new/shiftover statusline"
+    assert all("/old/" not in h["command"] for ev in s2["hooks"].values() for e in ev for h in e["hooks"])
+
+
+def test_settings_write_keeps_modes_and_refuses_garbage(home, tmp_path):
+    p = home / ".claude-second" / "settings.json"
+    p.chmod(0o600)
+    install._write_settings(p, {"a": 1})
+    assert oct(p.stat().st_mode & 0o777) == "0o600"
+    bad = home / ".claude-third" / "settings.json"
+    bad.write_text("{not json")
+    import pytest
+    with pytest.raises(install.InstallError):
+        install._read_settings(bad)
+    assert bad.read_text() == "{not json"
+
+
+def test_uninstall_removes_the_shell_line(home):
+    rc = home / ".zshrc"
+    rc.write_text("export A=1\n")
+    install.ensure_shell_init(rc)
+    assert install.shell_wired(rc)
+    assert install.remove_shell_init(rc) and rc.read_text() == "export A=1\n"
+    rc.write_text('# eval "$(shiftover shell-init)"\n')
+    assert not install.shell_wired(rc)
+
+
+def test_remove_keeps_an_account_out_of_the_next_setup(home, fake_claude, monkeypatch, capsys):
+    from shiftover import cli
+    monkeypatch.setattr(install, "exe", lambda: "/opt/shiftover")
+    monkeypatch.setattr(install, "_mcp_add", lambda acct, exe_path, dry_run: "Added")
+    assert cli.main(["remove", "third"]) == 0
+    assert cli.main(["setup", "--main", "main", "--no-shell"]) == 0
+    cfg = config.load()
+    assert set(cfg.accounts) == {"main", "second"} and cfg.ignore == ["~/.claude-third"]
+    assert cli.main(["setup", "--main", "nope", "--no-install", "--no-shell"]) == 1
+    assert "not an account" in capsys.readouterr().err
+
+
+def test_setup_without_a_terminal_asks_for_main_by_flag(home, monkeypatch, capsys):
+    from shiftover import cli
+    (home / ".config" / "shiftover" / "config.toml").unlink()
+    monkeypatch.setattr("sys.stdin", type("T", (), {"isatty": staticmethod(lambda: False)})())
+    assert cli.main(["setup", "--no-install", "--no-shell"]) == 2
+    assert "--main <name>" in capsys.readouterr().out
+
+
+def test_setup_keeps_an_account_out_of_the_pool(home, fake_claude, monkeypatch, capsys):
+    from shiftover import cli
+    monkeypatch.setattr(install, "exe", lambda: "/opt/shiftover")
+    monkeypatch.setattr(install, "_mcp_add", lambda acct, exe_path, dry_run: "Added")
+    monkeypatch.setattr("sys.stdin", type("T", (), {"isatty": staticmethod(lambda: True)})())
+    answers = iter(["1", "third"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    assert cli.main(["setup", "--no-shell"]) == 0
+    out = capsys.readouterr().out
+    cfg = config.load()
+    assert not cfg.accounts["third"].pool and cfg.accounts["second"].pool
+    assert "third: kept separate" in out

@@ -1,4 +1,6 @@
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -18,6 +20,28 @@ def segment(acct_name: str, rl: dict, st: Style) -> str:
         parts.append(f"{lab} {col}{p:.0f}%{st.reset}")
     name = acct_name or "?"
     return " ".join([f"{st.bold}{name}{st.reset}"] + parts) if parts else f"{st.bold}{name}{st.reset}"
+
+
+def _wrapped(wrap: str, raw: str) -> str:
+    if not wrap:
+        return ""
+    try:
+        proc = subprocess.Popen(wrap, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return ""
+    try:
+        out, _ = proc.communicate(raw.encode("utf-8", "replace"), timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        return ""
+    except Exception:  # noqa: BLE001 - a broken wrapper must not take the status line down
+        return ""
+    return out.decode("utf-8", "replace").rstrip("\n")
 
 
 def main() -> int:
@@ -40,13 +64,7 @@ def main() -> int:
             })
         except OSError:
             pass
-    base = ""
-    wrap = cfg.statusline_wrap if cfg else ""
-    if wrap:
-        try:
-            base = subprocess.run(wrap, shell=True, input=raw, capture_output=True, text=True, timeout=3).stdout.rstrip("\n")
-        except (OSError, subprocess.SubprocessError):
-            base = ""
+    base = _wrapped(cfg.statusline_wrap if cfg else "", raw)
     if not base:
         model = (data.get("model") or {}).get("display_name") or ""
         ctx = (data.get("context_window") or {}).get("used_percentage")

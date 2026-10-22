@@ -50,3 +50,12 @@ def test_import_skips_dirs_without_login(home):
     (home / ".claude-scratch" / "settings.json").write_text("{}")
     cfg = config.import_existing({}, main=None)
     assert "scratch" not in cfg.accounts
+
+
+def test_adopt_emails_fills_blanks_from_live_login(home):
+    cfg = config.load()
+    acct = cfg.by_dir(home / ".claude-second")
+    acct.email = ""
+    assert config.adopt_emails(cfg) == [acct]
+    assert acct.email == "two@example.com"
+    assert config.adopt_emails(cfg) == []

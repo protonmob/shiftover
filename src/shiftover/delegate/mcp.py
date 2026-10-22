@@ -4,7 +4,7 @@ import os
 import sys
 
 from .. import __version__, claude, config, pick, usage
-from . import jobs
+from . import codex, jobs
 
 PROTOCOL = "2025-06-18"
 SUPPORTED = {"2025-06-18", "2025-03-26", "2024-11-05"}
@@ -15,19 +15,19 @@ TOOLS = [
     {
         "name": "accounts",
         "description": "List the pooled Claude Code accounts with their 5-hour / weekly usage windows, per-model windows, "
-                       "headroom and live sessions. Read-only; uses a short cache.",
+                       "headroom and live sessions, plus the Codex CLI backend when it is installed. Read-only; uses a short cache.",
         "inputSchema": {"type": "object", "properties": {
             "refresh": {"type": "boolean", "description": "Bypass the cache (one network call per account)."}}},
     },
     {
         "name": "delegate",
-        "description": "Run a self-contained task as a headless Claude Code session on another account and return its answer. "
-                       "The delegate sees only the prompt, has no claude.ai connectors and nobody answers its permission prompts. "
-                       "Long tasks: background=true, then monitor.",
+        "description": "Run a self-contained task as a headless Claude Code session on another account (or on the OpenAI Codex CLI "
+                       "with account=\"codex\") and return its answer. The delegate sees only the prompt, has no claude.ai "
+                       "connectors and nobody answers its permission prompts. Long tasks: background=true, then monitor.",
         "inputSchema": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "The complete task: goal, paths, constraints, expected output format."},
-            "account": {"type": "string", "description": "Account name, 'auto' (most headroom for the model; default) or 'self'."},
-            "model": {"type": "string", "description": "fable | opus | sonnet | haiku or a full model id. Default: the account's default."},
+            "account": {"type": "string", "description": "Account name, 'auto' (most headroom for the model; default), 'self', or 'codex' for the OpenAI Codex CLI."},
+            "model": {"type": "string", "description": "fable | opus | sonnet | haiku or a full model id; for codex an OpenAI model id. Default: the backend's default."},
             "effort": {"type": "string", "enum": EFFORTS},
             "cwd": {"type": "string", "description": "Working directory for the delegate. Default: this project."},
             "background": {"type": "boolean", "description": "Return a job_id immediately; collect with monitor."},
@@ -79,6 +79,9 @@ class Server:
             a = r["account"]
             d = {"name": a.name, "email": r.get("email") or "", "is_current": bool(self.cur and a.name == self.cur.name),
                  "live_sessions": len(claude.live_sessions(a.path))}
+            if not a.pool:
+                d["pinned"] = True
+                d["note"] = "kept out of the pool: never an automatic hand-off or delegate target"
             if a.models:
                 d["models"] = a.models
             if "limits" in r:
@@ -88,15 +91,26 @@ class Server:
             else:
                 d["error"] = r.get("err", "unknown")
             out.append(d)
+        cx = codex.binary(cfg)
+        if cx:
+            out.append({"name": "codex", "backend": "codex", "version": codex.version(cx) or "installed",
+                        "note": "OpenAI Codex CLI on its own subscription; usage windows are not readable. "
+                                "Use delegate(account=\"codex\"); permission_mode maps to Codex's sandbox."})
         return out
 
     def _pick_account(self, cfg, spec: str, family: str | None):
         spec = (spec or "auto").strip()
+        if spec == "codex":
+            if not codex.binary(cfg):
+                raise ToolError("the Codex CLI is not installed or is disabled in the shiftover config ([codex] enabled)")
+            return "codex"
         if spec == "auto":
             rows = pick.rows_for(cfg, usage.refresh([a.path for a in cfg.ordered()], ttl=60, budget=10))
             row = pick.best(cfg, rows, family, exclude=(self.cur.name,) if self.cur else ())
             if not row:
                 row = pick.best(cfg, rows, family)
+            if not row and codex.binary(cfg) and not family:
+                return "codex"
             if not row:
                 raise ToolError("no account has headroom for this task right now")
             return row["account"]
@@ -135,17 +149,28 @@ class Server:
             mcp_servers = {k: v for k, v in claude.mcp_servers(main.path).items() if k != "shiftover"} if main else None
         wait_s = args.get("wait_seconds")
         wait_s = cfg.delegate_wait if wait_s is None else max(0, min(int(wait_s), 600))
-        job = jobs.start(acct, prompt, model=model, effort=effort, cwd=args.get("cwd") or None, permission_mode=perm,
-                         allowed_tools=args.get("allowed_tools") or None, json_schema=args.get("json_schema") or None,
-                         max_budget_usd=args.get("max_budget_usd"), resume_session_id=args.get("resume_session_id") or None,
-                         label=args.get("label") or "", mcp_servers=mcp_servers)
+        ignored = []
+        if acct == "codex":
+            ignored = [k for k in ("allowed_tools", "mcp", "max_budget_usd") if args.get(k)]
+            job = jobs.start_codex(codex.binary(cfg), prompt, model=model, effort=effort, cwd=args.get("cwd") or None,
+                                   permission_mode=perm, json_schema=args.get("json_schema") or None,
+                                   resume_session_id=args.get("resume_session_id") or None, label=args.get("label") or "")
+            acct_name = "codex"
+        else:
+            job = jobs.start(acct, prompt, model=model, effort=effort, cwd=args.get("cwd") or None, permission_mode=perm,
+                             allowed_tools=args.get("allowed_tools") or None, json_schema=args.get("json_schema") or None,
+                             max_budget_usd=args.get("max_budget_usd"), resume_session_id=args.get("resume_session_id") or None,
+                             label=args.get("label") or "", mcp_servers=mcp_servers)
+            acct_name = acct.name
         if not args.get("background"):
             job = jobs.wait(job, wait_s)
         out = jobs.summary(job)
+        if ignored:
+            out["ignored"] = f"{', '.join(ignored)} do not apply to the Codex backend"
         if job.status == "running":
             out["note"] = f"still running after {wait_s}s; collect with monitor(job_ids=[\"{job.id}\"])"
         if job.session_id:
-            out["resume_hint"] = f"delegate(resume_session_id=\"{job.session_id}\", account=\"{acct.name}\", prompt=...)"
+            out["resume_hint"] = f"delegate(resume_session_id=\"{job.session_id}\", account=\"{acct_name}\", prompt=...)"
         return out
 
     def monitor(self, args: dict):
@@ -191,7 +216,12 @@ def serve() -> int:
         except ValueError:
             _send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
             continue
-        mid, method, params = msg.get("id"), msg.get("method") or "", msg.get("params") or {}
+        if not isinstance(msg, dict) or not isinstance(msg.get("method"), str) or not isinstance(msg.get("params", {}), (dict, type(None))):
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            _send({"jsonrpc": "2.0", "id": mid if isinstance(mid, (str, int)) else None,
+                   "error": {"code": -32600, "message": "invalid request"}})
+            continue
+        mid, method, params = msg.get("id"), msg["method"], msg.get("params") or {}
         if method.startswith("notifications/"):
             continue
         try:

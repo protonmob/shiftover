@@ -102,7 +102,15 @@ def resume_args(flags: list[str], sid: str, model: str | None, effort: str | Non
         out = claude.strip_flag(out, "--model") + ["--model", model]
     if effort:
         out = claude.strip_flag(out, "--effort") + ["--effort", effort]
-    return out + ["--resume", sid]
+    # --resume goes first so a trailing variadic flag (--allowedTools a b) cannot swallow it.
+    return ["--resume", sid] + out
+
+
+def transcript_visible(acct: Account, sid: str) -> bool:
+    try:
+        return any((acct.path / "projects").glob(f"*/{sid}.jsonl"))
+    except OSError:
+        return False
 
 
 def _ask_switch(cfg: Config, cur: Account) -> Account | None:
@@ -147,6 +155,12 @@ def run(cfg: Config, acct: Account, args: list[str], interactive: bool | None = 
             if req and sid:
                 (rdir / "handoff.json").unlink(missing_ok=True)
                 target = cfg.accounts.get(req.get("target") or "")
+                if target and not transcript_visible(target, sid):
+                    print(t("handoff_invisible", dst=target.name, src=cur.name), file=sys.stderr)
+                    paths.write_json(rdir / "notice.json", {"src": cur.name, "dst": "", "reason": req.get("reason", ""),
+                                                            "detail": f"{target.name} cannot see the transcript (projects/ is not shared)"})
+                    cur_args = resume_args(flags, sid, None, None)
+                    continue
                 if target:
                     detail = ", ".join(x for x in (req.get("model"), req.get("effort")) if x)
                     print(t("handoff_line", src=cur.name, reason=req.get("reason", ""), dst=target.name,

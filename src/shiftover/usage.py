@@ -147,14 +147,16 @@ def refresh(dirs: list, ttl: int = TTL, force: bool = False, budget: float = 12.
     keys = [str(claude.norm(d)) for d in dirs]
     todo = [k for k in keys if force or not fresh(cache.get(k), ttl)]
     if todo:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(todo))) as ex:
-            futs = {k: ex.submit(_probe, k) for k in todo}
-            deadline = time.time() + budget
-            for k, fut in futs.items():
-                try:
-                    cache[k] = fut.result(timeout=max(0.1, deadline - time.time()))
-                except concurrent.futures.TimeoutError:
-                    cache[k] = {"ts": time.time(), "email": claude.email(k), "err": "timeout"}
+        # No context manager: leaving one would wait for every probe, blowing the caller's budget.
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(todo)))
+        futs = {k: ex.submit(_probe, k) for k in todo}
+        deadline = time.time() + budget
+        for k, fut in futs.items():
+            try:
+                cache[k] = fut.result(timeout=max(0.1, deadline - time.time()))
+            except concurrent.futures.TimeoutError:
+                cache[k] = {"ts": time.time(), "email": claude.email(k), "err": "timeout"}
+        ex.shutdown(wait=False, cancel_futures=True)
         paths.write_json(cache_path(), cache)
     return {k: cache.get(k) or {"email": claude.email(k), "err": "unknown"} for k in keys}
 

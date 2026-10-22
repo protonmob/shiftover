@@ -18,6 +18,7 @@ class Account:
     email: str = ""
     models: list[str] | None = None
     enabled: bool = True
+    pool: bool = True
 
     @property
     def path(self) -> Path:
@@ -45,12 +46,18 @@ class Config:
     tips_levels: list = field(default_factory=lambda: [75, 90])
     map: dict = field(default_factory=dict)
     statusline_wrap: str = ""
+    ignore: list = field(default_factory=list)
+    codex_enabled: bool = True
+    codex_bin: str = "codex"
     path: Path | None = None
 
     def ordered(self) -> list[Account]:
         accts = [a for a in self.accounts.values() if a.enabled]
         main = [a for a in accts if a.name == self.main]
         return main + [a for a in accts if a.name != self.main]
+
+    def pooled(self) -> list[Account]:
+        return [a for a in self.ordered() if a.pool]
 
     def main_account(self) -> Account | None:
         a = self.accounts.get(self.main)
@@ -98,6 +105,7 @@ def _acct_from(name: str, d: dict) -> Account:
     return Account(
         name=name, dir=str(d.get("dir", "")), email=str(d.get("email", "")),
         models=list(d["models"]) if d.get("models") else None, enabled=bool(d.get("enabled", True)),
+        pool=bool(d.get("pool", True)),
     )
 
 
@@ -121,6 +129,10 @@ def from_dict(data: dict, path: Path | None = None) -> Config:
     cfg.tips_levels = [int(x) for x in tp.get("levels", [75, 90])]
     cfg.map = {str(k): str(v) for k, v in (data.get("map") or {}).items()}
     cfg.statusline_wrap = str((data.get("statusline") or {}).get("wrap", ""))
+    cfg.ignore = [str(x) for x in (data.get("ignore") or [])]
+    cx = data.get("codex") or {}
+    cfg.codex_enabled = bool(cx.get("enabled", True))
+    cfg.codex_bin = str(cx.get("bin", "codex"))
     if not cfg.main and cfg.accounts:
         cfg.main = next(iter(cfg.accounts))
     return cfg
@@ -155,7 +167,10 @@ def _v(x) -> str:
 
 
 def to_toml(cfg: Config) -> str:
-    lines = [f"main = {_v(cfg.main)}", f"threshold = {_v(cfg.threshold)}", f"lang = {_v(cfg.lang)}", ""]
+    lines = [f"main = {_v(cfg.main)}", f"threshold = {_v(cfg.threshold)}", f"lang = {_v(cfg.lang)}"]
+    if cfg.ignore:
+        lines.append(f"ignore = {_v(cfg.ignore)}")
+    lines.append("")
     for a in cfg.accounts.values():
         lines += [f"[accounts.{a.name}]" if a.name.replace("-", "").replace("_", "").isalnum() else f'[accounts.{json.dumps(a.name)}]',
                   f"dir = {_v(a.dir)}", f"email = {_v(a.email)}"]
@@ -163,6 +178,8 @@ def to_toml(cfg: Config) -> str:
             lines.append(f"models = {_v(a.models)}")
         if not a.enabled:
             lines.append("enabled = false")
+        if not a.pool:
+            lines.append("pool = false")
         lines.append("")
     lines += ["[handoff]", f"mode = {_v(cfg.handoff_mode)}", "",
               "[delegate]", f"wait_seconds = {_v(cfg.delegate_wait)}", f"permission_mode = {_v(cfg.delegate_permission_mode)}",
@@ -170,6 +187,7 @@ def to_toml(cfg: Config) -> str:
               "[tips]", f"enabled = {_v(cfg.tips_enabled)}", f"min_interval_min = {_v(cfg.tips_min_interval)}",
               f"levels = {_v(cfg.tips_levels)}", "",
               "[statusline]", f"wrap = {_v(cfg.statusline_wrap)}", "",
+              "[codex]", f"enabled = {_v(cfg.codex_enabled)}", f"bin = {_v(cfg.codex_bin)}", "",
               "[map]"]
     for k, v in cfg.map.items():
         lines.append(f"{json.dumps(k, ensure_ascii=False)} = {_v(v)}")
@@ -183,17 +201,23 @@ def save(cfg: Config, path: Path | None = None) -> Path:
     return path
 
 
-def discover_dirs() -> list[Path]:
+def discover_dirs(ignore=()) -> list[Path]:
+    skip = {claude.norm(i) for i in ignore}
     out = []
-    if claude.DEFAULT_DIR.is_dir():
+    if claude.DEFAULT_DIR.is_dir() and claude.DEFAULT_DIR not in skip:
         out.append(claude.DEFAULT_DIR)
     for p in sorted(Path.home().glob(".claude-*")):
-        if not p.is_dir() or (p.is_symlink() and p.resolve() == claude.DEFAULT_DIR.resolve()):
+        if not p.is_dir() or (p.is_symlink() and p.resolve() == claude.DEFAULT_DIR.resolve()) or claude.norm(p) in skip:
             continue
         # Plugins and tools keep scratch config dirs too; only a dir someone signed into is an account.
         if (p / ".claude.json").exists():
             out.append(p)
     return out
+
+
+def shown_dir(d) -> str:
+    home = str(Path.home())
+    return "~" + str(d)[len(home):] if str(d).startswith(home) else str(d)
 
 
 def default_name(d: Path, email: str = "", taken=()) -> str:
@@ -223,10 +247,23 @@ def import_existing(names: dict[str, str] | None = None, main: str | None = None
     return cfg
 
 
+def adopt_emails(cfg: Config) -> list[Account]:
+    """Fills in e-mails the config lacks from each directory's live sign-in, so nobody edits the file by hand."""
+    learned = []
+    for a in cfg.ordered():
+        if not a.email:
+            em = claude.email(a.path)
+            if em:
+                a.email = em
+                learned.append(a)
+    return learned
+
+
 def merge_discovered(cfg: Config) -> list[Account]:
     """Adds signed-in dirs the config does not know yet; returns the new accounts."""
     added = []
-    for d in discover_dirs():
+    adopt_emails(cfg)
+    for d in discover_dirs(cfg.ignore):
         if cfg.by_dir(d):
             continue
         em = claude.email(d)

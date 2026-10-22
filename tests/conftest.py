@@ -38,8 +38,35 @@ def home(tmp_path, monkeypatch):
         '[accounts.second]\ndir = "~/.claude-second"\nemail = "two@example.com"\n'
         '[accounts.third]\ndir = "~/.claude-third"\nemail = "three@example.com"\n'
         '[handoff]\nmode = "auto"\n[delegate]\nwait_seconds = 5\n[tips]\nenabled = true\nlevels = [75, 90]\n'
+        '[codex]\nenabled = false\n'
     )
     return h
+
+
+@pytest.fixture
+def fake_codex(tmp_path, monkeypatch):
+    """A `codex` shim that prints the JSONL event stream `codex exec --json` produces."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / "codex-calls.jsonl"
+    shim = bindir / "codex"
+    shim.write_text(f'''#!/usr/bin/env python3
+import json, os, sys
+prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
+with open({str(log)!r}, "a") as f:
+    f.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(), "prompt": prompt}}) + "\\n")
+if "--version" in sys.argv:
+    print("codex-cli 9.9.9"); sys.exit(0)
+print(json.dumps({{"type": "thread.started", "thread_id": "thread-1"}}))
+print(json.dumps({{"type": "turn.started"}}))
+print(json.dumps({{"type": "item.completed", "item": {{"id": "i1", "type": "agent_message", "text": "codex: " + prompt.strip()}}}}))
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 10, "output_tokens": 2}}}}))
+if "-o" in sys.argv:
+    open(sys.argv[sys.argv.index("-o") + 1], "w").write("codex: " + prompt.strip())
+''')
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ.get('PATH', '')}")
+    return shim
 
 
 @pytest.fixture
