@@ -25,3 +25,10 @@ def test_import_existing_discovers_dirs(home):
     assert cfg.main == "main"
     assert cfg.accounts["work"].email == "two@example.com"
     assert cfg.accounts["work"].dir == "~/.claude-second"
+
+
+def test_import_skips_dirs_without_login(home):
+    (home / ".claude-scratch").mkdir()
+    (home / ".claude-scratch" / "settings.json").write_text("{}")
+    cfg = config.import_existing({}, main=None)
+    assert "scratch" not in cfg.accounts

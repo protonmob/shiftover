@@ -58,6 +58,12 @@ def cmd_run(args: list[str]) -> int:
         a = args[i]
         if a == "--menu":
             menu = True
+        elif a in ("-C", "--chdir") and i + 1 < len(args):
+            try:
+                os.chdir(os.path.expanduser(args[i + 1]))
+            except OSError as e:
+                return _err(f"cannot cd to {args[i + 1]}: {e}")
+            i += 1
         elif a in ("-a", "--account") and i + 1 < len(args):
             spec = args[i + 1]
             i += 1
@@ -306,9 +312,11 @@ def cmd_uninstall(ns) -> int:
 def cmd_shell_init(ns) -> int:
     lines = ["# shiftover: route `claude` through the account pool",
              "if command -v shiftover >/dev/null 2>&1; then",
-             '  claude() { shiftover run "$@"; }']
+             '  claude() { shiftover run "$@"; }',
+             '  claude-status() { shiftover status "$@"; }']
     if not ns.no_cl:
-        lines.append('  cl() { shiftover run --menu "$@"; }')
+        lines.append('  cl() { if [ -n "$1" ] && [ -d "$1" ]; then local _d="$1"; shift; shiftover run --menu -C "$_d" "$@"; '
+                     'else shiftover run --menu "$@"; fi; }')
     lines.append("fi")
     print("\n".join(lines))
     return 0
@@ -432,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"shiftover {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
-    sub.add_parser("run", help="open claude on the right account: shiftover run [--menu] [-a ACCOUNT] [claude args...]", add_help=False)
+    sub.add_parser("run", help="open claude on the right account: shiftover run [--menu] [-a ACCOUNT] [-C DIR] [claude args...]", add_help=False)
 
     s = sub.add_parser("status", help="accounts and their usage windows")
     s.add_argument("--no-usage", action="store_true")

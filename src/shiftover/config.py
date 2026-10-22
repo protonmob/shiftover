@@ -188,7 +188,10 @@ def discover_dirs() -> list[Path]:
     if claude.DEFAULT_DIR.is_dir():
         out.append(claude.DEFAULT_DIR)
     for p in sorted(Path.home().glob(".claude-*")):
-        if p.is_dir() and not (p.is_symlink() and p.resolve() == claude.DEFAULT_DIR.resolve()):
+        if not p.is_dir() or (p.is_symlink() and p.resolve() == claude.DEFAULT_DIR.resolve()):
+            continue
+        # Plugins and tools keep scratch config dirs too; only a dir someone signed into is an account.
+        if (p / ".claude.json").exists():
             out.append(p)
     return out
 
