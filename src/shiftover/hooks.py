@@ -66,13 +66,25 @@ def _switch(cfg, rd, st: dict, reason: str, effort: str | None, target_name: str
     handoff.apply(rd, {"target": target.name, "model": model, "effort": effort, "reason": reason, "session_id": runstate.session_id(rd)})
 
 
+def _settled_state(sid: str, started: float) -> dict:
+    """The status line rewrites the session file ~300 ms after the last response; Stop often fires
+    first, so a state older than this turn is given a moment to catch up."""
+    st = runstate.session_state(sid)
+    deadline = started + 2.5
+    while st.get("ts") and float(st["ts"]) < started - 3 and time.time() < deadline:
+        time.sleep(0.2)
+        st = runstate.session_state(sid)
+    return st
+
+
 def stop(data: dict) -> None:
+    started = time.time()
     rd = _state_dir()
     cfg = config.load_or_none()
     if not rd or not cfg or cfg.handoff_mode == "off":
         return
     sid = data.get("session_id") or runstate.session_id(rd)
-    st = runstate.session_state(sid)
+    st = _settled_state(sid, started)
     pending = paths.read_json(rd / "pending.json")
     if pending:
         _switch(cfg, rd, st, pending.get("reason") or "manual hand-off", pending.get("effort") or _effort(data),
