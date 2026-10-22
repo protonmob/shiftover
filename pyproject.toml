@@ -21,7 +21,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/kadiraktastr/shiftover"
+Homepage = "https://github.com/protonmob/shiftover"
 
 [project.scripts]
 shiftover = "shiftover.cli:main"

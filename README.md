@@ -29,7 +29,7 @@ and spends its own quota.
 ## Install
 
 ```bash
-pipx install shiftover            # or: uv tool install shiftover
+pipx install git+https://github.com/protonmob/shiftover   # or: uv tool install git+https://github.com/protonmob/shiftover
 shiftover init --import           # finds ~/.claude and ~/.claude-* and writes ~/.config/shiftover/config.toml
 shiftover install                 # hooks + status line + MCP server + /handoff + skill (backs up settings.json first)
 echo 'eval "$(shiftover shell-init)"' >> ~/.zshrc   # `claude` now goes through the pool; `cl` opens the picker
@@ -181,7 +181,7 @@ its own directory, moves live conversations instead of restarting them, and lets
 ## Development
 
 ```bash
-git clone https://github.com/kadiraktastr/shiftover && cd shiftover
+git clone https://github.com/protonmob/shiftover && cd shiftover
 pipx install --editable .
 uv run --with pytest --no-project pytest     # tests use a fake `claude`; no quota is spent
 ```

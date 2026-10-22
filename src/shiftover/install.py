@@ -124,8 +124,9 @@ def _mcp_registered(d) -> bool:
 
 
 def _mcp_add(acct, exe_path: str, dry_run: bool) -> str:
+    # -e is variadic, so the positionals must sit behind "--" or they are read as more KEY=VALUE pairs.
     cmd = [claude.claude_bin() or "claude", "mcp", "add", "-s", "user", "-e", f"SHIFTOVER_ACCOUNT_DIR={acct.path}",
-           "shiftover", "--", *exe_path.split(" "), "mcp"]
+           "--", "shiftover", *exe_path.split(" "), "mcp"]
     if dry_run:
         return "would run: " + " ".join(cmd)
     r = subprocess.run(cmd, env=claude.env_for(acct.path), capture_output=True, text=True, timeout=60)
