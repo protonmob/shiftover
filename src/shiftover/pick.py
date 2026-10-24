@@ -48,6 +48,7 @@ def eligible(row: dict, family: str | None = None) -> bool:
 
 def choose(cfg: Config, rows: list[dict], prefer=None, family: str | None = None, exclude=()) -> tuple[dict | None, str]:
     """First account in order that is logged in and not at 100% on any applicable window.
+    The preferred account is skipped only when it is shown to be full: unreadable limits still open it.
     A pinned account (pool = false) is opened as asked, full or not: it exists to stay separate."""
     order = [r for r in rows if r["name"] not in exclude]
     if prefer:
@@ -55,6 +56,9 @@ def choose(cfg: Config, rows: list[dict], prefer=None, family: str | None = None
         if pinned:
             return pinned, t("opening", name=pinned["name"], summary=summary(pinned) if "limits" in pinned else t("no_limit_info"))
         order = [r for r in order if r["name"] == prefer] + [r for r in order if r["name"] != prefer and r["account"].pool]
+        head = order[0] if order and order[0]["name"] == prefer else None
+        if head and "limits" not in head and eligible(head, family):
+            return head, t("limits_unreadable", err=head.get("err", "?"), name=head["name"])
     else:
         order = [r for r in order if r["account"].pool]
     known = [r for r in order if "limits" in r and eligible(r, family)]

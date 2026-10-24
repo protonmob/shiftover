@@ -77,7 +77,7 @@ spare has 80 % room*, and passes it on. The status line always shows the active 
 (`alex 5h 78% wk 41%`). `shiftover status` prints every account.
 
 **Quality of life.** Directory → account rules, `sync-mcp` to copy local MCP servers between accounts, `doctor`, an
-arrow-key picker (`cl`), English or Turkish messages.
+arrow-key picker (`claude --menu`), English or Turkish messages.
 
 ## Requirements
 
@@ -135,7 +135,7 @@ sequenceDiagram
 | `shiftover map add DIR ACCOUNT` / `map remove DIR` / `map` | directory → account rules |
 | `shiftover sync-mcp [--from A] [--to B\|all] [--overwrite]` | copy `mcpServers` definitions between accounts |
 | `shiftover jobs [--show ID] [--cancel ID] [--purge]` | delegate jobs |
-| `shiftover shell-init` | prints the `claude()` / `cl()` shell functions |
+| `shiftover shell-init` | prints the `claude()` / `cl()` shell functions (`cl DIR [--menu] [claude args…]` starts in DIR) |
 
 ## Config
 
@@ -200,9 +200,10 @@ monitor(job_ids=["20261022-141503-a1b2"], wait_seconds=120)
 accounts()
 ```
 
-- `account="auto"` (default) picks the account with the most headroom for the requested model, never the calling one
-  and never an account kept out of the pool. `account="codex"` runs the task on the OpenAI Codex CLI; `permission_mode`
-  maps onto Codex's sandbox (`default` → read-only, `acceptEdits` → workspace-write).
+- `account="auto"` (default) picks the account with the most headroom for the requested model (without one, the default
+  model from `settings.json`), never the calling one and never an account kept out of the pool; when none has room it
+  says so, and `account="self"` runs the task on the calling account anyway. `account="codex"` runs the task on the
+  OpenAI Codex CLI; `permission_mode` maps onto Codex's sandbox (`default` → read-only, `acceptEdits` → workspace-write).
 - A delegate sees only the prompt. Put the goal, paths, constraints and the output format in it.
 - Nobody answers permission prompts in a delegate: read-only work needs nothing, file edits need `permission_mode="acceptEdits"`.
 - claude.ai connectors (Gmail, Amplitude, the browser extension, …) are not available in a delegate; do that part in the

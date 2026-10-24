@@ -1,4 +1,5 @@
 """Claude Code hook handlers. They must never fail loudly: a hook error would land in the user's session."""
+import datetime
 import json
 import os
 import sys
@@ -50,6 +51,45 @@ def _over(cfg, rl: dict) -> str:
     return "; ".join(reasons)
 
 
+def _model_id(st: dict) -> str | None:
+    m = st.get("model")
+    mid = m.get("id") if isinstance(m, dict) else None
+    return mid if isinstance(mid, str) and mid else None
+
+
+def _family(cur, model: str | None) -> str | None:
+    """The family whose windows count: the session's model, else the default a bare `claude` starts with."""
+    return usage.model_family(model or (claude.default_model(cur.path) if cur else None))
+
+
+def _window(lim: dict) -> str:
+    if lim.get("kind") == "session":
+        return "5-hour window"
+    if lim.get("kind") == "weekly_scoped":
+        return f"{lim.get('model') or 'model'} weekly window"
+    return "weekly window"
+
+
+def _over_cached(cfg, cur, family: str | None) -> str:
+    """Windows the status line does not carry, such as a model's own weekly window, read from the usage cache.
+    A stale entry only schedules a refresh for a later turn: the Stop hook never waits on the network."""
+    try:
+        entry = usage.load_cache().get(str(cur.path))
+        if not usage.fresh(entry):
+            usage.refresh_detached()
+            return ""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        reasons = []
+        for lim in entry.get("limits") or []:
+            ends = usage.parse_ts(lim.get("resets_at"))
+            # A window that reset after the entry was cached no longer says anything.
+            if (ends is None or ends > now) and usage.applies(lim, family) and float(lim["used"]) >= cfg.threshold:
+                reasons.append(f"{_window(lim)} {float(lim['used']):.0f}% used")
+        return "; ".join(reasons)
+    except Exception:  # noqa: BLE001 - a malformed cache entry must not break the hook
+        return ""
+
+
 def can_resume(acct, transcript_path: str | None) -> bool:
     """Resume works only where the transcript is visible, i.e. a shared projects/ dir."""
     if not transcript_path:
@@ -63,10 +103,10 @@ def _switch(cfg, rd, st: dict, reason: str, effort: str | None, target_name: str
     cur = _current(cfg, st)
     if cur and not cur.pool and not target_name:
         return
-    model = model or (st.get("model") or {}).get("id")
+    model = model or _model_id(st)
     if not isinstance(model, str):
         model = None
-    family = usage.model_family(model)
+    family = _family(cur, model)
     target = cfg.accounts.get(target_name) if target_name else None
     if target is not None and not can_resume(target, transcript_path):
         paths.write_json(rd / "notice.json", {"src": cur.name if cur else "?", "dst": "", "reason": reason,
@@ -110,6 +150,9 @@ def stop(data: dict) -> None:
     if cfg.handoff_mode != "auto":
         return
     reason = _over(cfg, st.get("rate_limits") or {})
+    if not reason:
+        cur = _current(cfg, st)
+        reason = _over_cached(cfg, cur, _family(cur, _model_id(st))) if cur else ""
     if reason:
         _switch(cfg, rd, st, reason, _effort(data), transcript_path=tp)
 
@@ -172,7 +215,7 @@ def prompt(data: dict) -> None:
         if fh < 50:
             fired.pop("delegate", None)
     if cur and isinstance(fh, (int, float)) and now - last > cfg.tips_min_interval * 60:
-        family = usage.model_family((st.get("model") or {}).get("id"))
+        family = _family(cur, _model_id(st))
         other = _best_other(cfg, cur.name, family)
         other_txt = ""
         if other:

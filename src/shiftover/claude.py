@@ -27,6 +27,8 @@ VARIADIC_FLAGS = {"--allowedTools", "--allowed-tools", "--disallowedTools", "--d
 SESSION_SELECTORS = {"-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "-p", "--print"}
 # Any of these would make claude authenticate as someone other than the directory's sign-in.
 AUTH_OVERRIDES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+# A child that inherits these reports to the outer `shiftover run`: its hooks write into that run and signal its wrapper.
+RUN_IDENTITY = ("SHIFTOVER_RUN_ID", "SHIFTOVER_PID")
 
 
 def norm(d) -> Path:
@@ -63,6 +65,16 @@ def email(d) -> str:
 
 def mcp_servers(d) -> dict:
     return read_config_json(d).get("mcpServers") or {}
+
+
+def default_model(d) -> str | None:
+    """The model a bare `claude` starts with: ANTHROPIC_MODEL, else the "model" key of settings.json."""
+    env = os.environ.get("ANTHROPIC_MODEL")
+    if env:
+        return env
+    data = paths.read_json(settings_json(d), {})
+    model = data.get("model") if isinstance(data, dict) else None
+    return model if isinstance(model, str) and model else None
 
 
 def access_token(d) -> str:
@@ -118,8 +130,10 @@ def claude_bin() -> str | None:
 
 
 def env_for(d, extra: dict | None = None) -> dict:
+    """The environment for a claude child on account d. The interactive runner hands its own run
+    identity back in through extra; every other child starts outside any run."""
     env = dict(os.environ)
-    for k in AUTH_OVERRIDES:
+    for k in AUTH_OVERRIDES + RUN_IDENTITY:
         env.pop(k, None)
     env.pop("CLAUDE_CONFIG_DIR", None)
     if not is_default(d):
@@ -185,6 +199,20 @@ def strip_flag(flags: list[str], name: str) -> list[str]:
         out.append(flags[i])
         i += 1
     return out
+
+
+def flag_value(args: list[str], name: str) -> str | None:
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def effective_model(args: list[str], d) -> str | None:
+    """The model a launch with these args runs on: its --model, else the default it picks up."""
+    return flag_value(args, "--model") or default_model(d)
 
 
 def wants_print(args: list[str]) -> bool:

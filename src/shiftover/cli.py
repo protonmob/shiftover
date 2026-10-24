@@ -40,15 +40,6 @@ def _dirs(cfg: Config):
     return [a.path for a in cfg.ordered()]
 
 
-def _flag_value(args: list[str], name: str) -> str | None:
-    for i, a in enumerate(args):
-        if a == name and i + 1 < len(args):
-            return args[i + 1]
-        if a.startswith(name + "="):
-            return a.split("=", 1)[1]
-    return None
-
-
 # MARK: run
 
 def cmd_run(args: list[str]) -> int:
@@ -87,7 +78,7 @@ def cmd_run(args: list[str]) -> int:
     if claude_args and claude_args[0] in claude.PASSTHROUGH:
         return runner.spawn(main, claude_args, interactive=False)
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not claude.wants_print(claude_args)
-    family = usage.model_family(_flag_value(claude_args, "--model"))
+    family = usage.model_family(claude.effective_model(claude_args, main.path))
     prefer = cfg.for_cwd(os.getcwd()) or main
     color = _color(sys.stderr)
     if menu:
@@ -475,8 +466,8 @@ def cmd_shell_init(ns) -> int:
              '  claude() { shiftover run "$@"; }',
              '  claude-status() { shiftover status "$@"; }']
     if not ns.no_cl:
-        lines.append('  cl() { if [ -n "${1-}" ] && [ -d "${1-}" ]; then local _d="$1"; shift; shiftover run --menu -C "$_d" "$@"; '
-                     'else shiftover run --menu "$@"; fi; }')
+        lines.append('  cl() { if [ -n "${1-}" ] && [ -d "${1-}" ]; then local _d="$1"; shift; shiftover run -C "$_d" "$@"; '
+                     'else shiftover run "$@"; fi; }')
     lines.append("fi")
     print("\n".join(lines))
     return 0

@@ -123,3 +123,34 @@ def test_delegate_to_codex(home, fake_claude, fake_codex):
     finally:
         p.stdin.close()
         p.wait(5)
+
+
+def _seed_limits(home, spec):
+    from shiftover import config, usage
+    cfg = config.load()
+    paths.write_json(usage.cache_path(), {str(cfg.accounts[n].path): {"ts": 10**12, "email": cfg.accounts[n].email, "limits": [
+        {"kind": k, "model": m, "used": u, "resets_at": None} for k, m, u in lims]} for n, lims in spec.items()})
+
+
+def test_auto_without_a_model_counts_the_settings_model_window(home, fake_claude):
+    from shiftover.delegate import mcp
+    (home / ".claude" / "settings.json").write_text(json.dumps({"model": "fable"}))
+    _seed_limits(home, {"main": [("session", "", 10)],
+                        "second": [("session", "", 5), ("weekly_scoped", "Fable", 100)],
+                        "third": [("session", "", 30), ("weekly_scoped", "Fable", 20)]})
+    out = mcp.Server().delegate({"prompt": "hi"})
+    assert out["account"] == "third" and out["status"] == "done"
+    assert "--model" not in calls(fake_claude)[-1]["argv"]
+
+
+def test_auto_never_falls_back_to_the_calling_account(home, fake_claude):
+    from shiftover.delegate import mcp
+    _seed_limits(home, {"main": [("session", "", 10)], "second": [("session", "", 100)], "third": [("session", "", 100)]})
+    srv = mcp.Server()
+    with pytest.raises(mcp.ToolError, match='pass account="self"'):
+        srv.delegate({"prompt": "x"})
+    assert calls(fake_claude) == []
+    out = srv.delegate({"prompt": "hi", "account": "self"})
+    assert out["account"] == "main" and out["result"] == "echo: hi"
+    desc = next(t for t in mcp.TOOLS if t["name"] == "delegate")["inputSchema"]["properties"]["account"]["description"]
+    assert "never the current one" in desc

@@ -21,6 +21,10 @@ def home(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("SHIFTOVER_ACCOUNT_DIR", raising=False)
     monkeypatch.delenv("SHIFTOVER_RUN_ID", raising=False)
+    # Tests often run inside a real `shiftover run`: never let one signal that wrapper or inherit its account or model.
+    monkeypatch.delenv("SHIFTOVER_PID", raising=False)
+    monkeypatch.delenv("SHIFTOVER_ACCOUNT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.delenv("SHIFTOVER_DEPTH", raising=False)
     import shiftover.claude as c
     monkeypatch.setattr(c, "DEFAULT_DIR", h / ".claude")

@@ -128,3 +128,64 @@ def test_pinned_account_never_hands_off_by_itself(home, monkeypatch):
     monkeypatch.setattr(hooks.handoff, "apply", lambda rd_, req: paths.write_json(rd_ / "handoff.json", req))
     hooks.stop({"session_id": "s8"})
     assert not (rd / "handoff.json").exists()
+
+
+def _limits_cache(home, spec, ts=10**12):
+    """spec: {account: [(kind, model, used, resets_at), ...]} written as the usage cache."""
+    cfg = config.load()
+    paths.write_json(usage.cache_path(), {str(cfg.accounts[n].path): {"ts": ts, "email": cfg.accounts[n].email, "limits": [
+        {"kind": k, "model": m, "used": u, "resets_at": r} for k, m, u, r in lims]} for n, lims in spec.items()})
+
+
+def test_over_cached_reads_the_model_window_the_status_line_lacks(home, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(usage, "refresh_detached", lambda: spawned.append(1))
+    cfg = config.load()
+    main = cfg.accounts["main"]
+    _limits_cache(home, {"main": [("session", "", 40, None), ("weekly_scoped", "Fable", 95, None)]})
+    assert hooks._over_cached(cfg, main, "fable") == "Fable weekly window 95% used"
+    assert hooks._over_cached(cfg, main, "sonnet") == ""
+    assert hooks._over_cached(cfg, main, None) == ""
+    _limits_cache(home, {"main": [("session", "", 96, "2000-01-01T00:00:00Z"), ("weekly_all", "", 97, None)]})
+    assert hooks._over_cached(cfg, main, "fable") == "weekly window 97% used"
+    assert spawned == []
+
+
+def test_over_cached_with_a_stale_entry_only_schedules_a_refresh(home, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(usage, "refresh_detached", lambda: spawned.append(1))
+    cfg = config.load()
+    _limits_cache(home, {"main": [("weekly_scoped", "Fable", 100, None)]}, ts=1)
+    assert hooks._over_cached(cfg, cfg.accounts["main"], "fable") == "" and spawned == [1]
+    paths.write_json(usage.cache_path(), {})
+    assert hooks._over_cached(cfg, cfg.accounts["main"], "fable") == "" and spawned == [1, 1]
+
+
+def test_stop_hands_off_on_a_full_model_window_using_the_settings_model(home, monkeypatch):
+    rd = _run_env(monkeypatch, home)
+    (rd / "sid").write_text("s7")
+    monkeypatch.setattr(usage, "refresh_detached", lambda: None)
+    monkeypatch.setattr(hooks.handoff, "apply", lambda rd_, req: paths.write_json(rd_ / "handoff.json", req))
+    (home / ".claude" / "settings.json").write_text(json.dumps({"model": "fable"}))
+    paths.write_json(paths.sessions_dir() / "s7.json", {"dir": str(home / ".claude"), "account": "main",
+                                                        "rate_limits": {"five_hour": {"used_percentage": 20}}})
+    _limits_cache(home, {"main": [("session", "", 20, None), ("weekly_scoped", "Fable", 97, None)],
+                         "second": [("session", "", 5, None), ("weekly_scoped", "Fable", 100, None)],
+                         "third": [("session", "", 30, None), ("weekly_scoped", "Fable", 10, None)]})
+    hooks.stop({"session_id": "s7"})
+    req = paths.read_json(rd / "handoff.json")
+    assert req["target"] == "third" and req["reason"] == "Fable weekly window 97% used" and req["model"] is None
+
+
+def test_prompt_tip_counts_the_settings_model_window(home, monkeypatch, capsys):
+    rd = _run_env(monkeypatch, home)
+    (rd / "sid").write_text("s6")
+    monkeypatch.setattr(usage, "refresh_detached", lambda: None)
+    (home / ".claude" / "settings.json").write_text(json.dumps({"model": "fable"}))
+    paths.write_json(paths.sessions_dir() / "s6.json", {"dir": str(home / ".claude"), "rate_limits": {"five_hour": {"used_percentage": 80}}})
+    _limits_cache(home, {"main": [("session", "", 80, None)],
+                         "second": [("session", "", 5, None), ("weekly_scoped", "Fable", 100, None)],
+                         "third": [("session", "", 60, None), ("weekly_scoped", "Fable", 10, None)]})
+    hooks.prompt({"session_id": "s6"})
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert 'Account "third" has 40% headroom' in ctx and '"second"' not in ctx

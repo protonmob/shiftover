@@ -34,3 +34,24 @@ def test_pretrust_copies_folder_trust(home):
     assert out["oauthAccount"]["emailAddress"] == "two@example.com"
     assert runner.pretrust(src, dst, "/work/x") is False
     assert runner.pretrust(src, dst, "/work/other") is False
+
+
+def test_print_mode_child_starts_outside_the_outer_run(home, monkeypatch):
+    from shiftover import claude, config
+    monkeypatch.setenv("SHIFTOVER_RUN_ID", "outer-run")
+    monkeypatch.setenv("SHIFTOVER_PID", "8793")
+    monkeypatch.setattr(claude, "claude_bin", lambda: "claude")
+    seen = {}
+
+    class FakeProc:
+        def __init__(self, argv, env=None, **kw):
+            seen["argv"], seen["env"] = argv, env
+
+        def wait(self, *a):
+            return 0
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakeProc)
+    cfg = config.load()
+    assert runner.run(cfg, cfg.accounts["second"], ["-p", "hi"], interactive=False) == 0
+    assert "SHIFTOVER_RUN_ID" not in seen["env"] and "SHIFTOVER_PID" not in seen["env"]
+    assert seen["env"]["SHIFTOVER_ACCOUNT"] == "second" and seen["argv"] == ["claude", "-p", "hi"]

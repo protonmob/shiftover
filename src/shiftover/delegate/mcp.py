@@ -26,7 +26,8 @@ TOOLS = [
                        "connectors and nobody answers its permission prompts. Long tasks: background=true, then monitor.",
         "inputSchema": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "The complete task: goal, paths, constraints, expected output format."},
-            "account": {"type": "string", "description": "Account name, 'auto' (most headroom for the model; default), 'self', or 'codex' for the OpenAI Codex CLI."},
+            "account": {"type": "string", "description": "Account name, 'auto' (default: the other account with the most headroom for the model; "
+                                                         "never the current one), 'self' (this account), or 'codex' for the OpenAI Codex CLI."},
             "model": {"type": "string", "description": "fable | opus | sonnet | haiku or a full model id; for codex an OpenAI model id. Default: the backend's default."},
             "effort": {"type": "string", "enum": EFFORTS},
             "cwd": {"type": "string", "description": "Working directory for the delegate. Default: this project."},
@@ -98,7 +99,7 @@ class Server:
                                 "Use delegate(account=\"codex\"); permission_mode maps to Codex's sandbox."})
         return out
 
-    def _pick_account(self, cfg, spec: str, family: str | None):
+    def _pick_account(self, cfg, spec: str, family: str | None, named_model: str | None = None):
         spec = (spec or "auto").strip()
         if spec == "codex":
             if not codex.binary(cfg):
@@ -107,12 +108,12 @@ class Server:
         if spec == "auto":
             rows = pick.rows_for(cfg, usage.refresh([a.path for a in cfg.ordered()], ttl=60, budget=10))
             row = pick.best(cfg, rows, family, exclude=(self.cur.name,) if self.cur else ())
-            if not row:
-                row = pick.best(cfg, rows, family)
-            if not row and codex.binary(cfg) and not family:
+            # Codex steps in only when the caller named no model: a settings default is not a request for Claude.
+            if not row and codex.binary(cfg) and not named_model:
                 return "codex"
             if not row:
-                raise ToolError("no account has headroom for this task right now")
+                raise ToolError('no other account has headroom for this task right now; '
+                                'pass account="self" to run it on this account anyway')
             return row["account"]
         if spec in ("self", "current"):
             if not self.cur:
@@ -141,11 +142,13 @@ class Server:
             raise ToolError(f"permission_mode must be one of {PERMS}")
         if perm == "bypassPermissions" and not cfg.delegate_allow_bypass:
             raise ToolError("bypassPermissions is disabled; set delegate.allow_bypass = true in the shiftover config to allow it")
-        acct = self._pick_account(cfg, args.get("account") or "auto", usage.model_family(model))
+        main = cfg.main_account()
+        # Without a model the delegate runs the default of the shared settings, so that family's windows decide.
+        family = usage.model_family(model or claude.default_model(main.path if main else claude.current_dir()))
+        acct = self._pick_account(cfg, args.get("account") or "auto", family, named_model=model)
         mcp_mode = args.get("mcp") or cfg.delegate_mcp or "none"
         mcp_servers = None
         if mcp_mode == "main":
-            main = cfg.main_account()
             mcp_servers = {k: v for k, v in claude.mcp_servers(main.path).items() if k != "shiftover"} if main else None
         wait_s = args.get("wait_seconds")
         wait_s = cfg.delegate_wait if wait_s is None else max(0, min(int(wait_s), 600))

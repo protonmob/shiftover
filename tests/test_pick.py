@@ -77,3 +77,13 @@ def test_pinned_account_is_never_an_automatic_target(home):
     assert row["name"] == "third"
     row, msg = pick.choose(cfg, rs, prefer="main")
     assert row["name"] != "third"
+
+
+def test_unreadable_main_still_opens_first(home):
+    cfg = config.load()
+    r, msg = pick.choose(cfg, rows(cfg, {"main": {"err": "timeout"}, "second": {"session": 0}, "third": {"session": 0}}), prefer="main")
+    assert r["name"] == "main" and msg == "limits unreadable (timeout) → opening main"
+    r, msg = pick.choose(cfg, rows(cfg, {"main": {"session": 100}, "second": {"session": 10}}), prefer="main")
+    assert r["name"] == "second" and msg.startswith("⚠") and "main: 5h full" in msg
+    r, msg = pick.choose(cfg, rows(cfg, {"second": {"session": 10}}), prefer="main")
+    assert r["name"] == "second" and msg.startswith("→ second")

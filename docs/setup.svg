@@ -16,7 +16,7 @@
 <text x="22" y="256" xml:space="preserve"><tspan fill="#e6e6e6">Main account [1]: </tspan><tspan fill="#f2cc60">1</tspan></text>
 <text x="22" y="277" xml:space="preserve"></text>
 <text x="22" y="298" xml:space="preserve"><tspan fill="#7ee787">Done. What changed:</tspan></text>
-<text x="22" y="319" xml:space="preserve"><tspan fill="#7ee787">  • </tspan><tspan fill="#e6e6e6">`claude` opens alex. `cl` lets you pick an account by hand.</tspan></text>
+<text x="22" y="319" xml:space="preserve"><tspan fill="#7ee787">  • </tspan><tspan fill="#e6e6e6">`claude` opens alex. `claude --menu` lets you pick an account by hand.</tspan></text>
 <text x="22" y="340" xml:space="preserve"><tspan fill="#7ee787">  • </tspan><tspan fill="#e6e6e6">When alex runs out, your conversation continues on another account by itself.</tspan></text>
 <text x="22" y="361" xml:space="preserve"><tspan fill="#7ee787">  • </tspan><tspan fill="#e6e6e6">Inside Claude: type /handoff to switch, or ask Claude to &quot;delegate&quot; a task</tspan></text>
 <text x="22" y="382" xml:space="preserve"><tspan fill="#e6e6e6">    to another account.</tspan></text>
