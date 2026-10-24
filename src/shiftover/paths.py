@@ -41,6 +41,15 @@ def log_file() -> Path:
     return cache_dir() / "shiftover.log"
 
 
+def data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME")
+    return (Path(base) if base else HOME / ".local" / "share") / "shiftover"
+
+
+def mods_dir() -> Path:
+    return data_dir() / "mods"
+
+
 def ensure_dir(p: Path, mode: int = 0o700) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     try:

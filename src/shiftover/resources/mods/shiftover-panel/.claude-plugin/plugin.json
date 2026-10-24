@@ -1,0 +1,6 @@
+{
+  "name": "shiftover-panel",
+  "version": "0.1.0",
+  "description": "Shiftover accounts and delegate jobs beside the chat",
+  "types": "./types/index.d.ts"
+}

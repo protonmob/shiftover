@@ -228,6 +228,9 @@ def cmd_doctor(ns) -> int:
     for d, have in st["skills"].items():
         (_ok if have else _warn)(f"{d}/shiftover/SKILL.md {'present' if have else 'missing (run `shiftover install`)'}")
         problems += 0 if have else 1
+    for p, on in st["panel"].items():
+        (_ok if on else _warn)(f"{p}: side panel {'enabled' if on else 'not enabled (run `shiftover install`)'}")
+        problems += 0 if on else 1
     rc = ""
     for f in ("~/.zshrc", "~/.bashrc", "~/.bash_profile", "~/.config/fish/config.fish"):
         if installer.shell_wired(Path(os.path.expanduser(f))):
@@ -347,7 +350,7 @@ def cmd_setup(ns) -> int:
             report = installer.install(cfg)
         except installer.InstallError as e:
             return _err(str(e))
-        backup = next((r.split("backup ", 1)[1] for r in report if "backup " in r), None)
+        backup = next((r.split("backup ", 1)[1] for r in report if "backup " in r and not r.startswith("panel")), None)
         for r in report:
             if r.startswith("mcp ") and ": failed: " in r:
                 mcp_failed.append(r[4:].split(":", 1)[0])
@@ -620,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("remove", help="remove an account from the config")
     s.add_argument("name")
 
-    s = sub.add_parser("install", help="install hooks, status line, MCP server, /handoff and the skill")
+    s = sub.add_parser("install", help="install hooks, status line, MCP server, /handoff, the skill and the side panel")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-mcp", action="store_true")
     s.add_argument("--no-files", action="store_true")

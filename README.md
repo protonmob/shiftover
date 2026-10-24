@@ -79,6 +79,14 @@ spare has 80 % room*, and passes it on. The status line always shows the active 
 **Quality of life.** Directory → account rules, `sync-mcp` to copy local MCP servers between accounts, `doctor`, an
 arrow-key picker (`claude --menu`), English or Turkish messages.
 
+## Side panel
+
+A panel beside the chat shows each account's limits, the open chats with their state, delegate jobs and this session's
+agents. Click a chat or a job to jump to its tab; `/shiftover-panel` shows or hides the panel.
+
+The panel is a Claude Code plugin (a "mod"). `shiftover install`, and so `setup`, keeps a copy of it in
+`~/.local/share/shiftover/mods` and installs it from there at user scope; `shiftover uninstall` removes it again.
+
 ## Requirements
 
 - macOS (Linux should work but is untested; credentials are read through the macOS Keychain or `.credentials.json`)
@@ -88,9 +96,10 @@ arrow-key picker (`claude --menu`), English or Turkish messages.
 
 ## How it works
 
-Under the hood `setup` does four things: installs four hooks and a status-line command into Claude Code's
+Under the hood `setup` does five things: installs four hooks and a status-line command into Claude Code's
 `settings.json` (backed up first), registers the `shiftover` MCP server in every account, copies the `/handoff` command
-and a skill, and adds `eval "$(shiftover shell-init)"` to your shell rc so that `claude` runs `shiftover run`.
+and a skill, installs the side panel plugin, and adds `eval "$(shiftover shell-init)"` to your shell rc so that `claude`
+runs `shiftover run`.
 The pieces are available separately as `shiftover init --import`, `shiftover install` and `shiftover shell-init`.
 
 ```mermaid
@@ -126,7 +135,7 @@ sequenceDiagram
 | --- | --- |
 | `shiftover run [--menu] [-a ACCOUNT] [claude args…]` | what the `claude` shell function calls; `--menu` shows the picker, `SHIFTOVER_ACCOUNT=name` forces an account |
 | `shiftover status [--refresh] [--json]` | accounts with their windows |
-| `shiftover doctor` | sign-in drift, shared directories, hooks, MCP registration, shell wiring |
+| `shiftover doctor` | sign-in drift, shared directories, hooks, MCP registration, side panel, shell wiring |
 | `shiftover setup [--main NAME] [--no-install] [--no-shell]` | scan, pick the main account, install, wire the shell |
 | `shiftover init --import [--main NAME] [--name DIR=NAME…]` | create the config only |
 | `shiftover add NAME [--dir D] [--no-share] [--main]` / `remove NAME` | add a directory and sign in / drop one for good (`setup` will not re-add it) |

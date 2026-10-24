@@ -1,0 +1,8 @@
+{
+  "name": "shiftover",
+  "owner": { "name": "Kadir Aktaş" },
+  "plugins": [
+    { "name": "shiftover-panel", "source": "./shiftover-panel",
+      "description": "Shiftover accounts, open chats and delegate jobs beside the chat" }
+  ]
+}

@@ -18,6 +18,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(h))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(h / ".config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(h / ".cache"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(h / ".local" / "share"))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("SHIFTOVER_ACCOUNT_DIR", raising=False)
     monkeypatch.delenv("SHIFTOVER_RUN_ID", raising=False)

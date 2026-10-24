@@ -1,4 +1,4 @@
-"""Wires shiftover into Claude Code: hooks, status line, the MCP server, the /handoff command and the skill."""
+"""Wires shiftover into Claude Code: hooks, status line, the MCP server, the /handoff command, the skill and the side panel."""
 import json
 import os
 import re
@@ -12,7 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 from . import claude, config, paths
-from .config import Config
+from .config import Account, Config
 
 SHARED = ["CLAUDE.md", "settings.json", "settings.local.json", "agents", "commands", "skills", "hooks",
           "output-styles", "plugins", "projects"]
@@ -107,7 +107,8 @@ def unmerge_settings(settings: dict, restore_cmd: str) -> tuple[dict, list[str]]
     return settings, changes
 
 
-def settings_targets(cfg: Config) -> list[Path]:
+def _settings_accounts(cfg: Config) -> list[tuple[Path, Account]]:
+    """Each distinct settings.json with the first account (main first) that reads it."""
     seen, out = set(), []
     for a in cfg.ordered():
         p = claude.settings_json(a.path)
@@ -117,8 +118,12 @@ def settings_targets(cfg: Config) -> list[Path]:
         if key in seen:
             continue
         seen.add(key)
-        out.append(p)
+        out.append((p, a))
     return out
+
+
+def settings_targets(cfg: Config) -> list[Path]:
+    return [p for p, _ in _settings_accounts(cfg)]
 
 
 def _read_settings(p: Path) -> dict:
@@ -235,6 +240,7 @@ def install(cfg: Config, dry_run: bool = False, with_mcp: bool = True, with_file
             if not dry_run:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(_resource("skills/shiftover/SKILL.md"), encoding="utf-8")
+        report += _panel_install(cfg, dry_run)
     return report
 
 
@@ -262,6 +268,7 @@ def uninstall(cfg: Config, dry_run: bool = False) -> list[str]:
             report.append(f"{f}: {'would remove' if dry_run else 'removed'}")
             if not dry_run:
                 shutil.rmtree(f, ignore_errors=True)
+    report += _panel_uninstall(cfg, dry_run)
     rc = shell_rc()
     if rc and rc.exists() and "shiftover shell-init" in rc.read_text(encoding="utf-8", errors="replace"):
         report.append(f"{rc}: {'would remove' if dry_run else 'removed'} the shiftover line")
@@ -287,7 +294,7 @@ def share(main_dir: Path, new_dir: Path) -> list[str]:
 
 
 def installed_state(cfg: Config) -> dict:
-    state = {"hooks": {}, "statusline": {}, "mcp": {}, "commands": {}, "skills": {}}
+    state = {"hooks": {}, "statusline": {}, "mcp": {}, "commands": {}, "skills": {}, "panel": {}}
     for p in settings_targets(cfg):
         try:
             data = _read_settings(p)
@@ -299,6 +306,7 @@ def installed_state(cfg: Config) -> dict:
         state["hooks"][str(p)] = have
         sl = data.get("statusLine") or {}
         state["statusline"][str(p)] = is_ours(str(sl.get("command", ""))) if isinstance(sl, dict) else False
+        state["panel"][str(p)] = _plugin_settings(p)[1].get(PLUGIN) is True
     for a in cfg.ordered():
         state["mcp"][a.name] = _mcp_registered(a.path)
     for d in _file_targets(cfg, "commands"):
@@ -356,3 +364,132 @@ def ensure_shell_init(rc: Path | None = None) -> str:
     with open(rc, "a", encoding="utf-8") as f:
         f.write(("" if text.endswith("\n") or not text else "\n") + SHELL_MARK + "\n" + SHELL_LINE + "\n")
     return "added"
+
+
+# MARK: side panel
+
+MARKETPLACE = "shiftover"
+PLUGIN = "shiftover-panel@shiftover"
+
+
+def _plugin_settings(p: Path) -> tuple[dict, dict]:
+    """extraKnownMarketplaces and enabledPlugins of a settings.json, {} when absent or malformed."""
+    data = paths.read_json(p, {})
+    data = data if isinstance(data, dict) else {}
+    known, enabled = data.get("extraKnownMarketplaces"), data.get("enabledPlugins")
+    return (known if isinstance(known, dict) else {}), (enabled if isinstance(enabled, dict) else {})
+
+
+def _copy_tree(src, dst: Path) -> None:
+    """src is a Traversable, so a zipped package copies too."""
+    dst.mkdir()
+    for item in src.iterdir():
+        if item.is_dir():
+            _copy_tree(item, dst / item.name)
+        else:
+            (dst / item.name).write_bytes(item.read_bytes())
+
+
+def _copy_mods(target: Path) -> None:
+    """Swaps in a fresh copy of the bundled marketplace; claude keeps this path, which outlives the package."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}-"))
+    new, old = work / "new", work / "old"
+    try:
+        _copy_tree(resources.files("shiftover") / "resources" / "mods", new)
+        if os.path.lexists(target):
+            target.rename(old)
+        try:
+            new.rename(target)
+        except OSError:
+            if os.path.lexists(old):
+                old.rename(target)
+            raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _trim(text: str, limit: int = 200) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _claude(b: str, acct: Account, args: list[str]) -> str | None:
+    """Runs `claude <args>` as acct: None when it exits 0, else what went wrong. stdin is closed so a prompt
+    can never hang on the terminal `shiftover setup` is reading."""
+    try:
+        r = subprocess.run([b, *args], env=claude.env_for(acct.path), capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    except (OSError, subprocess.SubprocessError) as e:
+        return _trim(str(e)) or type(e).__name__
+    if r.returncode == 0:
+        return None
+    return _trim(r.stderr) or _trim(r.stdout) or f"exit {r.returncode}"
+
+
+def _panel_install(cfg: Config, dry_run: bool) -> list[str]:
+    b = claude.claude_bin()
+    if not b:
+        return ["panel: skipped, claude CLI not found"]
+    mods = paths.mods_dir()
+    if dry_run:
+        report = [f"panel: would copy to {mods}"]
+    else:
+        try:
+            _copy_mods(mods)
+        except Exception as e:  # noqa: BLE001 - a failed copy is reported, the rest of install goes on
+            return [f"panel: copy to {mods} failed: {_trim(str(e)) or type(e).__name__}"]
+        report = [f"panel: copied to {mods}"]
+    add, update = ["plugin", "marketplace", "add", str(mods)], ["plugin", "marketplace", "update", MARKETPLACE]
+    for p, a in _settings_accounts(cfg):
+        known, enabled = _plugin_settings(p)
+        cmd = update if MARKETPLACE in known else add
+        if dry_run:
+            report.append(f"panel {p}: would run: claude {' '.join(cmd)}")
+        else:
+            err = _claude(b, a, cmd)
+            # Registered in a shared plugins/ dir that this settings.json does not show: add refuses, update works.
+            if err and cmd is add and _claude(b, a, update) is None:
+                cmd, err = update, None
+            if err:
+                report.append(f"panel {p}: failed: claude {' '.join(cmd)}: {err}")
+                continue
+            report.append(f"panel {p}: marketplace {'updated' if cmd is update else 'added'}")
+        if enabled.get(PLUGIN) is True:
+            report.append(f"panel {p}: already installed and enabled")
+        elif dry_run:
+            report.append(f"panel {p}: would run: claude plugin install {PLUGIN}")
+        else:
+            err = _claude(b, a, ["plugin", "install", PLUGIN])
+            report.append(f"panel {p}: " + (f"failed: claude plugin install {PLUGIN}: {err}" if err else "plugin installed"))
+    return report
+
+
+def _panel_uninstall(cfg: Config, dry_run: bool) -> list[str]:
+    report: list[str] = []
+    b = claude.claude_bin()
+    for p, a in _settings_accounts(cfg):
+        known, enabled = _plugin_settings(p)
+        steps = []
+        if PLUGIN in enabled:
+            steps.append((["plugin", "uninstall", PLUGIN], "plugin uninstalled"))
+        if MARKETPLACE in known:
+            steps.append((["plugin", "marketplace", "remove", MARKETPLACE], "marketplace removed"))
+        if steps and not b:
+            report.append(f"panel {p}: stays registered, claude CLI not found")
+            continue
+        for args, done in steps:
+            cmd = "claude " + " ".join(args)
+            if dry_run:
+                report.append(f"panel {p}: would run: {cmd}")
+            else:
+                err = _claude(b, a, args)
+                report.append(f"panel {p}: " + (f"failed: {cmd}: {err}" if err else done))
+    mods = paths.mods_dir()
+    if mods.exists():
+        report.append(f"{mods}: {'would remove' if dry_run else 'removed'}")
+        if not dry_run:
+            shutil.rmtree(mods, ignore_errors=True)
+    return report

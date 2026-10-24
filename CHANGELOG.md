@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Side panel: `shiftover install` (and so `setup`) installs a Claude Code plugin that shows account limits, open chats, delegate jobs and this session's agents beside the chat; `uninstall` removes it and `doctor` checks it.
 - Accounts can be kept out of the pool (`pool = false`, or the second `setup` question): opened only on request, never a hand-off or delegate target, and never left for another account when full.
 - `shiftover remove` is remembered (`ignore` list); `setup` no longer re-adds a removed directory.
 - Delegate to the OpenAI Codex CLI: `delegate(account="codex")`, listed by `accounts()`, `status` and `doctor`.

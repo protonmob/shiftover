@@ -30,7 +30,8 @@ shiftover = "shiftover.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-shiftover = ["resources/**/*"]
+# glob() skips dot-directories, so the plugin manifests need their own patterns.
+shiftover = ["resources/**/*", "resources/mods/.claude-plugin/*", "resources/mods/*/.claude-plugin/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
