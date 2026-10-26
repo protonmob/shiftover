@@ -72,7 +72,8 @@ export type Job = {
   durationMs: number | null
   costUsd: number | null
   /** What a running job does now, in Turkish (`register.tsx düzenleniyor`),
-   * from its live transcript or log; absent once it no longer runs. */
+   * from its live transcript or log: the last step it named, `çalışıyor`
+   * before any; absent once it no longer runs. */
   step?: string
 }
 

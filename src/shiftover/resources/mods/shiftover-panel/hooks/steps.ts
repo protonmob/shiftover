@@ -12,6 +12,11 @@ const basename = (path: string): string => path.replace(/\/+$/, '').split('/').p
 // A test, typecheck or build reads as tests running, any other command as a
 // command: the tool's word standing alone, not inside a file name.
 const TEST_COMMAND = /(?:^|[^\w.-])(?:test|pytest|tsc|jest|vitest|xcodebuild|gradlew?)(?=$|[^\w.-])/
+// Tools that say what they do by name alone; an MCP server's, by its prefix.
+const TOOL_STEPS = new Map([
+  ['WebSearch', "web'de arıyor"], ['WebFetch', "web'de arıyor"], ['TodoWrite', 'plan güncelleniyor'],
+  ['Skill', 'beceri kullanıyor'], ['AskUserQuestion', 'soru soruyor'],
+])
 
 export function commandStep(command: string): string {
   return TEST_COMMAND.test(command) ? 'testler çalışıyor' : 'komut çalışıyor'
@@ -24,14 +29,19 @@ function toolStep(name: string, input: Record<string, unknown>): string {
   if (name === 'Grep' || name === 'Glob') return 'aranıyor'
   if (name === 'Bash') return commandStep(text(input.command))
   if (name === 'Agent' || name === 'Task') return 'alt ajan çalışıyor'
-  return 'çalışıyor'
+  if (name.startsWith('mcp__')) return 'araç kullanıyor'
+  return TOOL_STEPS.get(name) ?? 'çalışıyor'
 }
 
 // The last assistant line's last block: the tool it called, the text it
-// writes or its thinking. A tail cut mid-line drops its first line.
-export function claudeStep(tail: string, truncated = false): string {
+// writes or its thinking. A tail cut mid-line drops its first line. Null
+// while the tail holds no assistant line: a session's end is often one huge
+// line, a tool's image or a request's copy of it, and says no step.
+export function claudeStep(tail: string, truncated = false): string | null {
   const lines = tail.split('\n')
   for (let index = lines.length - 1; index >= (truncated ? 1 : 0); index -= 1) {
+    // Only an assistant line is parsed; the huge ones in between are not.
+    if (!lines[index]!.includes('"assistant"')) continue
     let row: unknown
     try {
       row = JSON.parse(lines[index]!)
@@ -47,12 +57,13 @@ export function claudeStep(tail: string, truncated = false): string {
     if (block.type === 'thinking' || block.type === 'redacted_thinking') return 'düşünüyor'
     return 'çalışıyor'
   }
-  return 'çalışıyor'
+  return null
 }
 
 // `codex exec --json` reports each step as an item, started and completed:
-// a command, a file change, a message or reasoning. The last one is the step.
-export function codexStep(tail: string, truncated = false): string {
+// a command, a file change, a message or reasoning. The last one is the step;
+// null while the tail holds none.
+export function codexStep(tail: string, truncated = false): string | null {
   const lines = tail.split('\n')
   for (let index = lines.length - 1; index >= (truncated ? 1 : 0); index -= 1) {
     let row: unknown
@@ -76,7 +87,7 @@ export function codexStep(tail: string, truncated = false): string {
     if (kind === 'reasoning') return 'düşünüyor'
     return 'çalışıyor'
   }
-  return 'çalışıyor'
+  return null
 }
 
 // MARK: - Session folders
@@ -88,4 +99,26 @@ export function codexStep(tail: string, truncated = false): string {
 export function projectFolders(cwd: string): string[] {
   const clean = cwd.replace(/\/+$/, '')
   return [...new Set([clean.replace(/[^a-zA-Z0-9]/g, '-'), clean.replace(/[/.]/g, '-')])]
+}
+
+// A delegate's session names itself in its first lines: shiftover titles it
+// `delegate:<label>` (`custom-title`, then `agent-name`). Every account's
+// sessions for one folder share it, so this tells the job's own apart. The
+// label; null when the whole lines read name no delegate; undefined before
+// the session holds a whole line.
+export function delegateLabel(head: string): string | null | undefined {
+  let isRead = false
+  for (const line of head.split('\n')) {
+    let row: unknown
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    isRead = true
+    if (!isRecord(row)) continue
+    const title = row.type === 'custom-title' ? text(row.customTitle) : row.type === 'agent-name' ? text(row.agentName) : ''
+    if (title.startsWith('delegate:')) return title.slice('delegate:'.length).trim()
+  }
+  return isRead ? null : undefined
 }

@@ -1,8 +1,9 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { Engine, Mounted } from 'claude-code/testing'
-import type { AgentInfo, On } from 'claude-code'
+import type { ElementQuery, Engine, FoundElement, Mounted, MountPointerEvent, MountPressTarget, MountTarget } from 'claude-code/testing'
+import type { AgentInfo, On, RenderSurface } from 'claude-code'
+import type { CapsuleProps } from './capsule'
 import { chatStatus, formatModelId, isShellTitle, parsePanels, parseSessions, parseTranscriptTail, parseWorkspaces } from './sessions'
-import { claudeStep, codexStep, commandStep, projectFolders } from './steps'
+import { claudeStep, codexStep, commandStep, delegateLabel, projectFolders } from './steps'
 
 const PANE = {
   plugin: 'shiftover-panel', component: 'Pane', requestId: 'shiftover-panel',
@@ -199,25 +200,27 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
       }
       return ran(isMissing ? 2 : found.length > 0 ? 0 : 1, found.join(''))
     }
-    if (e.argv[0] === 'tail') {
-      // As BSD tail: with several files, each one's end under `==> path <==`,
-      // a newline before every later head; a missing file gets no head.
+    if (e.argv[0] === 'tail' || e.argv[0] === 'head') {
+      // As BSD tail and head: with several files, each one's end or start
+      // under `==> path <==`, a newline before every later head; a missing
+      // file gets no head.
       const fileOf = (path: string) => (path.startsWith(`${JOBS}/`) && path.endsWith('.out')
         ? state.outs.get(path.slice(JOBS.length + 1, -4)) : undefined) ?? state.chatFiles.get(path) ?? state.codexFiles.get(path)
       const paths = e.argv.slice(e.argv.indexOf('--') + 1)
       const bytes = Number(e.argv[2])
+      const part = (text: string): string => e.argv[0] === 'tail' ? text.slice(-bytes) : text.slice(0, bytes)
       if (paths.length === 1) {
         const file = fileOf(paths[0]!)
-        return file ? ran(0, file.text.slice(-bytes)) : ran(1, '', 'transcript unavailable')
+        return file ? ran(0, part(file.text)) : ran(1, '', 'transcript unavailable')
       }
       let stdout = ''
       let isMissing = false
       for (const path of paths) {
         const file = fileOf(path)
         if (!file) { isMissing = true; continue }
-        stdout += `${stdout === '' ? '' : '\n'}==> ${path} <==\n${file.text.slice(-bytes)}`
+        stdout += `${stdout === '' ? '' : '\n'}==> ${path} <==\n${part(file.text)}`
       }
-      return ran(isMissing ? 1 : 0, stdout, isMissing ? 'tail: No such file or directory\n' : '')
+      return ran(isMissing ? 1 : 0, stdout, isMissing ? `${e.argv[0]}: No such file or directory\n` : '')
     }
     if (state.isCmuxDown && (e.argv[1] === 'list-workspaces' || e.argv[1] === 'list-panels')) return ran(1, '', 'socket unavailable\n')
     if (e.argv[1] === 'list-workspaces') return ran(0, `* workspace:1 ${WS} Main\n`)
@@ -386,9 +389,10 @@ const capsuleBorder = (tree: unknown, title: string): DrawnNode | undefined =>
 const borderOverlay = (frame: DrawnNode | undefined): DrawnNode | undefined =>
   (frame?.children as DrawnNode[] | undefined)?.find(node =>
     node.type === 'Box' && node.props?.position === 'absolute' && node.props.borderStyle === undefined)
-// A chat's running delegates: a row Button each under the chat's own lines.
+// A chat's running delegates: a row each under the chat's own lines, a keyed
+// Box the capsule module drew or, without it, a Button.
 const followButtonsIn = (capsule: DrawnNode | undefined): DrawnNode[] => drawnNodes(capsule)
-  .filter(node => node.type === 'Button' && String(node.props?.key).startsWith('follow:'))
+  .filter(node => (node.type === 'Button' || node.type === 'Box') && String(node.props?.key).startsWith('follow:'))
 const followButtons = (tree: unknown, title: string): DrawnNode[] => followButtonsIn(capsuleFor(tree, title))
 const subRows = (tree: unknown, title: string): string[] => followButtons(tree, title).flatMap(node => contentRows(node))
 const subRow = (name: string, step = 'çalışıyor'): RegExp => new RegExp(`^└ [${spinner}] ${name}  ${step}$`)
@@ -425,10 +429,27 @@ function expectLimitColumns(capsule: DrawnNode, limits: readonly { label: string
   expect(rows.slice(1, 4).every(row => cells(row) <= room)).toBe(true)
 }
 const lineButtons = (tree: unknown): DrawnNode[] => drawnNodes(tree).filter(node => node.type === 'Button')
+// The pane's press targets in drawing order: the capsule Clients where the
+// surface runs the capsule module, each with its lines' text and whether a
+// click on them acts; elsewhere the Buttons.
+type Target = { key: string; label: string; text: string; isPressable: boolean }
+async function targetsOf(ui: Pick<Mounted, 'findAll'>): Promise<Target[]> {
+  const clients = await ui.findAll({ type: 'Client' })
+  if (clients.length > 0) {
+    return clients.map(node => {
+      const props = node.props.props as CapsuleProps
+      const lines = props.lines.map(line => line.map(seg => seg.text).join(''))
+      return { key: node.key ?? '', label: lines[0] ?? '', text: lines.join('\n'), isPressable: props.isPressable }
+    })
+  }
+  return (await ui.findAll({ type: 'Button' })).map(node =>
+    ({ key: node.key ?? '', label: String(node.props.label), text: node.text, isPressable: true }))
+}
 const grepCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'grep')
 const jobPsCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'ps' && !call.argv.includes('pid='))
 const chatPsCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'ps' && call.argv.includes('pid='))
 const tailCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'tail')
+const headCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'head')
 // A transcript the starter search finds: the delegate tool's answer for each
 // id, its JSON kept inside an escaped string as a transcript row keeps it.
 const mention = (state: World, path: string, ...ids: string[]): void => {
@@ -487,11 +508,80 @@ function observedClock(on: On) {
   return { ...clock, waits: () => [...waits] }
 }
 
+// MARK: - Capsule clients
+
+// On the terminal and the desktop the chat and job capsules are Clients the
+// capsule module draws. A drawing mounted here reads as one tree, each Client
+// replaced by what its module drew, and a press of a capsule or a delegate
+// row is a left click on that part; a Button is pressed as before.
+type Handle = {
+  drawn: (scope?: { in?: string }) => Promise<unknown>
+  find: (query: ElementQuery) => Promise<FoundElement | undefined>
+  findAll: (query: ElementQuery) => Promise<FoundElement[]>
+  press: (target: MountPressTarget) => Promise<unknown>
+  pointer?: (event: MountPointerEvent) => Promise<void>
+}
+const clientKeys = (tree: unknown): string[] =>
+  drawnNodes(tree).filter(node => node.type === 'Client').map(node => String(node.props?.key))
+async function expanded(ui: Handle, node: unknown): Promise<unknown> {
+  if (typeof node !== 'object' || node === null) return node
+  const element = node as DrawnNode
+  if (element.type === 'Client') return ui.drawn({ in: String(element.props?.key) })
+  return element.children === undefined ? node
+    : { ...element, children: await Promise.all(element.children.map(child => expanded(ui, child))) }
+}
+// The row of a capsule's region a part sits on: its border's row is 0.
+const rowIn = (capsule: unknown, key: string): number =>
+  ((capsule as DrawnNode).children ?? []).findIndex(child => (child as DrawnNode | null)?.props?.key === key) + 1
+const click = async (ui: Handle, key: string, y = 1, button: 'left' | 'middle' | 'right' = 'left'): Promise<void> => {
+  await ui.pointer!({ type: 'down', x: 2, y, button, in: key })
+  await ui.pointer!({ type: 'up', x: 2, y, button, in: key })
+}
+function withClients<M>(mounted: M): M {
+  const raw = mounted as unknown as Handle
+  const members: Record<string, unknown> = { surface: (mounted as { surface: string }).surface }
+  for (const name of ['drawn', 'find', 'findAll', 'press', 'input', 'select', 'key', 'pointer', 'post', 'advance',
+    'resize', 'redraw', 'unmount']) {
+    const member = (mounted as Record<string, unknown>)[name]
+    if (typeof member === 'function') members[name] = member.bind(mounted)
+  }
+  const handle = members as unknown as Handle
+  return Object.assign(members, {
+    drawn: async (scope?: { in?: string }) => scope?.in === undefined ? expanded(handle, await raw.drawn()) : raw.drawn(scope),
+    find: async (query: ElementQuery) => {
+      const own = await raw.find(query)
+      if (own !== undefined || query.in !== undefined) return own
+      for (const key of clientKeys(await raw.drawn())) {
+        const found = await raw.find({ ...query, in: key })
+        if (found !== undefined) return found
+      }
+      return undefined
+    },
+    findAll: async (query: ElementQuery) => {
+      const own = await raw.findAll(query)
+      if (query.in !== undefined) return own
+      const inner = await Promise.all(clientKeys(await raw.drawn()).map(key => raw.findAll({ ...query, in: key })))
+      return [...own, ...inner.flat()]
+    },
+    press: async (target: MountPressTarget) => {
+      const keys = target.plugin === undefined && target.link === undefined ? clientKeys(await raw.drawn()) : []
+      if (keys.includes(target.key)) return click(handle, target.key)
+      for (const key of target.key.startsWith('follow:') ? keys : []) {
+        const y = rowIn(await raw.drawn({ in: key }), target.key)
+        if (y > 0) return click(handle, key, y)
+      }
+      return raw.press(target)
+    },
+  }) as unknown as M
+}
+const mount = <P extends RenderSurface>($: Engine, target: MountTarget<P, 'Pane'>): Promise<Mounted<P, 'Pane'>> =>
+  $.ui.mount(target).then(withClients)
+
 test('three compact cards and their round capsules render on every surface without wrapped rows', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); world(on)
   await start($, clock)
   for (const surface of SURFACES) {
-    const ui = await $.ui.mount({ ...PANE, surface })
+    const ui = await mount($,{ ...PANE, surface })
     for (const title of ['Hesaplar ▾', 'Sohbetler', 'İşler']) {
       expect(await rowText(ui, new RegExp(title))).toBeDefined()
       expect((await ui.findAll({ type: 'Text', text: new RegExp(`^ ${title} $`) })).some(node => node.props.weight === 'bold' && node.props.color === 'text')).toBe(true)
@@ -515,7 +605,7 @@ test('three compact cards and their round capsules render on every surface witho
 test('the pane starts with Hesaplar, has no Oturum card, and never reads session usage', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   for (const elapsed of [0, 60_000]) {
     await clock.advance(elapsed)
     expect((await paneRows(ui)).join('')).not.toMatch(/Oturum/)
@@ -534,7 +624,7 @@ test('every account and Codex bar uses fixed whole heavy-line cells with severit
     { used_percent: 90, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
   await start($, clock)
   for (const width of [32, 42, 58]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const rows = await paneRows(ui)
     expect(rows.join('')).not.toMatch(/[▏▎▍▌▋▊▉█░▁▇]/)
     const tree = await ui.drawn()
@@ -574,7 +664,7 @@ test('every account has its own round capsule with a name, ordered mini columns,
     { name: 'yusa', email: '', dir: `${HOME}/.claude-yusa`, limits: [] },
   ]; state.jobs = []; state.sessions = {}
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   for (const name of ['kadir', 'aras', 'yusa', 'codex']) {
     const capsule = accountCapsule(tree, name)!
@@ -613,7 +703,7 @@ test('critical notes compact reset time before truncating and never overflow nar
   ]; state.jobs = []; state.sessions = {}
   await start($, clock)
   for (const width of [32, 42, 58]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     for (const [name, note] of [
       ['kadir', width === 32 ? '5 saat 4sa sonra açılır' : '5 saat 4sa 59dk sonra açılır'],
@@ -640,7 +730,7 @@ test('several critical limits use one note after the bars for the highest usage'
     ...limit(90 + index, kind, kind === 'weekly_scoped' ? 'Fable' : ''), resets_at: iso(NOW + 67 * 3_600_000 + 60_000),
   }))); state.jobs = []
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const capsule = accountCapsule(await ui.drawn(), 'kadir')!
   const rows = contentRows(capsule)
   expect(rows).toHaveLength(5)
@@ -656,7 +746,7 @@ test('percent severity uses success below 75, warning through 89, and bold error
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.accounts = oneAccount([limit(74), limit(89, 'weekly_all'), limit(90, 'weekly_scoped', 'Fable')]); state.jobs = []
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   for (const [percent, color] of [[74, 'success'], [89, 'warning'], [90, 'error']] as const) {
     const node = await ui.find({ type: 'Text', text: new RegExp(`^ *${percent}%$`) })
     expect(node?.props.color).toBe(color)
@@ -669,7 +759,7 @@ test('percent severity uses success below 75, warning through 89, and bold error
 test('current account follows CLAUDE_CONFIG_DIR and warning errors replace only the second capsule line', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); world(on, { CLAUDE_CONFIG_DIR: `${HOME}/.claude-aras/`, SHIFTOVER_ACCOUNT: 'kadir' })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   const kadir = accountCapsule(tree, 'kadir')!
   expect(contentRows(kadir)).toEqual(['○ kadir', 'yeniden giriş gerekli'])
@@ -691,7 +781,7 @@ test('Hesaplar shows only existing limits with their model names and never uses 
     { name: 'yusa', email: '', dir: `${HOME}/.claude-yusa`, err: 'şu an okunamıyor' },
   ]; state.jobs = []; state.sessions = {}
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: 'Sonnet', percent: 12 }])
   expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 0 }, { label: 'Fable', percent: 43 }])
@@ -713,7 +803,7 @@ test('each capsule centers labels and complete percentages over equal columns at
   ]; state.jobs = []; state.sessions = {}
   await start($, clock)
   for (const width of [32, 42, 58]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const rows = laidOutRows(tree, width)
     expect(rows.filter(row => /5 saat.*hafta.*Fable/.test(row))).toHaveLength(1)
@@ -743,7 +833,7 @@ test('the approved 58-column account fixture has the critical Fable note and no 
   ]; state.jobs = []; state.sessions = {}
   state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine({ used_percent: 6, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 58 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 58 }, surface: 'terminal' })
   const tree = await ui.drawn()
   const card = accountsCard(tree)!
   expect(card).toBeDefined()
@@ -772,7 +862,7 @@ test('wide accounts align three inline cells, leave missing limits blank, and in
   await start($, clock)
   for (const width of [76, 96]) {
     for (const surface of SURFACES) {
-      const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface })
+      const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface })
       const tree = await ui.drawn()
       const kadir = accountCapsule(tree, 'kadir')!
       const room = accountRoom(kadir)
@@ -810,7 +900,7 @@ test('wide accounts align three inline cells, leave missing limits blank, and in
       await ui.unmount()
     }
   }
-  const narrow = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const narrow = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await narrow.drawn()
   expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '5 saat', percent: 2 }, { label: 'hafta', percent: 75 }, { label: 'Fable', percent: 96 }])
   expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 10 }, { label: 'Fable', percent: 45 }])
@@ -841,7 +931,7 @@ test('5-hour columns show their reset countdown with an arrow where it fits, els
     { used_percent: 5, window_minutes: 10080, resets_at: NOW / 1000 + 50 * 3600 }) })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const [width, label] of [[42, '↻ 1sa 48dk'], [38, '1sa 48dk'], [32, '1sa 48…']] as const) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const kadir = accountCapsule(tree, 'kadir')!
     expectLimitColumns(kadir, [{ label, percent: 12 }, { label: 'hafta', percent: 40 }, { label: 'Fable', percent: 60 }])
@@ -855,7 +945,7 @@ test('5-hour columns show their reset countdown with an arrow where it fits, els
     await ui.unmount()
   }
   // Too narrow for the name, a fallback still shortens to 5s.
-  const tiny = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 24 }, surface: 'terminal' })
+  const tiny = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 24 }, surface: 'terminal' })
   expect(contentRows(accountCapsule(await tiny.drawn(), 'aras'))[1]!.trim()).toMatch(/^5s /)
   await tiny.unmount()
 })
@@ -871,7 +961,7 @@ test('wide inline cells give 5-hour countdowns one shared slot so bars line up, 
   for (const [width, labels] of [
     [96, { kadir: '↻ 1sa 48dk', aras: '↻ 35dk', yusa: '5s' }], [86, { kadir: '1sa 48dk', aras: '35dk', yusa: '5s' }],
   ] as const) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const cellWidth = Math.floor((accountRoom(accountCapsule(tree, 'kadir')!) - 9 - 4) / 3)
     const starts = [9, 9 + cellWidth + 2, 9 + 2 * (cellWidth + 2)]
@@ -898,7 +988,7 @@ test('at 76 columns a 5-hour countdown under an hour stays inline and a longer o
   const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
   state.accounts = countdownAccounts(59 * 60_000 + 30_000).slice(0, 2)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   let tree = await ui.drawn()
   const room = accountRoom(accountCapsule(tree, 'kadir')!)
   expect(Math.floor((room - 9 - 4) / 3)).toBe(18)
@@ -921,7 +1011,7 @@ test('a 5-hour countdown changes on the minute boundary with no timer of its own
   const state = world(on); idle(state)
   state.accounts = oneAccount([{ ...limit(10), resets_at: iso(NOW + 35 * 60_000) }])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(67); redraws.length = 0
   const label = async () => contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]?.trim()
   expect(await label()).toBe('↻ 35dk')
@@ -948,7 +1038,7 @@ test('Codex reads the newest JSONL last rate_limits and maps primary 10080 to th
   expect(snapshot).toMatchObject({ shape: 'codex-1', value: { limits: [
     { kind: 'weekly_all', used: 77 }, { kind: 'session', used: 16 },
   ] } })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 1sa 0dk', percent: 16 }, { label: 'hafta', percent: 77 }])
   expect(state.reads.filter(path => path === `read:${CODEX}/older.jsonl`)).toHaveLength(0)
   await ui.unmount()
@@ -960,7 +1050,7 @@ test('Codex renders only hafta for a 10080-minute primary window and never adds 
   state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine({ used_percent: 6, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
   await start($, clock)
   for (const width of [32, 42, 58]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const capsule = accountCapsule(await ui.drawn(), 'codex')!
     expectLimitColumns(capsule, [{ label: 'hafta', percent: 6 }])
     expect(contentRows(capsule)).toHaveLength(4)
@@ -975,7 +1065,7 @@ test('Codex labels other readable windows by their rounded day count', async ($,
   state.accounts = []; state.jobs = []; state.sessions = {}
   state.codexFiles.set(`${CODEX}/custom.jsonl`, { mtimeMs: 1, text: rateLine({ used_percent: 24, window_minutes: 2880, resets_at: NOW / 1000 + 3600 }) })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '2 gün', percent: 24 }])
   await ui.unmount()
 })
@@ -986,7 +1076,7 @@ test('Codex searches at most seven dated folders and shows a warning instead of 
   await start($, clock)
   const dirs = state.reads.filter(path => path.startsWith(`list:${HOME}/.codex/sessions/`))
   expect(dirs).toHaveLength(7)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const capsule = accountCapsule(await ui.drawn(), 'codex')!
   expect(contentRows(capsule)).toEqual(['◎ codex', 'şu an okunamıyor'])
   expect(drawnNodes(capsule).some(node => node.type === 'Text' && shownText(node) === 'şu an okunamıyor' && node.props?.color === 'warning')).toBe(true)
@@ -1004,7 +1094,7 @@ test('accounts and Codex refresh once a minute and preserve successful data afte
   await clock.advance(10_000)
   expect(statusCalls(state)).toHaveLength(2)
   expect(state.reads.filter(path => path.startsWith(`list:${HOME}/.codex/`))).toHaveLength(firstCodexLists * 2)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[2]).toMatch(/10%.*75%.*92%/)
   // The kept 5-hour window still counts down: 202 minutes, one gone.
   expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[1]?.trim()).toMatch(/^↻ 3sa 21dk /)
@@ -1023,7 +1113,7 @@ test('session records are filtered by open panel and alive PID, and use cmux tit
     { id: 'idle-session', title: 'Idle tab', account: 'aras' },
     { id: 'runner-session', title: 'Analysis tab', status: 'running' },
   ] } })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /Dead process|Closed tab/)).toBeUndefined()
   expect(await rowText(ui, /Current tab/)).not.toMatch(/›/)
   expect(await rowText(ui, /^bu sekme$/)).toBeDefined()
@@ -1038,7 +1128,7 @@ test('session records are filtered by open panel and alive PID, and use cmux tit
 test('each chat has a self-contained three-line round capsule, with an arrow only when pressable', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); world(on)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   const expected = [
     ['Needs approval', 'kadir', 'cevap bekliyor', true],
@@ -1113,7 +1203,7 @@ for (const [account, model, effort, expected] of [
     } } }) }
     state.chatFiles.set('/transcripts/1004.jsonl', { mtimeMs: 1, text: assistantLine(model, effort) })
     await start($, clock)
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
     const capsule = capsuleFor(await ui.drawn(), 'Idle tab')!
     const rows = laidOutRows(capsule, 72)
     expect(rows).toHaveLength(5)
@@ -1133,7 +1223,7 @@ test('chat metadata reads only transcript tails, caches size and mtime, and sees
   state.chatFiles.set(path, file)
   state.chatFiles.set(cachePath, { mtimeMs: 1, text: JSON.stringify({ model: { id: 'claude-fable-5-1', display_name: 'Fable 5.1' } }) })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   expect(await rowText(ui, /^kadir · Fable 5.1 · xhigh$/)).toBeDefined()
   const tails = () => state.calls.filter(call => call.argv[0] === 'tail')
   expect(tails().map(call => call.argv)).toEqual([['tail', '-c', '262144', '--', path]])
@@ -1160,42 +1250,58 @@ test('chat metadata reads only transcript tails, caches size and mtime, and sees
   await ui.unmount()
 })
 
-test('a clickable capsule is one Button holding every line across its padding, inside the flowing frame on every surface', async ($, on) => {
+test('a clickable capsule is one target holding every line inside its border: the capsule module where the surface runs one, else one Button', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   mention(state, '/transcripts/1003.jsonl', RUNNING.id)
   await start($, clock)
   for (const surface of SURFACES) {
-    const ui = await $.ui.mount({ ...PANE, surface })
+    const ui = await mount($,{ ...PANE, surface })
+    const hasClient = surface === 'terminal' || surface === 'desktop'
     for (const [key, title, height] of [
       ['chat:waiting-session', 'Needs approval', 5], [`job:${RUNNING.id}`, 'ads review', 4],
     ] as const) {
       const capsule = capsuleFor(await ui.drawn(), title)!
-      // One Button, keyed as the capsule: no line is a target of its own.
-      const buttons = lineButtons(capsule)
-      expect(buttons.map(button => button.props?.key)).toEqual([key])
-      const button = buttons[0]!
-      expect(button.props).toMatchObject({ plain: true })
-      expect(String(button.props?.label)).toContain(title)
-      // Every content row, each across all 36 cells inside the border.
-      const lines = shownText(button).split('\n')
-      expect(lines).toHaveLength(height - 2)
-      expect(lines.map(cells)).toEqual(lines.map(() => 36))
-      expect(lines[0]).toContain(title)
-      // Strings and Text alone, every Text one row: newlines only between them.
-      for (const child of button.children ?? []) {
-        if (typeof child === 'string') expect(child).toBe('\n')
-        else expect((child as DrawnNode).type).toBe('Text')
+      if (hasClient) {
+        // A region the capsule's size, keyed as the capsule; its module draws
+        // the border and every line, and no Button.
+        const client = (await ui.find({ type: 'Client', key }))!
+        // The module's path as the engine resolved it, under the plugin folder.
+        expect(client.props).toMatchObject({ module: 'hooks/capsule.tsx', width: 38, height })
+        expect(client.props.props).toMatchObject({ key, width: 38, padding: 1, isPressable: true })
+        expect(lineButtons(capsule)).toEqual([])
+        expect(capsule.props).toMatchObject({ key: `capsule:${key}`, borderStyle: 'round', paddingX: 1 })
+        const lines = (capsule.children ?? []) as DrawnNode[]
+        expect(lines).toHaveLength(height - 2)
+        expect(lines.every(node => node.type === 'Text' && !shownText(node).includes('\n'))).toBe(true)
+        expect(shownText(lines[0])).toContain(title)
+      } else {
+        // One Button, keyed as the capsule: no line is a target of its own.
+        const buttons = lineButtons(capsule)
+        expect(buttons.map(button => button.props?.key)).toEqual([key])
+        const button = buttons[0]!
+        expect(button.props).toMatchObject({ plain: true })
+        expect(String(button.props?.label)).toContain(title)
+        // Every content row, each across all 36 cells inside the border.
+        const lines = shownText(button).split('\n')
+        expect(lines).toHaveLength(height - 2)
+        expect(lines.map(cells)).toEqual(lines.map(() => 36))
+        expect(lines[0]).toContain(title)
+        // Strings and Text alone, every Text one row: newlines only between them.
+        for (const child of button.children ?? []) {
+          if (typeof child === 'string') expect(child).toBe('\n')
+          else expect((child as DrawnNode).type).toBe('Text')
+        }
+        expect(drawnNodes(button).filter(node => node.type === 'Text').every(node => !shownText(node).includes('\n'))).toBe(true)
+        // The Button's own keyed Box scopes its hover to it alone.
+        const frame = capsuleBorder(capsule, title)!
+        expect(frame.props?.position).toBeUndefined()
+        expect(frame.props?.paddingX).toBe(0)
+        expect(frame.children).toHaveLength(1)
+        const target = frame.children![0] as DrawnNode
+        expect(target).toMatchObject({ type: 'Box', props: { key: `target:${key}` } })
+        expect(target.children).toEqual([button])
+        expect((capsule.children ?? [])[0]).toBe(frame)
       }
-      expect(drawnNodes(button).filter(node => node.type === 'Text').every(node => !shownText(node).includes('\n'))).toBe(true)
-      // The Button's own keyed Box scopes its hover to it alone.
-      const frame = capsuleBorder(capsule, title)!
-      expect(frame.props?.position).toBeUndefined()
-      expect(frame.props?.paddingX).toBe(0)
-      expect(frame.children).toHaveLength(1)
-      const target = frame.children![0] as DrawnNode
-      expect(target).toMatchObject({ type: 'Box', props: { key: `target:${key}` } })
-      expect(target.children).toEqual([button])
-      expect((capsule.children ?? [])[0]).toBe(frame)
       const rows = laidOutRows(capsule, 38)
       expect(rows).toHaveLength(height)
       expect(rows[0]).toBe(`╭${'─'.repeat(36)}╮`)
@@ -1207,7 +1313,9 @@ test('a clickable capsule is one Button holding every line across its padding, i
       await ui.press({ key })
       expect(actionCalls(state)).toHaveLength(before + 2)
     }
+    // The current chat's lines press nothing.
     expect(drawnNodes(capsuleFor(await ui.drawn(), 'Current tab')).some(node => node.type === 'Button')).toBe(false)
+    if (hasClient) expect((await ui.find({ type: 'Client', key: 'chat:current-session' }))?.props.props).toMatchObject({ isPressable: false })
     await ui.unmount()
   }
 })
@@ -1235,7 +1343,7 @@ test('no absolute Box covers a Button, and every overlay hangs from a borderless
   expect(statusCalls(state)).toHaveLength(2)
   for (const surface of SURFACES) {
     for (const width of [76, 42, 32]) {
-      const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface })
+      const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface })
       for (const isOpen of [true, false]) {
         const tree = await ui.drawn()
         expect(await rowText(ui, /Hesaplar/)).toMatch(new RegExp(`^ Hesaplar ${isOpen ? '▾' : '▸'} [${spinner}] $`))
@@ -1245,8 +1353,9 @@ test('no absolute Box covers a Button, and every overlay hangs from a borderless
         expect(subRows(tree, 'Idle tab')).toEqual([expect.stringMatching(subRow('aras'))])
         for (const title of ['Needs approval', 'Idle tab']) expect(borderOverlay(capsuleFor(tree, title))).toBeUndefined()
         expect(capsuleBorder(tree, 'Current tab')?.props?.borderColor).toBe('claude')
-        // Three chats, three jobs, two delegate rows and the title: one Button each.
-        expect(lineButtons(tree)).toHaveLength(9)
+        // Three chats, three jobs, two delegate rows and the title: one Button
+        // each, or the title's alone where the capsule module draws the rest.
+        expect(lineButtons(tree)).toHaveLength(surface === 'terminal' || surface === 'desktop' ? 1 : 9)
         expect(coveredButtons(tree, width)).toEqual([])
         // Three card titles, and two accounts' reset times while open.
         expect(absoluteParents(tree)).toHaveLength(isOpen ? 5 : 3)
@@ -1267,9 +1376,9 @@ test('a chat, job or agent capsule has one key that presses its action, and the 
   state.agents = [{ id: 'agent-live', description: 'Inspect tests', type: 'Explore', status: 'running' }]
   mention(state, '/transcripts/1003.jsonl', RUNNING.id)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const keys = async (capsule: string) => (await ui.findAll({ type: 'Button' }))
-    .map(node => node.key ?? '').filter(key => key === capsule || key.startsWith(`${capsule}:`))
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
+  const keys = async (capsule: string) => (await targetsOf(ui))
+    .map(target => target.key).filter(key => key === capsule || key.startsWith(`${capsule}:`))
   const focusCalls = (panel: string) => [
     [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', panel, '--workspace', WS]]
   for (const [key, panel] of [['chat:waiting-session', WAITING], [`job:${RUNNING.id}`, RUNNER]] as const) {
@@ -1331,10 +1440,11 @@ test('all open chats render in full beyond the pane window, waiting first, then 
   state.chatFiles.set('/transcripts/1003.jsonl', { mtimeMs: NOW - 1000, text: '' })
   state.chatFiles.set('/transcripts/1001.jsonl', { mtimeMs: NOW - 5000, text: '' })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows: 5 } }, surface: 'terminal' })
-  const chatButtons = (await ui.findAll({ type: 'Button' })).filter(node => /^chat:/.test(node.key ?? ''))
-  expect(new Set(chatButtons.map(node => node.key)).size).toBe(10)
-  expect(chatButtons).toHaveLength(10)
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows: 5 } }, surface: 'terminal' })
+  // Every chat a capsule, all but the current one pressable.
+  const chatTargets = (await targetsOf(ui)).filter(target => /^chat:/.test(target.key))
+  expect(new Set(chatTargets.map(target => target.key)).size).toBe(11)
+  expect(chatTargets.filter(target => target.isPressable)).toHaveLength(10)
   const tree = await ui.drawn()
   expect(capsules(tree).filter(node => /Needs approval|Analysis tab|Current tab|Idle tab|Extra tab \d/.test(shownText(node)))).toHaveLength(11)
   for (let index = 0; index < 7; index += 1) expect(await rowText(ui, new RegExp(`Extra tab ${index}`))).toBeDefined()
@@ -1392,7 +1502,7 @@ test('a session on a tab no listing saw lists cmux at once, while a closed tab l
   await clock.advance(10_000)
   expect(cmuxCalls(state, 'list-workspaces')).toHaveLength(2)
   expect(chatPsCalls(state)).toHaveLength(2)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /New tab/)).toBeDefined()
   await ui.unmount()
 })
@@ -1408,7 +1518,7 @@ test('a transient cmux failure keeps the open chats, names the error, and lists 
   expect(cmuxCalls(state, 'list-workspaces')).toHaveLength(2)
   expect(chats().list.map(chat => chat.id)).toEqual(ids)
   expect(chats().error).toBe('sohbetler okunamadı')
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /Idle tab/)).toBeDefined()
   expect(await rowText(ui, /sohbetler okunamadı|sohbet yok/)).toBeUndefined()
   state.isCmuxDown = false
@@ -1428,7 +1538,7 @@ test('waiting chats lead, the rest follow their transcripts\' last change, newes
   touch(1004, NOW - 1000); touch(1001, NOW - 2000); touch(1003, NOW - 60_000); touch(1002, NOW - 90_000)
   await start($, clock)
   expect(order()).toEqual(['waiting-session', 'idle-session', 'current-session', 'runner-session'])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const at = (rows: string[], title: string) => rows.findIndex(row => row.includes(title))
   const drawnOrder = async () => {
     const rows = laidOutRows(await ui.drawn(), 42)
@@ -1454,7 +1564,7 @@ test('waiting chats lead, the rest follow their transcripts\' last change, newes
 test('pressing a tab selects its workspace then focuses its panel, using only mocked commands', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'chat:waiting-session' })
   expect(actionCalls(state).map(call => call.argv)).toEqual([
     [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', WAITING, '--workspace', WS],
@@ -1466,7 +1576,7 @@ test('tab focus failures show the Turkish toast and cmux falls back to PATH if t
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.hasCmux = false; state.isFocusDown = true
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'chat:runner-session' })
   expect(actionCalls(state).map(call => call.argv)).toEqual([['cmux', 'select-workspace', '--workspace', WS]])
   expect(state.toasts).toEqual(['sekme açılamadı'])
@@ -1477,7 +1587,7 @@ test('a delegate without parent fields searches only open transcripts once, then
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   mention(state, '/transcripts/1003.jsonl', RUNNING.id)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: `job:${RUNNING.id}` })
   await ui.press({ key: `job:${RUNNING.id}` })
   const grep = grepCalls(state)
@@ -1502,7 +1612,7 @@ for (const [name, parent] of [
     state.jobs = [{ ...RUNNING, ...parent }]
     mention(state, '/transcripts/1004.jsonl', RUNNING.id)
     await start($, clock)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, surface: 'terminal' })
     await ui.press({ key: `job:${RUNNING.id}` }); await ui.press({ key: `job:${RUNNING.id}` })
     expect(grepCalls(state)).toHaveLength(0)
     expect(actionCalls(state).map(call => call.argv)).toEqual([
@@ -1516,7 +1626,7 @@ for (const [name, parent] of [
 test('parent fields added after a cached missing grep take priority on the next delegate click', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: `job:${RUNNING.id}` })
   expect(state.toasts).toEqual(['başlatan sekme kapalı'])
   state.jobs = [{ ...RUNNING, parent_session_id: 'current-session' }]; state.jobsRevision += 1
@@ -1532,7 +1642,7 @@ test('a delegate started in this session shows bu sohbette without focus command
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   mention(state, '/transcripts/1001.jsonl', RUNNING.id)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: `job:${RUNNING.id}` })
   expect(state.toasts).toEqual(['bu sohbette'])
   expect(actionCalls(state)).toHaveLength(0)
@@ -1542,7 +1652,7 @@ test('a delegate started in this session shows bu sohbette without focus command
 test('a delegate with no open starter shows başlatan sekme kapalı and caches the missing answer', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: `job:${RUNNING.id}` }); await ui.press({ key: `job:${RUNNING.id}` })
   expect(state.toasts).toEqual(['başlatan sekme kapalı', 'başlatan sekme kapalı'])
   expect(grepCalls(state)).toHaveLength(1)
@@ -1557,15 +1667,15 @@ test('jobs show three two-line round capsules, running first, and agents still o
   state.jobs = [RUNNING, ...Array.from({ length: 8 }, (_, index) => ({ ...DONE, id: `done-${index}`,
     label: `Old job ${index}`, finished: NOW / 1000 - 100 - index }))]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'agent:agent-live' })
   expect(state.views).toEqual([{ agentId: 'agent-live' }])
-  const tasks = (await ui.findAll({ type: 'Button' })).filter(node => /^(agent|job):/.test(node.key ?? ''))
-  // One Button per capsule: the two running tasks, then the latest finished.
-  expect(tasks.map(node => node.key).slice(0, 2).sort()).toEqual(['agent:agent-live', `job:${RUNNING.id}`])
-  expect(tasks.map(node => node.key).slice(2)).toEqual(['agent:agent-done'])
-  expect(tasks.slice(0, 2).every(node => /Inspect tests|ads review/.test(String(node.props.label)))).toBe(true)
-  expect(tasks.slice(2).every(node => /Recent agent/.test(String(node.props.label)))).toBe(true)
+  const tasks = (await targetsOf(ui)).filter(target => /^(agent|job):/.test(target.key))
+  // One target per capsule: the two running tasks, then the latest finished.
+  expect(tasks.map(target => target.key).slice(0, 2).sort()).toEqual(['agent:agent-live', `job:${RUNNING.id}`])
+  expect(tasks.map(target => target.key).slice(2)).toEqual(['agent:agent-done'])
+  expect(tasks.slice(0, 2).every(target => /Inspect tests|ads review/.test(target.label))).toBe(true)
+  expect(tasks.slice(2).every(target => /Recent agent/.test(target.label))).toBe(true)
   const tree = await ui.drawn()
   for (const title of ['Inspect tests', 'ads review', 'Recent agent']) {
     const capsule = capsuleFor(tree, title)!
@@ -1586,7 +1696,7 @@ test('a missing or whitespace delegate label falls back to the cwd basename insi
   state.jobs = [{ ...DONE, id: 'empty-label', label: '', cwd: '/Users/k/tvOSBrowser' },
     { ...DONE, id: 'blank-label', account: 'codex', label: ' \t ', cwd: '/Users/k/another-project/' }]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /tvOSBrowser/)).toMatch(/^✓.*tvOSBrowser.*›$/)
   expect(await rowText(ui, /another-project/)).toMatch(/^✓.*another-project.*›$/)
   expect(await rowText(ui, /aras · 7 dk/)).toBeDefined()
@@ -1602,7 +1712,7 @@ test('job capsules show success and error glyphs with concise second-line durati
     { ...DONE, id: 'hours', label: 'saat işi', account: '', status: 'failed', duration_ms: 7_380_000 },
   ]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   for (const [title, glyph, metadata] of [
     ['saniye işi', '✓', 'codex · 42 sn'], ['dakika işi', '✓', 'aras · 2 dk'], ['saat işi', '✗', 'ajan · 2 sa 3 dk'],
@@ -1627,7 +1737,7 @@ test('a delegate whose process disappeared shows a warning question mark and no 
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   idle(state); state.jobs = [RUNNING]; state.processes.clear()
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /ads review/)).toMatch(/^\? .*ads review/)
   expect((await ui.find({ type: 'Text', text: /^\?$/ }))?.props.color).toBe('warning')
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'stale' }] } })
@@ -1654,17 +1764,17 @@ for (const failure of ['deny', 'exit', 'stderr'] as const) {
     ]
     state.jobs = cases.map(job => ({ ...RUNNING, ...job, status: 'running' }))
     await start($, clock)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, surface: 'terminal' })
     const snapshot = state.snapshots.get('jobs') as { value: { list: { id: string; status: string }[] } }
     for (const job of cases) expect(snapshot.value.list.find(row => row.id === job.id)?.status).toBe(job.status)
-    const visible = (await ui.findAll({ type: 'Button' })).filter(node => /^job:/.test(node.key ?? ''))
-    expect(new Set(visible.map(node => node.key)).size).toBe(3)
+    const visible = (await targetsOf(ui)).filter(target => /^job:/.test(target.key))
+    expect(new Set(visible.map(target => target.key)).size).toBe(3)
     expect(visible).toHaveLength(3)
     const rows = capsules(await ui.drawn()).filter(node => /^capsule:job:/.test(String(node.props?.key)))
     expect(laidOutRows(rows[0], 38)[1]).toMatch(/^│ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] /)
     expect(rows.slice(1).every(node => /^│ \? /.test(laidOutRows(node, 38)[1]!))).toBe(true)
     expect((await paneRows(ui)).filter(row => /· durdu$/.test(row))).toHaveLength(2)
-    expect(visible.every(node => !/✗/.test(node.text))).toBe(true)
+    expect(visible.every(target => !/✗/.test(target.text))).toBe(true)
     const questions = await ui.findAll({ type: 'Text', text: /^\?$/ })
     expect(questions).toHaveLength(2)
     expect(questions.every(node => node.props.color === 'warning')).toBe(true)
@@ -1680,7 +1790,7 @@ test('narrow cards truncate long rows with an ellipsis and never wrap or contain
   state.panels = state.panels.map(panel => panel.id === WAITING ? { ...panel, title: 'A very long permission prompt title that will not fit' } : panel)
   await start($, clock)
   for (const width of [60, 42, 32, 24, 18]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     expect(laidOutRows(capsules(await ui.drawn()).find(node => node.props?.key === `capsule:job:${RUNNING.id}`), width - 4)[1]).toMatch(/…/)
     expect(laidOutRows(await ui.drawn(), width).filter(row => cells(row) > width)).toEqual([])
     for (const node of await ui.findAll({ type: 'Text' })) {
@@ -1726,7 +1836,7 @@ test('one adaptive spinner clock follows time at four frames a second and respec
   on('ui.invalidate', { event: 'ui.render' }, async (_, e, next) => { redraws.push(clock.now()); return next(e) })
   const state = world(on); idle(state); state.jobs = [RUNNING]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const before = (await rowText(ui, /ads review/))?.[0]
   await clock.advance(300)
   const after = (await rowText(ui, /ads review/))?.[0]
@@ -1747,7 +1857,7 @@ test('spinner, waiting blink and completion pop never change row count or render
   state.jobs = [RUNNING, { ...DONE, label: 'yeni tamamlandı', finished: NOW / 1000 }]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const width of [42, 32, 60]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const initial = laidOutRows(await ui.drawn(), width).map(cells)
     expect(initial.every(size => size <= width)).toBe(true)
     for (const elapsed of [125, 175, 300, 600]) {
@@ -1762,7 +1872,7 @@ test('gauge values appear immediately and refresh instantly without any idle ani
   const clock = observedClock(on); const state = world(on); idle(state)
   state.accounts = oneAccount([limit(40), limit(92, 'weekly_scoped', 'Fable')])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/40%.*92%/)
   const initial = contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]
   await clock.advance(2000)
@@ -1784,7 +1894,7 @@ test('waiting dots blink error and subtle at 600 ms edges using one quiet after 
   const state = world(on); idle(state)
   state.sessions = { waiting: rawSession(WAITING, 1002, { agentLifecycle: 'needsInput' }) }
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   // Let the one deferred refresh repaint settle before measuring blink-only work.
   await clock.advance(67)
   const marker = async () => (await ui.find({ type: 'Text', text: /^●$/ }))?.props.color
@@ -1818,7 +1928,7 @@ test('idle chats show a steady text-colored open circle without an animation tim
   const state = world(on); idle(state)
   state.sessions = { idle: rawSession(IDLE, 1004) }
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   // Let the one deferred refresh repaint settle before measuring idle work.
   await clock.advance(67)
   redraws.length = 0
@@ -1841,7 +1951,7 @@ test('waiting and idle chats schedule only dot and border edges while the idle m
     waiting: rawSession(WAITING, 1002, { agentLifecycle: 'needsInput' }), idle: rawSession(IDLE, 1004),
   }
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   // Let the one deferred refresh repaint settle before measuring blink-only work.
   await clock.advance(67)
   for (let edge = 0; edge < 6; edge += 1) {
@@ -1869,7 +1979,7 @@ test('a recent completion pops to its final glyph and then stops its animation',
   const clock = observedClock(on); const state = world(on); idle(state)
   state.jobs = [{ ...DONE, label: 'just completed', finished: NOW / 1000 }]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /just completed/)).toMatch(/^·/)
   await clock.advance(125); await ui.redraw(); await clock.settle()
   expect(await rowText(ui, /just completed/)).toMatch(/^•/)
@@ -1892,7 +2002,7 @@ test('accounts draw no refresh countdown and schedule the earliest finite server
     { ...STATUS[0]!, name: 'stuck', next_refresh_at: (NOW - 600_000) / 1000 },
   ]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(67)
   expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
   expect(shownText(accountsCard(await ui.drawn()))).not.toMatch(/↻|\d+sn/)
@@ -1913,7 +2023,7 @@ test('older shiftover without reset times has no countdown or additional clock w
   const clock = observedClock(on); const state = world(on); idle(state)
   state.accounts = oneAccount([limit(10)])
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /Hesaplar/)).not.toMatch(/↻/)
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
   await ui.unmount()
@@ -1923,7 +2033,7 @@ test('the single refresh deadline stops when the pane loses placement', async ($
   const clock = observedClock(on); const state = world(on); idle(state)
   state.accounts = [{ ...readable(STATUS[0]!), next_refresh_at: (NOW + 42_000) / 1000 }]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 41_933 }])
   state.isPlaced = false
   await clock.advance(9000)
@@ -1938,7 +2048,7 @@ for (const failed of [false, true]) {
     const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
     state.accounts = [{ ...readable(STATUS[0]!), next_refresh_at: (NOW + 2000) / 1000 }]
     await start($, clock)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, surface: 'terminal' })
     let release!: () => void
     state.accountsGate = new Promise<void>(resolve => { release = resolve })
     state.isShiftoverDown = failed
@@ -2003,7 +2113,7 @@ test('the accounts border contains just its title at 76 and 42 columns', async (
   state.accounts = [{ ...readable(STATUS[0]!), next_refresh_at: (NOW + 11_000) / 1000 }]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const width of [76, 42]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const before = laidOutRows(await ui.drawn(), width)[0]!
     expect(before).toMatch(/^╭─ Hesaplar ▾ ─+╮$/)
     expect(cells(before)).toBe(width)
@@ -2015,7 +2125,7 @@ test('the accounts border contains just its title at 76 and 42 columns', async (
     expect(laidOutRows(await ui.drawn(), width).every(row => cells(row) <= width)).toBe(true)
     await ui.unmount()
   }
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 20 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 20 }, surface: 'terminal' })
   const border = laidOutRows(await ui.drawn(), 20)[0]!
   expect(border).toMatch(/^╭─ Hesaplar /)
   expect(border).not.toMatch(/↻/)
@@ -2027,7 +2137,7 @@ test('a refresh spinner is active only while account status is in flight', async
   const clock = observedClock(on); const state = world(on); idle(state)
   state.accountsGate = clock.sleep(500)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /Hesaplar/)).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)
   await clock.advance(500)
   expect(await rowText(ui, /Hesaplar/)).not.toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)
@@ -2039,7 +2149,7 @@ test('the current-account marker stays steady while work runs', async ($, on) =>
   const clock = observedClock(on); const state = world(on); idle(state)
   state.accounts = oneAccount([]); state.jobs = [RUNNING]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const before = (await ui.find({ type: 'Text', text: /^● ?$/ }))?.props
   expect(before?.color).toBe('claude')
   expect(before?.dimColor).not.toBe(true)
@@ -2074,7 +2184,7 @@ test('cached snapshots after reload form a steady baseline without entrance or c
     shape: 'jobs-2', value: { list: [{ id: 'cached-done', account: 'aras', model: '', label: 'cached completion',
       status: 'done', pid: 1, startedMs: NOW - 1000, finishedMs: NOW, durationMs: 1000, costUsd: null }], at: NOW, error: null },
   }, version: 1 } }))
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/70%/)
   expect(await rowText(ui, /cached completion/)).toMatch(/^✓/)
   expect(clock.waits()).toHaveLength(0)
@@ -2090,7 +2200,7 @@ test('refresh completion cannot invalidate less than 67 ms before a scheduled an
   on('ui.invalidate', { event: 'ui.render' }, async (_, e, next) => { redraws.push(clock.now()); return next(e) })
   const state = world(on); idle(state); state.jobs = [RUNNING]; state.accountsGate = clock.sleep(90)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(1000)
   expect(redraws.length).toBeGreaterThan(3)
   for (let index = 1; index < redraws.length; index += 1) expect(redraws[index]! - redraws[index - 1]!).toBeGreaterThanOrEqual(67)
@@ -2102,7 +2212,7 @@ test('external text stays on one line and long names truncate inside their own c
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.jobs = [{ ...RUNNING, label: 'review — pending\n tasks', account: 'very-long-account-owner-name-that-will-not-fit' }]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   const capsule = capsuleFor(tree, 'review')!
   const rows = laidOutRows(capsule, 38)
@@ -2115,12 +2225,136 @@ test('external text stays on one line and long names truncate inside their own c
   await ui.unmount()
 })
 
-test('hovering a clickable capsule lights its border and mutes its one block while rest styles stay as they were', async ($, on) => {
+test('hovering a capsule lights its border alone: its text and background stay as at rest and nothing inverts', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); world(on)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await mount($, { ...PANE, surface })
+    const region = async (key: string) => await ui.drawn({ in: key }) as DrawnNode
+    // Nothing the capsule module draws fills: no Button, no inverse or
+    // background, no hover style of the surface's own.
+    const fills = (node: DrawnNode) => drawnNodes(node).filter(one => one.type === 'Button' || one.hover !== undefined ||
+      one.props?.inverse !== undefined || one.props?.backgroundColor !== undefined)
+    for (const key of ['chat:runner-session', 'chat:idle-session', `job:${RUNNING.id}`, 'chat:waiting-session']) {
+      const rest = await region(key)
+      expect(fills(rest)).toEqual([])
+      expect(rest.props?.borderColor).toBe('subtle')
+      // Over its lines, its border and its padding alike, the border is text.
+      for (const event of [{ type: 'enter', x: 5, y: 1 }, { type: 'move', x: 30, y: 2 }, { type: 'move', x: 0, y: 0 },
+        { type: 'move', x: 37, y: 3 }] as const) {
+        await ui.pointer({ ...event, in: key })
+        const lit = await region(key)
+        expect(lit.props?.borderColor).toBe('text')
+        expect({ ...lit, props: { ...lit.props, borderColor: 'subtle' } }).toEqual(rest)
+        expect(fills(lit)).toEqual([])
+        // Another capsule stays as it was.
+        expect((await region(key === 'chat:idle-session' ? 'chat:runner-session' : 'chat:idle-session')).props?.borderColor).toBe('subtle')
+      }
+      await ui.pointer({ type: 'leave', x: 37, y: 3, in: key })
+      expect(await region(key)).toEqual(rest)
+    }
+    // The current chat's lines press nothing: no light over them.
+    await ui.pointer({ type: 'enter', x: 5, y: 1, in: 'chat:current-session' })
+    expect((await region('chat:current-session')).props?.borderColor).toBe('claude')
+    expect(fills(await region('chat:current-session'))).toEqual([])
+    await ui.unmount()
+  }
+})
+
+test('spinner and blink frames reach the capsule module as new props: a hovered capsule stays lit across them, and the module keeps no clock', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); world(on)
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await mount($, { ...PANE, surface })
+    const key = 'chat:runner-session'
+    const glyph = async () => ((await ui.find({ type: 'Client', key }))?.props.props as CapsuleProps).lines[0]![0]!.text
+    const first = await glyph()
+    expect(first).toBe(spinnerAt(clock.now()))
+    await ui.pointer({ type: 'enter', x: 3, y: 1, in: key })
+    const lit = await ui.drawn({ in: key })
+    // Its own frame clock moves nothing: no timer of its own redraws it.
+    const at = clock.now()
+    await ui.advance(5_000)
+    expect(await ui.drawn({ in: key })).toEqual(lit)
+    expect([clock.now(), await glyph()]).toEqual([at, first])
+    // The pane's next frame does, as new props (a blink just before it puts it
+    // off by the frame budget); the hover holds across them.
+    await clock.advance(300)
+    expect((await ui.drawn({ in: key }) as DrawnNode).props?.borderColor).toBe('text')
+    expect(await glyph()).toBe(spinnerAt(clock.now()))
+    expect(await glyph()).not.toBe(first)
+    const next = await ui.drawn({ in: key }) as DrawnNode
+    expect(next.props?.borderColor).toBe('text')
+    expect(contentRows(next)[0]).toMatch(new RegExp(`^${spinnerAt(clock.now())} Analysis tab +›$`))
+    await ui.unmount()
+  }
+})
+
+test('a capsule acts on its own parts alone: a post naming another capsule, another chat\'s row or nothing does nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
+  state.agents = [{ id: 'agent-live', description: 'Inspect tests', type: 'Explore', status: 'running' }]
+  await start($, clock)
+  const ui = await mount($, { ...PANE, surface: 'terminal' })
+  for (const [data, key] of [
+    [{ target: 'chat:waiting-session' }, 'chat:idle-session'], [{ target: `follow:${RUNNING.id}` }, 'chat:runner-session'],
+    [{ target: `follow:${RUNNING.id}` }, `job:${RUNNING.id}`], [{ target: 'agent:agent-live' }, `job:${RUNNING.id}`],
+    [{}, 'chat:idle-session'], ['chat:idle-session', 'chat:idle-session'], [{ target: 'chat:current-session' }, 'chat:current-session'],
+  ] as const) await ui.post(data, { in: key })
+  expect([actionCalls(state), surfaceCalls(state), state.views]).toEqual([[], [], []])
+  // Its own: the chat focuses its tab, its row follows the job, an agent opens.
+  await ui.post({ target: 'chat:idle-session' }, { in: 'chat:idle-session' })
+  await ui.post({ target: `follow:${RUNNING.id}` }, { in: 'chat:idle-session' })
+  await ui.post({ target: 'agent:agent-live' }, { in: 'agent:agent-live' })
+  expect([actionCalls(state).length, surfaceCalls(state).length, state.views]).toEqual([2, 1, [{ agentId: 'agent-live' }]])
+  await ui.unmount()
+})
+
+test('VS Code and mobile draw no Client, and a surface whose capsule module failed draws Buttons from then on', { timeoutMs: 60_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  const logs: string[] = []
+  on('ui.log', (_, e) => { logs.push(`${e.to}: ${e.text}`); return { value: undefined } })
+  await start($, clock)
+  for (const surface of ['vscode', 'mobile'] as const) {
+    const ui = await mount($, { ...PANE, surface })
+    expect(await ui.findAll({ type: 'Client' })).toEqual([])
+    expect((await targetsOf(ui)).map(target => target.key).filter(key => /^(chat|job):/.test(key)).sort())
+      .toEqual(['chat:idle-session', 'chat:runner-session', 'chat:waiting-session', `job:${DONE.id}`, `job:${RUNNING.id}`].sort())
+    await ui.press({ key: 'chat:idle-session' })
+    await ui.unmount()
+  }
+  expect(actionCalls(state)).toHaveLength(4)
+  const terminal = await mount($, { ...PANE, surface: 'terminal' })
+  expect(await terminal.findAll({ type: 'Client' })).toHaveLength(6)
+  // Hundreds of delegates under one chat: a tree past what a surface module
+  // may draw, so the chat's capsule fails on the terminal.
+  const jobs = state.jobs
+  state.jobs = [...jobs, ...Array.from({ length: 300 }, (_, index) =>
+    ({ ...RUNNING, id: `flood-${index}`, parent_session_id: 'idle-session' }))]
+  state.jobsRevision += 1
+  await clock.advance(10_000)
+  expect(logs.length).toBeGreaterThan(0)
+  expect(logs.every(line => /^debug: Shiftover kapsülü çizilemedi \(render\): ./.test(line))).toBe(true)
+  // The terminal falls back whole, and stays so once the flood is gone: its
+  // capsules are Buttons again, pressed as before.
+  state.jobs = jobs; state.jobsRevision += 1
+  await clock.advance(10_000)
+  expect(await terminal.findAll({ type: 'Client' })).toEqual([])
+  expect((await terminal.find({ type: 'Button', key: 'chat:idle-session' }))?.props.label).toBe('○ Idle tab ›')
+  await terminal.press({ key: 'chat:idle-session' })
+  expect(actionCalls(state)).toHaveLength(6)
+  // Another surface keeps its own.
+  const desktop = await mount($, { ...PANE, surface: 'desktop' })
+  expect(await desktop.findAll({ type: 'Client' })).toHaveLength(6)
+  await terminal.unmount(); await desktop.unmount()
+})
+
+test('without the capsule module a capsule is a Button: hover mutes its one block and lights its border, rest styles stay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); world(on)
+  await start($, clock)
+  const ui = await mount($,{ ...PANE, surface: 'vscode' })
   const tree = await ui.drawn()
-  // The kit has no pointer driver: a hover is checked as the data drawn.
+  // The kit has no pointer driver for a Button: a hover is the data drawn.
   for (const title of ['Analysis tab', 'Idle tab', 'ads review', 'Needs approval']) {
     const capsule = capsuleFor(tree, title)!
     const border = capsuleBorder(tree, title)!
@@ -2169,12 +2403,14 @@ test('hovering a clickable capsule lights its border and mutes its one block whi
   await ui.unmount()
 })
 
-test('keyboard focus on a capsule lights its border and mutes its whole block at rest; a denied move keeps it', async ($, on) => {
+// The focus ring stops on Buttons alone: where the capsule module draws the
+// capsules, only the Hesaplar title is a stop.
+test('without the capsule module, keyboard focus on a capsule lights its border and mutes its whole block at rest; a denied move keeps it', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); world(on)
   let denied = false
   on('ui.focus', () => denied ? { deny: 'test refusal' } : {})
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'vscode' })
   const focus = (element?: string, plugin = 'shiftover-panel') => $.ui.focus({
     component: 'Pane', requestId: 'shiftover-panel', plugin, element, origin: { kind: 'person' },
   })
@@ -2217,11 +2453,8 @@ test('waiting borders share a one-second flash every ten seconds while dots keep
     'idle-session': rawSession(IDLE, 1004, { agentLifecycle: 'needsInput' }),
     'current-session': rawSession(CURRENT, 1001, { agentLifecycle: 'needsInput' }),
   }
-  on('ui.focus', () => ({}))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'terminal' })
-  await $.ui.focus({ component: 'Pane', requestId: 'shiftover-panel', plugin: 'shiftover-panel',
-    element: 'chat:waiting-session', origin: { kind: 'person' } })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   for (const elapsed of [67, 599, 600, 999, 1000, 1200, 9900, 9999, 10_000, 10_999, 11_000, 19_999, 20_000]) {
     await clock.set(NOW + elapsed)
     const tree = await ui.drawn()
@@ -2229,14 +2462,19 @@ test('waiting borders share a one-second flash every ten seconds while dots keep
     for (const title of ['Needs approval', 'Idle tab', 'Current tab']) {
       const capsule = capsuleFor(tree, title)!
       const dot = drawnNodes(capsule).find(node => node.type === 'Text' && shownText(node) === '●')
-      // The focused capsule's text is muted at rest; its border still flashes.
-      expect(dot?.props?.color).toBe(title === 'Needs approval' ? 'inactive' : color)
+      expect(dot?.props?.color).toBe(color)
       expect(capsuleBorder(tree, title)?.props?.borderColor).toBe(title === 'Current tab'
         ? 'claude' : elapsed % 10_000 < 1000 ? 'error' : 'subtle')
       expect(capsuleBorder(tree, title)?.hover).toBeUndefined()
     }
     expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(1)
   }
+  // Hovered, a waiting chat's border is text; let go, it flashes as before.
+  await clock.set(NOW + 30_000)
+  await ui.pointer({ type: 'enter', x: 3, y: 1, in: 'chat:waiting-session' })
+  expect(capsuleBorder(await ui.drawn(), 'Needs approval')?.props?.borderColor).toBe('text')
+  await ui.pointer({ type: 'leave', x: 3, y: 1, in: 'chat:waiting-session' })
+  expect(capsuleBorder(await ui.drawn(), 'Needs approval')?.props?.borderColor).toBe('error')
   state.isPlaced = false
   await clock.advance(600)
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
@@ -2252,7 +2490,7 @@ for (const status of ['idle', 'running'] as const) {
     const clock = mock.clock(on, { now: NOW }); const state = world(on)
     state.sessions['current-session'] = rawSession(CURRENT, 1001, { agentLifecycle: status })
     await start($, clock)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, surface: 'terminal' })
     for (const elapsed of [0, 600, 9400]) {
       await clock.advance(elapsed)
       const tree = await ui.drawn()
@@ -2260,7 +2498,12 @@ for (const status of ['idle', 'running'] as const) {
       expect(marker?.props?.color).toBe('claude')
       expect(capsuleBorder(tree, 'Current tab')?.props?.borderColor).toBe(marker?.props?.color)
       expect(drawnNodes(capsuleFor(tree, 'Current tab')).filter(node => node.type === 'Button')).toHaveLength(0)
+      expect((await ui.find({ type: 'Client', key: 'chat:current-session' }))?.props.props)
+        .toMatchObject({ border: 'claude', isPressable: false, rows: [] })
     }
+    // A click on it acts on nothing.
+    await ui.press({ key: 'chat:current-session' })
+    expect(actionCalls(state)).toEqual([])
     await ui.unmount()
   })
 }
@@ -2280,7 +2523,7 @@ test('delegate rows match session ids before pids and ignore old, closed, finish
     { ...RUNNING, id: 'empty', parent_session_id: '', parent_pid: 0 },
   ]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   const glyph = spinnerAt(clock.now())
   expect(subRows(tree, 'Needs approval')).toEqual([`└ ${glyph} codex  çalışıyor`, `└ ${glyph} yusa  çalışıyor`])
@@ -2300,7 +2543,7 @@ test('delegate rows list each running job by earliest start, share the spinner, 
   }))
   await start($, clock)
   for (const width of [76, 42, 16]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     for (const elapsed of [0, 250]) {
       await clock.advance(elapsed)
       await ui.redraw(); await clock.settle()
@@ -2351,7 +2594,7 @@ test('delegate rows retain the existing two-hour staleness guard when ps is unav
     { ...RUNNING, id: 'old-parent', account: 'aras', parent_pid: 1004, started: (NOW - 2 * 3_600_000) / 1000 },
   ]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.unmount()
 })
@@ -2372,7 +2615,7 @@ test('parentless running delegates find their starters in one batched grep of op
   // Many refreshes later the found starters still hold without a search.
   for (const elapsed of [0, 5 * 60_000]) {
     await clock.advance(elapsed)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, surface: 'terminal' })
     const tree = await ui.drawn()
     expect(subRows(tree, 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
     expect(subRows(tree, 'Analysis tab')).toEqual([expect.stringMatching(subRow('aras'))])
@@ -2389,7 +2632,7 @@ test('an unmatched starter is searched again only after a minute, and presses re
   expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
   mention(state, '/transcripts/1004.jsonl', RUNNING.id)
   await clock.advance(58_000)
-  const early = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const early = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await early.drawn(), 'Idle tab')).toEqual([])
   await early.press({ key: `job:${RUNNING.id}` })
   expect(state.toasts).toEqual(['başlatan sekme kapalı'])
@@ -2397,7 +2640,7 @@ test('an unmatched starter is searched again only after a minute, and presses re
   await early.unmount()
   await clock.advance(1_000)
   expect(grepCalls(state)).toHaveLength(2)
-  const found = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const found = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await found.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await found.press({ key: `job:${RUNNING.id}` })
   expect(actionCalls(state).map(call => call.argv)).toEqual([
@@ -2415,7 +2658,7 @@ test('delegates with parent fields, finished or stale ones are never searched in
   await start($, clock)
   await clock.advance(3 * 60_000)
   expect(grepCalls(state)).toHaveLength(0)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   for (const title of ['Needs approval', 'Analysis tab', 'Current tab', 'Idle tab']) {
     expect(subRows(await ui.drawn(), title)).toEqual([])
   }
@@ -2450,7 +2693,7 @@ test('a starter search waits for an open transcript without spending an attempt'
   await clock.advance(10_000)
   expect(grepCalls(state).map(call => call.argv)).toEqual([
     ['grep', '-o', '-H', '-E', '-s', '-e', jobIdPattern(RUNNING.id), '--', '/transcripts/1004.jsonl']])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.unmount()
 })
@@ -2460,13 +2703,13 @@ test('a finished delegate keeps its found starter for presses until it leaves th
   mention(state, '/transcripts/1004.jsonl', RUNNING.id)
   await start($, clock)
   expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
-  const running = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const running = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await running.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await running.unmount()
   state.jobs = [{ ...RUNNING, status: 'done', finished: (NOW + 5_000) / 1000, duration_ms: 60_000 }, DONE]
   state.jobsRevision += 1
   await clock.advance(3 * 60_000)
-  const done = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const done = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await done.drawn(), 'Idle tab')).toEqual([])
   await done.press({ key: `job:${RUNNING.id}` })
   expect(actionCalls(state).map(call => call.argv)).toEqual([
@@ -2488,7 +2731,7 @@ test('a zombie delegate process is not running: its job is stale and loses its r
   state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
   state.processes.set(4242, { stat: 'Z', command: '(codex)' })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'stale' }] } })
   expect(await rowText(ui, /ads review/)).toMatch(/^\? .*ads review/)
   expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([])
@@ -2522,7 +2765,7 @@ for (const [name, job, lines, status, glyph] of [
     // Its duration stops at the .out's time and the unchanged .out is not read again.
     for (const elapsed of [0, 60_000]) {
       await clock.advance(elapsed)
-      const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+      const ui = await mount($,{ ...PANE, surface: 'terminal' })
       expect(await rowText(ui, /ads review/)).toMatch(new RegExp(`^${glyph} .*ads review`))
       expect(await rowText(ui, new RegExp(`^${job.account} · 8 dk`))).toBeDefined()
       expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([])
@@ -2541,7 +2784,7 @@ test('a still-running .out keeps its job running and is tailed again only after 
   await start($, clock)
   expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', '262144', '--', `${JOBS}/${RUNNING.id}.out`]])
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'running', finishedMs: null }] } })
-  const running = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const running = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await running.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await running.unmount()
   await clock.advance(30_000)
@@ -2551,7 +2794,7 @@ test('a still-running .out keeps its job running and is tailed again only after 
   await clock.advance(10_000)
   expect(tailCalls(state)).toHaveLength(2)
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'done' }] } })
-  const done = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const done = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await done.drawn(), 'Idle tab')).toEqual([])
   await done.unmount()
 })
@@ -2566,8 +2809,10 @@ test('a truncated .out tail ignores its partial first line, both ends read by on
   await start($, clock)
   const list = (state.snapshots.get('jobs') as { value: { list: { id: string; status: string }[] } }).value.list
   expect(list.map(job => [job.id, job.status])).toEqual([[RUNNING.id, 'running'], ['claude-job', 'running']])
+  // Both ends in one tail; the codex .out, its step source too, named no step
+  // there, so all of it a tail can hold is read for one, alone.
   expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', '262144', '--',
-    `${JOBS}/${RUNNING.id}.out`, `${JOBS}/claude-job.out`]])
+    `${JOBS}/${RUNNING.id}.out`, `${JOBS}/claude-job.out`], ['tail', '-c', '300001', '--', `${JOBS}/${RUNNING.id}.out`]])
 })
 
 test('one batched ps checks every running delegate whose .out has not ended, zombies included', async ($, on) => {
@@ -2602,7 +2847,7 @@ test('account borders list reset times over an hour apart with faint labels and 
   ]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const width of [76, 42]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const kadir = resetOverlay(tree, 'kadir')!
     expect(shownText(kadir)).toBe(' hafta 1g 2sa · Fable 2g 2sa ')
@@ -2655,7 +2900,7 @@ test('reset borders omit missing and passed resets, use the cell model name, and
   ]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const width of [76, 42]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const overlay = resetOverlay(tree, 'kadir')!
     expect(shownText(overlay)).toBe(' ↻ 35dk ')
@@ -2678,7 +2923,7 @@ test('reset parts are dropped from the end and disappear completely before touch
   ])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const [width, expected] of [[42, ' hafta 2g 2sa '], [24, ' hafta 2g 2sa '], [16, '']] as const) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     expect(shownText(resetOverlay(tree, 'kadir'))).toBe(expected)
     const border = laidOutRows(accountFrame(tree, 'kadir'), width - 4)[0]!
@@ -2696,7 +2941,7 @@ test('Codex reset borders use only its existing windows and their actual reset t
     { used_percent: 20, window_minutes: 300, resets_at: NOW / 1000 + 35 * 60 }) })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const width of [76, 42]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const overlay = resetOverlay(await ui.drawn(), 'codex')!
     expect(shownText(overlay)).toBe(' ↻ 2g 2sa ')
     expect(shownText(overlay)).not.toMatch(/5s|35dk/)
@@ -2712,7 +2957,7 @@ test('reset border text changes only on minute boundaries even while another row
   state.jobs = [RUNNING]
   state.accounts = oneAccount([{ ...limit(10, 'weekly_all'), resets_at: iso(NOW + 108 * 60_000) }])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1sa 48dk ')
   for (const target of [NOW + 1000, NOW + 30_000, NOW + 59_900]) {
     await clock.set(target)
@@ -2729,7 +2974,7 @@ test('quiet reset borders schedule a minute callback with no one-second timer', 
   const state = world(on); idle(state)
   state.accounts = oneAccount([{ ...limit(10, 'weekly_all'), resets_at: iso(NOW + 35 * 60_000) }])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(67); redraws.length = 0
   expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 59_933 }])
   expect(clock.waits().some(wait => wait.ms === 1000)).toBe(false)
@@ -2762,7 +3007,7 @@ test('weekly resets at most an hour apart show one earliest time, colored for th
     { used_percent: 93, window_minutes: 10080, resets_at: NOW / 1000 + 26 * 3600 }) })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const width of [76, 42]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     for (const [name, shown] of [
       ['same', ' ↻ 2g 2sa '], ['hour', ' ↻ 2g 2sa '], ['apart', ' hafta 2g 3sa · Fable 2g 2sa '],
@@ -2796,7 +3041,7 @@ test('a server refresh deadline between spinner frames is not delayed by the rep
   const state = world(on); idle(state); state.jobs = [RUNNING]
   state.accounts = [{ ...readable(STATUS[0]!), next_refresh_at: (NOW + 250) / 1000 }]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(249)
   expect(statusCalls(state)).toHaveLength(1)
   await clock.advance(1)
@@ -2824,7 +3069,7 @@ for (const width of [76, 42]) {
     state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine(
       { used_percent: 2, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
     await start($, clock)
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const card = accountsCard(tree)!
     const rows = laidOutRows(card, width)
@@ -2857,7 +3102,7 @@ test('only the accounts title toggles, through a Button that is the visible titl
   state.accounts = summaryAccounts()
   await start($, clock)
   for (const surface of SURFACES) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface })
     expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
     const card = accountsCard(await ui.drawn())!
     expect(drawnNodes(card).filter(node => node.type === 'Button')).toHaveLength(1)
@@ -2891,7 +3136,7 @@ test('collapsed accounts show ordered markers and their maximum usage in the mat
   state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine(
     { used_percent: 2, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   await ui.press({ key: 'accounts:toggle' }); await clock.settle()
   const card = accountsCard(await ui.drawn())!
   expect(summaryRows(card)).toEqual(['● kadir 96%  ○ aras 46%  ○ yusa 64%  ○ lost ?  ◎ codex 2%'])
@@ -2911,7 +3156,7 @@ test('collapsed summaries drop whole trailing accounts and append an ellipsis wi
   state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine(
     { used_percent: 2, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   await ui.press({ key: 'accounts:toggle' }); await clock.settle()
   await ui.unmount()
   for (const [width, expected] of [
@@ -2919,7 +3164,7 @@ test('collapsed summaries drop whole trailing accounts and append an ellipsis wi
     [42, '● kadir 96%  ○ aras 46%  ○ yusa 64%  …'],
     [27, '● kadir 96%  …'], [16, '…'],
   ] as const) {
-    const narrow = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const narrow = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await narrow.drawn()
     expect(summaryRows(tree)).toEqual([expected])
     expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
@@ -2932,7 +3177,7 @@ for (const stored of [false, true, 'invalid', undefined]) {
     const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
     state.store.set('isAccountsOpen', stored)
     await start($, clock)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, surface: 'terminal' })
     expect(await rowText(ui, /Hesaplar/)).toBe(stored === false ? ' Hesaplar ▸ ' : ' Hesaplar ▾ ')
     await ui.unmount()
   })
@@ -2941,11 +3186,11 @@ for (const stored of [false, true, 'invalid', undefined]) {
 test('the accounts choice survives remounts and is reloaded from storage on session start', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'accounts:toggle' }); await clock.settle()
   expect(state.store.get('isAccountsOpen')).toBe(false)
   await ui.unmount()
-  const reload = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const reload = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(reload, /Hesaplar/)).toBe(' Hesaplar ▸ ')
   await reload.unmount()
   state.snapshots.delete('isAccountsOpen')
@@ -2953,7 +3198,7 @@ test('the accounts choice survives remounts and is reloaded from storage on sess
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   expect(state.storeReads.length).toBeGreaterThan(reads)
   expect(state.snapshots.get('isAccountsOpen')).toBe(false)
-  const tab = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const tab = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(tab, /Hesaplar/)).toBe(' Hesaplar ▸ ')
   await tab.press({ key: 'accounts:toggle' }); await clock.settle()
   expect(state.store.get('isAccountsOpen')).toBe(true)
@@ -2964,7 +3209,7 @@ test('collapsed accounts keep refreshing data and retain the spinner beside thei
   const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
   state.accounts = [{ ...summaryAccounts()[0]!, next_refresh_at: (NOW + 2000) / 1000 }]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'accounts:toggle' }); await clock.settle()
   expect(summaryRows(await ui.drawn())).toEqual(['● kadir 96%  ◎ codex ?'])
   let release!: () => void
@@ -2996,7 +3241,7 @@ test('a Codex file over 4 MiB is read by its tail, never whole', async ($, on) =
   expect(state.reads.filter(path => path.startsWith(`read:${HOME}/.codex/`))).toEqual([])
   expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', String(1024 * 1024), '--', `${CODEX}/huge.jsonl`]])
   expect(codexUsed(state)).toEqual([33, 44])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 1sa 0dk', percent: 33 }, { label: 'hafta', percent: 44 }])
   await ui.unmount()
 })
@@ -3021,7 +3266,7 @@ test('a newest Codex file with no rate limits yet falls back to older files, and
   expect(tailCalls(state).slice(2).map(call => call.argv[4])).toEqual([`${CODEX}/fresh.jsonl`])
   expect(state.writes.filter(key => key === 'codex')).toHaveLength(writes)
   expect(codexUsed(state)).toEqual([21, 31])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 58dk', percent: 21 }, { label: 'hafta', percent: 31 }])
   await ui.unmount()
 })
@@ -3039,7 +3284,7 @@ test('a window whose reset has passed draws as reset at that time: 0%, no critic
   state.codexFiles.set(`${CODEX}/old.jsonl`, { mtimeMs: 1, text: rateLine(
     codexWindow(97, 300, NOW / 1000 - 60), codexWindow(50, 10080)) })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   let tree = await ui.drawn()
   expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '↻ <1dk', percent: 92 }, { label: 'hafta', percent: 0 },
     { label: 'Fable', percent: 40 }])
@@ -3063,7 +3308,7 @@ test('a pane behind another pane\'s tab reads and animates nothing, then catches
   const clock = observedClock(on); const state = world(on); idle(state)
   state.jobs = [RUNNING]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(1)
   state.isShown = false
   await clock.advance(10_000)
@@ -3131,7 +3376,7 @@ test('a tab whose last event is the idle reminder stays boşta and steady; a per
   state.sessions = { 'idle-session': rawSession(IDLE, 1004, { hookEventName: 'Notification',
     notification_type: 'idle_prompt', message: 'Claude is waiting for your input' }) }
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(67)
   expect(contentRows(capsuleFor(await ui.drawn(), 'Idle tab'))).toContain('boşta')
   expect((await ui.find({ type: 'Text', text: /^○$/ }))?.props.color).toBe('text')
@@ -3160,7 +3405,7 @@ test('the jobs state keeps every running job, then those finished within a day, 
   ]
   await start($, clock)
   expect(ids()).toEqual([RUNNING.id, ...Array.from({ length: 9 }, (_, index) => `day-${index}`)])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /^\+7 iş daha$/)).toBeDefined()
   await ui.unmount()
   state.jobs = [{ ...DONE, id: 'recent', started: (NOW - 24 * hour) / 1000, finished: (NOW - 23 * hour) / 1000 },
@@ -3187,7 +3432,7 @@ test('only the delegate tool answer names a starter: a tab that printed the id, 
   mention(state, '/transcripts/1004.jsonl', RUNNING.id)
   await start($, clock)
   expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   expect(subRows(tree, 'Needs approval')).toEqual([])
   expect(subRows(tree, 'Analysis tab')).toEqual([])
@@ -3203,7 +3448,7 @@ test('a compact delegate answer, as a structured tool result keeps it, names its
   state.transcripts.set('/transcripts/1003.jsonl', JSON.stringify({ type: 'user',
     toolUseResult: { job_id: RUNNING.id, status: 'running' } }))
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await ui.drawn(), 'Analysis tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.unmount()
 })
@@ -3226,7 +3471,7 @@ test('a reload raises session.start again: an old accounts-1 value is declined, 
     shape: 'accounts-1', value: { list: [{ name: 'kadir', email: 'old@example.com', dir: `${HOME}/.claude`, err: null,
       limits: [{ kind: 'session', model: '', used: 70, resetsAtMs: null }] }], current: 'kadir', at: NOW, error: null },
   }, version: 1 } })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(accountFrame(await ui.drawn(), 'kadir')).toBeUndefined()
   expect(shownText(await ui.drawn())).not.toMatch(/70%/)
   // As the engine raises it for a module it loaded fresh.
@@ -3254,7 +3499,7 @@ test('account errors read briefly: a renewing key, a needed login, an expired to
   ] as const
   state.accounts = cases.map(([name, err]) => ({ name, email: `${name}@example.com`, dir: `/${name}`, err }))
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   for (const [name, , shown] of cases) expect(contentRows(accountCapsule(tree, name)), name).toEqual([`○ ${name}`, shown])
   await ui.unmount()
@@ -3268,7 +3513,7 @@ test('chat models come from shiftover\'s session cache under XDG_CACHE_HOME, as 
   state.chatFiles.set('/xdg/shiftover/sessions/metadata.json', { mtimeMs: 1,
     text: JSON.stringify({ model: { id: 'claude-opus-5-5', display_name: 'Opus 5.5' } }) })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   expect(await rowText(ui, /^kadir · Opus 5\.5$/)).toBeDefined()
   expect(state.reads).toContain('list:/xdg/shiftover/jobs')
   expect(state.reads.filter(path => path.startsWith(`read:${HOME}/.cache/`))).toEqual([])
@@ -3295,16 +3540,26 @@ test('a claude step reads the last assistant block: the tool with its file or co
     [toolUse('Agent', { prompt: 'look' }), 'alt ajan çalışıyor'], [toolUse('Task', { prompt: 'look' }), 'alt ajan çalışıyor'],
     [assistantBlocks({ type: 'text', text: 'Bitti.' }), 'yazıyor'],
     [assistantBlocks({ type: 'thinking', thinking: '…' }), 'düşünüyor'],
-    [toolUse('WebFetch', { url: 'https://example.com' }), 'çalışıyor'],
+    [toolUse('NewTool', { x: 1 }), 'çalışıyor'],
     [toolUse('Edit', {}), 'çalışıyor'],
   ] as const) expect(claudeStep(`${line}\n`), line).toBe(step)
   // The last assistant line counts, past the tool's result; of its blocks, the last.
   expect(claudeStep([toolUse('Read', { file_path: '/a/b.ts' }),
     JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'x' }] } })].join('\n'))).toBe('b.ts okunuyor')
   expect(claudeStep(assistantBlocks({ type: 'thinking' }, { type: 'tool_use', name: 'Grep', input: {} }))).toBe('aranıyor')
-  // A tail cut mid-line drops its first line; nothing known reads as working.
-  expect(claudeStep(`${toolUse('Edit', { file_path: '/x/cut.ts' })}\n`, true)).toBe('çalışıyor')
-  expect(claudeStep('')).toBe('çalışıyor')
+  // A tail cut mid-line drops its first line; one with no assistant line
+  // names no step.
+  expect(claudeStep(`${toolUse('Edit', { file_path: '/x/cut.ts' })}\n`, true)).toBeNull()
+  expect(claudeStep('')).toBeNull()
+  expect(claudeStep(`${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'x' }] } })}\n`)).toBeNull()
+})
+
+test('the web, plan, skill, MCP and question tools say what they do', async () => {
+  for (const [name, step] of [
+    ['WebSearch', "web'de arıyor"], ['WebFetch', "web'de arıyor"], ['TodoWrite', 'plan güncelleniyor'],
+    ['Skill', 'beceri kullanıyor'], ['mcp__firecrawl__scrape', 'araç kullanıyor'], ['mcp__claude_ai_Gmail__search', 'araç kullanıyor'],
+    ['AskUserQuestion', 'soru soruyor'], ['mcp', 'çalışıyor'], ['toString', 'çalışıyor'], ['__proto__', 'çalışıyor'],
+  ] as const) expect(claudeStep(`${toolUse(name, {})}\n`), name).toBe(step)
 })
 
 test('a command reads as tests running when a test, typecheck or build tool runs it', async () => {
@@ -3328,7 +3583,8 @@ test('a codex step reads the last item: a command, a file change, a message or r
     [codexItem('item.completed', { item_type: 'reasoning', text: '…' }), 'düşünüyor'],
     [codexItem('item.started', { type: 'mcp_tool_call', server: 'x' }), 'çalışıyor'],
   ] as const) expect(codexStep(`${codexLine('turn.started')}\n${line}\n${codexLine('turn.started')}\n`), line).toBe(step)
-  expect(codexStep(`${codexLine('thread.started')}\n${codexLine('turn.started')}\n`)).toBe('çalışıyor')
+  // No item yet names no step.
+  expect(codexStep(`${codexLine('thread.started')}\n${codexLine('turn.started')}\n`)).toBeNull()
 })
 
 test('a cwd names its session folder with / and . made -, its other characters tried both ways', async () => {
@@ -3345,7 +3601,7 @@ test('a claude delegate\'s row says its step from its live transcript, read agai
   const file = { mtimeMs: NOW - 1000, text: `${toolUse('Edit', { file_path: '/Users/k/project/hooks/register.tsx' })}\n` }
   state.chatFiles.set(transcript, file)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', 'register.tsx düzenleniyor'))])
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: 'claude-job', step: 'register.tsx düzenleniyor' }] } })
   const tails = () => tailCalls(state).filter(call => call.argv.includes(transcript)).length
@@ -3366,10 +3622,10 @@ test('a codex delegate\'s row says its step from its .out, the one tail that als
     { type: 'file_change', changes: [{ path: '/Users/k/project/hooks/sessions.ts', kind: 'update' }] })}\n` }
   state.outs.set(RUNNING.id, out)
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex', 'sessions.ts düzenleniyor'))])
   // At 42 columns the step is cut to the row, with an ellipsis.
-  const narrow = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const narrow = await mount($,{ ...PANE, surface: 'desktop' })
   expect(subRows(await narrow.drawn(), 'Idle tab')).toEqual([expect.stringMatching(/^└ . codex  sessions\.ts düzenleniy…$/)])
   expect(cells(subRows(await narrow.drawn(), 'Idle tab')[0]!)).toBe(34)
   await narrow.unmount()
@@ -3395,7 +3651,7 @@ test('every changed end, .outs, transcripts and logs, is read by one tail a tick
   await start($, clock)
   expect(tailCalls(state).map(call => call.argv.slice(4).sort())).toEqual([[transcript, log,
     `${JOBS}/claude-job.out`, `${JOBS}/codex-job.out`].sort()])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await ui.drawn(), 'Idle tab').sort()).toEqual([expect.stringMatching(subRow('aras', 'yazıyor')),
     expect.stringMatching(subRow('codex', 'düşünüyor'))].sort())
   await clock.advance(30_000)
@@ -3419,7 +3675,7 @@ for (const folderName of ['-Users-k-my-app-v2', '-Users-k-my_app-v2']) {
     // session passes for the delegate's.
     expect(state.reads).not.toContain(`list:${folder}`)
     await clock.advance(9_000)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, surface: 'terminal' })
     expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', 'aranıyor'))])
     expect(state.reads).toContain(`list:${folder}`)
     expect(tailCalls(state).some(call => call.argv.includes(`${folder}/delegate.jsonl`))).toBe(true)
@@ -3435,9 +3691,142 @@ test('a job file\'s own config folder outranks its account\'s for the fallback s
   state.chatFiles.set(`${folder}/delegate.jsonl`, { mtimeMs: NOW - 1_000, text: toolUse('Read', { file_path: '/x/notes.md' }) })
   await start($, clock)
   await clock.advance(9_000)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', 'notes\\.md okunuyor'))])
   expect(state.reads.some(path => path.startsWith(`list:${HOME}/.claude-aras/`))).toBe(false)
+  await ui.unmount()
+})
+
+// A delegate's session as Claude Code 2.1.310 writes it: its title first,
+// bookkeeping between turns, one block per assistant line, and a screenshot
+// the delegate reads, whose result line and the next request's copy of it
+// are each far longer than a tail.
+const YUSA_SESSION = 'c6c67aef-8541-4084-b484-39497379bac0'
+const ARAS_SESSION = '5cd70b5b-492e-4347-841f-4cc4ed4dc5fd'
+const HOME_TAB = '88888888-8888-4888-8888-888888888888'
+const titled = (label: string, sessionId: string): string[] => [
+  JSON.stringify({ type: 'custom-title', customTitle: `delegate:${label}`, sessionId }),
+  JSON.stringify({ type: 'agent-name', agentName: `delegate:${label}`, sessionId }),
+  JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-10-26T15:08:40.988Z', sessionId }),
+]
+const said = (sessionId: string, block: Record<string, unknown>): string => JSON.stringify({ parentUuid: 'p', isSidechain: false,
+  message: { model: 'claude-opus-5-5', type: 'message', role: 'assistant', content: [block], stop_reason: 'tool_use' },
+  requestId: 'req', type: 'assistant', uuid: 'u', sessionId, version: '2.1.310' })
+const between = (label: string, sessionId: string): string[] => [
+  JSON.stringify({ type: 'api-request', sessionId, id: 'r', params: { model: 'claude-opus-5-5', output_config: { effort: 'max' } } }),
+  JSON.stringify({ type: 'last-prompt', lastPrompt: 'Implement GitHub issue #107…', sessionId }),
+  JSON.stringify({ type: 'custom-title', customTitle: `delegate:${label}`, sessionId }),
+  JSON.stringify({ type: 'agent-name', agentName: `delegate:${label}`, sessionId }),
+  JSON.stringify({ type: 'atis-latch', atis: '', sessionId }),
+]
+const screenshot = (sessionId: string, bytes: number): string[] => {
+  const image = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo'.padEnd(bytes, 'A') } }]
+  return [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: image }] }, sessionId }),
+    JSON.stringify({ type: 'attachment', attachment: { type: 'total_tokens_reminder', text: '<total_tokens>…' }, sessionId }),
+    JSON.stringify({ type: 'api-request-blob', sessionId, hash: 'h', message: { role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't', content: image }] } }),
+  ]
+}
+const lines = (...rows: string[]): string => `${rows.join('\n')}\n`
+
+test('a session names its delegate in its first lines; a head with no whole line yet names nothing', async () => {
+  expect(delegateLabel(lines(...titled('verify seedance notes', ARAS_SESSION)))).toBe('verify seedance notes')
+  expect(delegateLabel(JSON.stringify({ type: 'agent-name', agentName: 'delegate: spaced ' }))).toBe('spaced')
+  expect(delegateLabel(lines(JSON.stringify({ type: 'queue-operation' }), JSON.stringify({ type: 'custom-title', customTitle: 'Benim adım' }))))
+    .toBeNull()
+  expect(delegateLabel('')).toBeUndefined()
+  expect(delegateLabel('{"type":"custom-title","customTitle":"deleg')).toBeUndefined()
+})
+
+test('a delegate whose session ends in a screenshot and its copy keeps its last step: the lines it gained are read further back', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  const label = 'muslimcar #107 welcome screen code'
+  const folder = `${HOME}/.claude-hesap3/projects/-Users-k-muslimcarplay-worktrees-107-welcome-screen`
+  const path = `${folder}/${YUSA_SESSION}.jsonl`
+  // As its job file has it: the account's config folder, no transcript path.
+  state.jobs = [{ ...RUNNING, id: '20261026-174431-9dd9', account: 'yusa', model: 'opus', backend: 'claude', label,
+    dir: `${HOME}/.claude-hesap3`, cwd: '/Users/k/muslimcarplay-worktrees/107-welcome-screen', parent_session_id: 'idle-session',
+    started: (NOW - 600_000) / 1000 }]
+  const file = { mtimeMs: NOW - 2_000, text: lines(...titled(label, YUSA_SESSION),
+    said(YUSA_SESSION, { type: 'thinking', thinking: '', signature: 'sig' }),
+    said(YUSA_SESSION, { type: 'tool_use', name: 'Bash', input: { command: "sed -i '' 's/a/b/' Welcome.swift && xcodebuild build" } }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'build exit 0' }] } }),
+    ...between(label, YUSA_SESSION),
+    said(YUSA_SESSION, { type: 'tool_use', name: 'Read', input: { file_path: '/tmp/107-work/shots/dt-ax5-bottom-small.png' } }),
+    ...screenshot(YUSA_SESSION, 200_000)) }
+  state.chatFiles.set(path, file)
+  const reads = () => tailCalls(state).filter(call => call.argv.includes(path)).map(call => Number(call.argv[2]))
+  const step = () => (state.snapshots.get('jobs') as { value: { list: { step?: string }[] } }).value.list[0]?.step
+  await start($, clock)
+  await clock.advance(9_000)
+  // Its end, a tail's worth inside the screenshot, names no step: all of it
+  // is read once, and the screenshot's Read is the step.
+  expect(reads()).toEqual([262_144, file.text.length + 1])
+  expect(step()).toBe('dt-ax5-bottom-small.png okunuyor')
+  const ui = await mount($, { ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('yusa', 'dt-ax5-bottom-small\\.png okunuyor'))])
+  // Another screenshot and no step since: only what it gained is read, and
+  // the step stays.
+  let size = file.text.length
+  file.text += lines(...screenshot(YUSA_SESSION, 150_000)); file.mtimeMs = clock.now()
+  await clock.advance(10_000)
+  expect(reads().slice(2)).toEqual([262_144, file.text.length - size + 1])
+  expect(step()).toBe('dt-ax5-bottom-small.png okunuyor')
+  // A test run, then a screenshot over it: the run is found behind it.
+  size = file.text.length
+  file.text += lines(...between(label, YUSA_SESSION), said(YUSA_SESSION, { type: 'tool_use', name: 'Bash',
+    input: { command: 'xcodebuild -scheme MuslimCarPlay test' } }), ...screenshot(YUSA_SESSION, 150_000))
+  file.mtimeMs = clock.now()
+  await clock.advance(10_000)
+  expect(reads().slice(4)).toEqual([262_144, file.text.length - size + 1])
+  expect(step()).toBe('testler çalışıyor')
+  // A step within a tail's reach needs no more.
+  file.text += lines(...between(label, YUSA_SESSION), said(YUSA_SESSION, { type: 'thinking', thinking: '', signature: 's' }))
+  file.mtimeMs = clock.now()
+  await clock.advance(10_000)
+  expect(reads().slice(6)).toEqual([262_144])
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('yusa', 'düşünüyor'))])
+  // Its head is read once: it never changes.
+  expect(headCalls(state).map(call => call.argv)).toEqual([['head', '-c', '16384', '--', path]])
+  await ui.unmount()
+})
+
+test('a WebFetch delegate in the home folder every account shares reads web\'de arıyor from its own session alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  const label = 'verify seedance notes'
+  const folder = `${HOME}/.claude-hesap2/projects/-Users-k`
+  const own = `${folder}/${ARAS_SESSION}.jsonl`
+  state.jobs = [{ ...RUNNING, id: '20261026-180839-fa03', account: 'aras', model: 'opus', backend: 'claude', label,
+    dir: `${HOME}/.claude-hesap2`, cwd: HOME, parent_session_id: 'idle-session', started: (NOW - 300_000) / 1000 }]
+  state.chatFiles.set(own, { mtimeMs: NOW - 3_000, text: lines(...titled(label, ARAS_SESSION),
+    said(ARAS_SESSION, { type: 'thinking', thinking: '', signature: 'sig' }),
+    said(ARAS_SESSION, { type: 'tool_use', name: 'WebFetch', input: { url: 'https://seed.bytedance.com', prompt: 'notes' } }),
+    said(ARAS_SESSION, { type: 'tool_use', name: 'WebFetch', input: { url: 'https://docs.byteplus.com', prompt: 'notes' } }),
+    ...between(label, ARAS_SESSION)) })
+  // Newer: an open chat in the same folder, its path spelled under another
+  // account's config folder, and another delegate's session.
+  state.panels = [...state.panels, { id: HOME_TAB, title: 'Home chat' }]
+  state.sessions['home-chat'] = rawSession(HOME_TAB, 1007, { cwd: HOME, transcriptPath: `${HOME}/.claude/projects/-Users-k/home-chat.jsonl` })
+  state.alivePids.add(1007)
+  state.chatFiles.set(`${folder}/home-chat.jsonl`, { mtimeMs: NOW - 1_000, text: lines(
+    JSON.stringify({ type: 'queue-operation', operation: 'enqueue' }), assistantBlocks({ type: 'text', text: 'Merhaba' })) })
+  state.chatFiles.set(`${folder}/other.jsonl`, { mtimeMs: NOW - 500, text: lines(...titled('another job', 'other'),
+    toolUse('Edit', { file_path: '/x/other.ts' })) })
+  // Older than the job: no candidate at all.
+  state.chatFiles.set(`${folder}/old.jsonl`, { mtimeMs: NOW - 900_000, text: lines(toolUse('Read', { file_path: '/x/old.ts' })) })
+  await start($, clock)
+  await clock.advance(9_000)
+  const ui = await mount($, { ...PANE, surface: 'terminal' })
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', "web'de arıyor"))])
+  // Only the two candidates' heads are read, in one head; only its own end.
+  expect(headCalls(state).map(call => call.argv.slice(0, 4))).toEqual([['head', '-c', '16384', '--']])
+  expect(headCalls(state).flatMap(call => call.argv.slice(4)).sort()).toEqual([own, `${folder}/other.jsonl`].sort())
+  const tailed = tailCalls(state).flatMap(call => call.argv.slice(4))
+  expect(tailed).toContain(own)
+  for (const name of ['home-chat', 'other', 'old']) expect(tailed).not.toContain(`${folder}/${name}.jsonl`)
+  await clock.advance(30_000)
+  expect(headCalls(state)).toHaveLength(1)
   await ui.unmount()
 })
 
@@ -3446,7 +3835,7 @@ test('pressing a delegate row opens a cmux tab in its chat\'s workspace that fol
   state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }, { ...RUNNING, id: "odd id's", parent_session_id: 'idle-session' }]
   await start($, clock)
   for (const surface of SURFACES) {
-    const ui = await $.ui.mount({ ...PANE, surface })
+    const ui = await mount($,{ ...PANE, surface })
     expect(followButtons(await ui.drawn(), 'Idle tab').map(node => node.props?.key)).toEqual([`follow:${RUNNING.id}`, "follow:odd id's"])
     const before = surfaceCalls(state).length
     await ui.press({ key: `follow:${RUNNING.id}` })
@@ -3454,7 +3843,7 @@ test('pressing a delegate row opens a cmux tab in its chat\'s workspace that fol
       '--command', `${HOME}/.local/bin/shiftover jobs follow ${RUNNING.id}`, '--focus', 'true']])
     await ui.unmount()
   }
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   // An id a shell would split stays one word.
   await ui.press({ key: "follow:odd id's" })
   expect(surfaceCalls(state).slice(-1)[0]?.argv[5]).toBe(`${HOME}/.local/bin/shiftover jobs follow 'odd id'\\''s'`)
@@ -3476,13 +3865,16 @@ test('the current chat shows its delegates as rows too, and a job whose starter 
     { ...RUNNING, id: 'orphan', label: 'yetim iş', account: 'aras', parent_session_id: 'closed-session', parent_pid: 1005 }]
   await start($, clock)
   for (const surface of SURFACES) {
-    const ui = await $.ui.mount({ ...PANE, surface })
+    const ui = await mount($,{ ...PANE, surface })
+    const hasClient = surface === 'terminal' || surface === 'desktop'
     const tree = await ui.drawn()
     const current = capsuleFor(tree, 'Current tab')!
-    // Its own lines press nothing; the row is the one Button, under them.
-    expect(lineButtons(current).map(node => node.props?.key)).toEqual([`follow:${RUNNING.id}`])
+    // Its own lines press nothing; the row, under them, is a target of its
+    // own: a part of the capsule module's region, else the one Button.
+    expect(followButtons(tree, 'Current tab').map(node => node.props?.key)).toEqual([`follow:${RUNNING.id}`])
+    expect(lineButtons(current).map(node => node.props?.key)).toEqual(hasClient ? [] : [`follow:${RUNNING.id}`])
     expect(subRows(tree, 'Current tab')).toEqual([expect.stringMatching(subRow('codex'))])
-    expect(capsuleBorder(tree, 'Current tab')?.props).toMatchObject({ borderColor: 'claude', paddingX: 0 })
+    expect(capsuleBorder(tree, 'Current tab')?.props).toMatchObject({ borderColor: 'claude', paddingX: hasClient ? 1 : 0 })
     expect(capsuleBorder(tree, 'Current tab')?.hover).toBeUndefined()
     const rows = laidOutRows(current, 38)
     expect(rows.slice(1, 4).map(row => row.slice(0, 4))).toEqual(['│ ○ ', '│ ka', '│ bu'])
@@ -3495,12 +3887,59 @@ test('the current chat shows its delegates as rows too, and a job whose starter 
   }
 })
 
-test('a delegate row has its own keyed Box: hover and focus mute it alone and light the chat\'s border', async ($, on) => {
+test('a delegate row is its own part of the chat\'s region: over it the border lights, a click follows the job, by the row it hit', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }, { ...RUNNING, id: 'mine', parent_session_id: 'current-session' }]
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await mount($, { ...PANE, surface })
+    const region = async (key: string) => await ui.drawn({ in: key }) as DrawnNode
+    const click = async (key: string, y: number, button: 'left' | 'middle' | 'right' = 'left', to = y) => {
+      await ui.pointer({ type: 'down', x: 4, y, button, in: key })
+      await ui.pointer({ type: 'up', x: 4, y: to, button, in: key })
+    }
+    // Rows 1 to 3 are the chat's own lines, row 4 the delegate's.
+    const idle = await region('chat:idle-session')
+    expect(rowIn(idle, `follow:${RUNNING.id}`)).toBe(4)
+    expect(laidOutRows(idle, 38)[4]).toMatch(new RegExp(`^│ ${subRow('codex').source.slice(1, -1)} *│$`))
+    const follows = () => surfaceCalls(state).map(call => call.argv[5])
+    const focuses = () => actionCalls(state).length
+    let [followed, focused] = [follows().length, focuses()]
+    // The current chat: its lines neither light nor press; its row does both.
+    for (const [y, color] of [[1, 'claude'], [4, 'text'], [2, 'claude'], [5, 'claude']] as const) {
+      await ui.pointer({ type: y === 1 ? 'enter' : 'move', x: 6, y, in: 'chat:current-session' })
+      expect((await region('chat:current-session')).props?.borderColor).toBe(color)
+    }
+    await click('chat:current-session', 1)
+    expect([follows().length, focuses()]).toEqual([followed, focused])
+    await click('chat:current-session', 4)
+    expect(follows().slice(followed)).toEqual([`${HOME}/.local/bin/shiftover jobs follow mine`])
+    // Another chat: its lines focus its tab, its row follows its own job.
+    ;[followed, focused] = [follows().length, focuses()]
+    const before = JSON.stringify((await region('chat:idle-session')).children)
+    await ui.pointer({ type: 'enter', x: 6, y: 4, in: 'chat:idle-session' })
+    expect((await region('chat:idle-session')).props?.borderColor).toBe('text')
+    expect(JSON.stringify((await region('chat:idle-session')).children)).toBe(before)
+    await click('chat:idle-session', 4)
+    expect(follows().slice(followed)).toEqual([`${HOME}/.local/bin/shiftover jobs follow ${RUNNING.id}`])
+    expect(focuses()).toBe(focused)
+    await click('chat:idle-session', 1)
+    expect(focuses()).toBe(focused + 2)
+    // A right or middle click does nothing; nor does a press let go elsewhere.
+    ;[followed, focused] = [follows().length, focuses()]
+    await click('chat:idle-session', 1, 'right'); await click('chat:idle-session', 4, 'middle')
+    await click('chat:idle-session', 1, 'left', 4); await click('chat:idle-session', 4, 'left', 9)
+    expect([follows().length, focuses()]).toEqual([followed, focused])
+    await ui.unmount()
+  }
+})
+
+test('without the capsule module a delegate row has its own keyed Box: hover and focus mute it alone and light the chat\'s border', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   on('ui.focus', () => ({}))
   state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'vscode' })
   let tree = await ui.drawn()
   const row = followButtons(tree, 'Idle tab')[0]!
   const target = drawnNodes(capsuleFor(tree, 'Idle tab')).find(node => (node.children ?? []).includes(row))!
@@ -3543,7 +3982,7 @@ test('delegate steps are read only while the pane shows: hidden, no stat, listin
   expect(state.calls.slice(calls)).toEqual([])
   // Shown again, the changed transcript is read at once.
   state.isShown = true
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(1)
   expect(tailCalls(state).slice(-1)[0]?.argv).toContain(transcript)
   expect(subRows(await ui.drawn(), 'Idle tab')[0]).toMatch(subRow('aras', 'aranıyor'))
@@ -3585,7 +4024,7 @@ test('a chat\'s title is its /rename, else its tab title unless a shell\'s, else
     .value.list.map(chat => [chat.id, chat.title]))
   expect(titles()).toEqual({ 'waiting-session': 'Yeni ad', 'idle-session': 'Önbellek düzeltmesi', 'runner-session': 'project',
     'current-session': 'Current tab' })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /Önbellek düzeltmesi/)).toMatch(/^○ Önbellek düzeltmesi +›$/)
   // A /rename shows on the next tick, cmux not listed again.
   idleFile.text += `${JSON.stringify({ type: 'custom-title', customTitle: 'Yeniden adlandırıldı' })}\n`
@@ -3613,7 +4052,7 @@ test('accounts draw their display name wherever one is set, else their name; Cod
     { name: 'aras', display: 'mehemed' }] } })
   expect(JSON.stringify(state.snapshots.get('accounts'))).not.toMatch(/@example\.com/)
   for (const width of [42, 76]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     // Hesaplar: the display name, else the name; the codex row as it was.
     expect(accountCapsule(tree, 'mehemed')).toBeDefined()
@@ -3628,7 +4067,7 @@ test('accounts draw their display name wherever one is set, else their name; Cod
     await ui.unmount()
   }
   // Collapsed, the summary names it the same way.
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
   await ui.press({ key: 'accounts:toggle' }); await clock.settle()
   expect(summaryRows(await ui.drawn())).toEqual(['● kadir ?  ○ mehemed 92%  ◎ codex ?'])
   await ui.unmount()

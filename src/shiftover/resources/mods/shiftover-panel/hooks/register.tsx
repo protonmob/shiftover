@@ -5,10 +5,11 @@ import type { Color, EngineInterface, FsEntry, Register, RenderChildren, TextHov
 import type { Account, AccountsSnapshot, AgentsSnapshot, ChatSession, CodexSnapshot, Job, JobsSnapshot,
   Limit, PaneAgent } from '../types'
 
+import type { CapsuleProps } from './capsule'
 import { readCodexLimits } from './codex'
 import { refreshChats, refreshStarters, focusChat, followJob, openDelegate, parentChat } from './sessions'
 import type { ChatsSnapshot } from './sessions'
-import { claudeStep, codexStep, projectFolders } from './steps'
+import { claudeStep, codexStep, delegateLabel, projectFolders } from './steps'
 
 // MARK: - Constants
 
@@ -29,7 +30,8 @@ const WAITING_BLINK_MS = 600
 const WAITING_BORDER_MS = 10_000
 const WAITING_BORDER_FLASH_MS = 1_000
 const CURRENT_COLOR: Color = 'claude'
-// The theme's dim color: a muted capsule inverts to a soft grey block.
+// The theme's dim color: a muted Button (the title, a capsule drawn without
+// the capsule module) inverts to a soft grey block.
 const MUTED: Color = 'inactive'
 const POP_MS = 250
 const FINISH_MS = 2_000
@@ -41,8 +43,14 @@ const JOBS_KEPT_MS = 24 * 60 * 60_000
 const UNVERIFIED_RUNNING_MS = 2 * 60 * 60 * 1000
 const RESET_GROUP_MS = 60 * 60_000
 const TAIL_BYTES = 256 * 1024
-// Files one `tail` reads at most: their ends stay under its 4 MiB of output.
+// Files one `tail` or `head` reads at most: their ends stay under its 4 MiB
+// of output.
 const TAILS_PER_RUN = 12
+// A session's first lines, where a delegate's names its label.
+const HEAD_BYTES = 16 * 1024
+// How far back a step source is read, alone, when its end names no step:
+// what it gained since its last read, else this much of its end.
+const DEEP_TAIL_BYTES = 3 * 1024 * 1024
 // The accounts' own colors, by name, for a delegate's row; text for others.
 const ACCOUNT_COLORS: Record<string, Color> = { codex: 'success', aras: 'suggestion', yusa: 'remember', kadir: CURRENT_COLOR }
 // Requested dock width; drawing uses the actual bodyColumns grant.
@@ -70,12 +78,15 @@ const agents = atom({ plugin: 'shiftover-panel', key: 'agents' } as const, NO_AG
 
 // What the module keeps between timer ticks; a reload starts it over.
 type Files = { home: string; cacheDir: string; jobsDir: string; configFile: string; bin: string }
-// The backend, the job's folders and where it records its steps stay here,
-// out of the stored Job shape: an empty path is one the file does not name.
-type JobPlace = { backend: string; cwd: string; dir: string; transcriptPath: string; logPath: string }
+// The backend, the job's folders, its label as the file wrote it and where
+// it records its steps stay here, out of the stored Job shape: an empty path
+// is one the file does not name.
+type JobPlace = { backend: string; cwd: string; dir: string; title: string; transcriptPath: string; logPath: string }
 type CachedJob = JobPlace & { mtimeMs: number; size: number; job: Job | null }
 type CachedOut = { mtimeMs: number; size: number; verdict: string | null }
-type CachedStep = { path: string; mtimeMs: number; size: number; step: string }
+// A step source's size and time at its last read, -1 for a time while a
+// read failed, and the last step it named: null while it has named none.
+type CachedStep = { path: string; mtimeMs: number; size: number; step: string | null }
 type JobRead = JobPlace & { job: Job; out: FsEntry | undefined }
 // A file as a listing or a stat last saw it.
 type FileMark = { path: string; size: number; mtimeMs: number }
@@ -111,9 +122,14 @@ let codexTriedAt = Number.NEGATIVE_INFINITY
 let accountsFailures = 0
 // A tick skipped while no surface showed the pane: its next drawing catches up.
 let missedTick = false
+// Surfaces where the capsule module failed: they draw Buttons until a reload.
+const faultedSurfaces = new Set<string>()
 const jobFiles = new Map<string, CachedJob>()
 const jobOuts = new Map<string, CachedOut>()
 const jobSteps = new Map<string, CachedStep>()
+// The delegate label each session found by folder names in its first lines,
+// null for none: its head never changes, so it is read once.
+const sessionLabels = new Map<string, string | null>()
 
 // MARK: - Parsing
 
@@ -186,6 +202,8 @@ function parseJob(raw: string, fileName: string): (JobPlace & { job: Job }) | nu
     cwd: asText(row.cwd),
     // The account's config folder, when the file names it.
     dir: asText(row.dir),
+    // What its session's title names, `delegate:<label>`.
+    title: asText(row.label).trim(),
     // A claude job's live session and a codex job's JSON-lines log.
     transcriptPath: asText(row.transcript_path),
     logPath: asText(row.log_path),
@@ -352,7 +370,7 @@ async function readJobs($: EngineInterface, dir: string): Promise<JobRead[]> {
   const outs = new Map(listing.filter(f => f.name.endsWith('.out')).map(f => [f.name, f]))
   const names = new Set(entries.map(entry => entry.name))
   for (const name of [...jobFiles.keys()]) if (!names.has(name)) jobFiles.delete(name)
-  const unread: JobPlace = { backend: 'claude', cwd: '', dir: '', transcriptPath: '', logPath: '' }
+  const unread: JobPlace = { backend: 'claude', cwd: '', dir: '', title: '', transcriptPath: '', logPath: '' }
   for (const entry of entries) {
     const held = jobFiles.get(entry.name)
     if (held && held.mtimeMs === entry.mtimeMs && held.size === entry.size) continue
@@ -369,20 +387,22 @@ async function readJobs($: EngineInterface, dir: string): Promise<JobRead[]> {
     ? [{ ...place, job, out: outs.get(`${job.id}.out`) }] : []))
 }
 
-// The ends of several files from one `tail`, a dozen at most per run. With
-// more than one file it heads each with `==> path <==`, every later head after
-// a newline of its own; a file it cannot read gets no head and no entry.
-async function tailFiles($: EngineInterface, paths: string[]): Promise<Map<string, string>> {
-  const tails = new Map<string, string>()
+// The ends (`tail`) or starts (`head`) of several files from one run, a dozen
+// at most per run. With more than one file either heads each with `==> path
+// <==`, every later head after a newline of its own; a file it cannot read
+// gets no head and no entry.
+async function fileEnds($: EngineInterface, command: 'tail' | 'head', bytes: number,
+  paths: string[]): Promise<Map<string, string>> {
+  const ends = new Map<string, string>()
   for (let at = 0; at < paths.length; at += TAILS_PER_RUN) {
     const batch = paths.slice(at, at + TAILS_PER_RUN)
     try {
-      if (!(await isVisible($))) return tails
-      const ran = await $.process.run(['tail', '-c', String(TAIL_BYTES), '--', ...batch], { timeoutMs: 5_000 })
+      if (!(await isVisible($))) return ends
+      const ran = await $.process.run([command, '-c', String(bytes), '--', ...batch], { timeoutMs: 5_000 })
       // A cut output may have cut a file's end: read them all again next tick.
       if (ran.isStdoutTruncated) continue
       if (batch.length === 1) {
-        if (ran.exitCode === 0) tails.set(batch[0]!, ran.stdout)
+        if (ran.exitCode === 0) ends.set(batch[0]!, ran.stdout)
         continue
       }
       const heads: { path: string; start: number; end: number }[] = []
@@ -393,21 +413,22 @@ async function tailFiles($: EngineInterface, paths: string[]): Promise<Map<strin
       }
       heads.forEach((head, index) => {
         const next = heads[index + 1]
-        tails.set(head.path, ran.stdout.slice(head.end, next === undefined ? undefined : Math.max(head.end, next.start - 1)))
+        ends.set(head.path, ran.stdout.slice(head.end, next === undefined ? undefined : Math.max(head.end, next.start - 1)))
       })
     } catch {
-      // A refused or slow `tail` leaves these for the next tick.
+      // A refused or slow read leaves these for the next tick.
     }
   }
-  return tails
+  return ends
 }
 
 // Where a running job records its steps, as it stands now: a codex job's log,
-// else its .out; a claude job's transcript, else the newest session in its
+// else its .out; a claude job's transcript. Without one, the sessions in its
 // account's folder for its cwd changed since it started that no open chat is
-// on, once the open chats are known. Undefined while there is none.
+// on, newest first, once the open chats are known: stepSources tells which is
+// the job's. Undefined while there is none.
 async function stepSource($: EngineInterface, dir: string, read: JobRead, home: string,
-  list: Account[], open: ReadonlySet<string> | null): Promise<FileMark | undefined> {
+  list: Account[], open: ReadonlySet<string> | null): Promise<FileMark | FileMark[] | undefined> {
   const stat = (path: string): Promise<FileMark | undefined> => $.fs.stat(path)
     .then(found => ({ path, size: found.size, mtimeMs: found.mtimeMs })).catch(() => undefined)
   const { job, out } = read
@@ -423,20 +444,54 @@ async function stepSource($: EngineInterface, dir: string, read: JobRead, home: 
     const folder = `${config}/projects/${name}`
     const entries = await $.fs.list(folder).catch(() => null)
     if (entries === null) continue
-    const newest = entries.filter(entry => entry.kind === 'file' && entry.name.endsWith('.jsonl') &&
-      entry.mtimeMs >= job.startedMs && !open.has(`${folder}/${entry.name}`))
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)[0]
-    return newest === undefined ? undefined : { path: `${folder}/${newest.name}`, size: newest.size, mtimeMs: newest.mtimeMs }
+    // Accounts may share one projects folder, each spelling its own path to
+    // it: an open chat's session is known by its file's name.
+    return entries.filter(entry => entry.kind === 'file' && entry.name.endsWith('.jsonl') &&
+      entry.mtimeMs >= job.startedMs && !open.has(entry.name))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .map(entry => ({ path: `${folder}/${entry.name}`, size: entry.size, mtimeMs: entry.mtimeMs }))
   }
   return undefined
+}
+
+// Each running job's step source. Of the sessions found by folder, the
+// newest whose first lines name the job's label, else the newest that names
+// no delegate at all: another job's, never. Heads not yet read are read in
+// one `head`.
+async function stepSources($: EngineInterface, dir: string, running: JobRead[], home: string,
+  list: Account[], open: ReadonlySet<string> | null): Promise<Map<string, FileMark>> {
+  const sources = new Map<string, FileMark>()
+  const found = new Map<string, FileMark[]>()
+  for (const read of running) {
+    if (!(await isVisible($))) return sources
+    const source = await stepSource($, dir, read, home, list, open)
+    if (Array.isArray(source)) found.set(read.job.id, source)
+    else if (source !== undefined) sources.set(read.job.id, source)
+  }
+  const seen = new Set([...found.values()].flat().map(mark => mark.path))
+  for (const path of [...sessionLabels.keys()]) if (!seen.has(path)) sessionLabels.delete(path)
+  for (const [path, head] of await fileEnds($, 'head', HEAD_BYTES, [...seen].filter(path => !sessionLabels.has(path)))) {
+    // One still without a whole line is read again next tick.
+    const label = delegateLabel(head)
+    if (label !== undefined) sessionLabels.set(path, label)
+  }
+  for (const read of running) {
+    const marks = found.get(read.job.id) ?? []
+    const own = marks.find(mark => sessionLabels.get(mark.path) === read.title) ??
+      marks.find(mark => sessionLabels.get(mark.path) === null)
+    if (own !== undefined) sources.set(read.job.id, own)
+  }
+  return sources
 }
 
 // A running job's .out can say how it ended before its file does, and its
 // step source what it does now; a codex job's source is often that same
 // .out. Each end is read again only after its size or time changed, all of
-// them in one `tail`.
+// them in one `tail`. An end that names no step keeps the last one named:
+// what it gained since, past a tail's reach or before any step was named,
+// is read further back, alone.
 async function readRunning($: EngineInterface, dir: string, running: JobRead[],
-  sources: Map<string, FileMark>): Promise<{ outcomes: Map<string, string>; steps: Map<string, string> }> {
+  sources: Map<string, FileMark>): Promise<{ outcomes: Map<string, string>; steps: Map<string, string | null> }> {
   const ids = new Set(running.map(({ job }) => job.id))
   for (const id of [...jobOuts.keys()]) if (!ids.has(id)) jobOuts.delete(id)
   for (const id of [...jobSteps.keys()]) if (!ids.has(id)) jobSteps.delete(id)
@@ -449,9 +504,9 @@ async function readRunning($: EngineInterface, dir: string, running: JobRead[],
     const held = jobSteps.get(job.id)
     if (source !== undefined && !(held?.path === source.path && isFresh(held, source))) due.add(source.path)
   }
-  const tails = await tailFiles($, [...due])
+  const tails = await fileEnds($, 'tail', TAIL_BYTES, [...due])
   const outcomes = new Map<string, string>()
-  const steps = new Map<string, string>()
+  const steps = new Map<string, string | null>()
   for (const { job, backend, out } of running) {
     const outPath = `${dir}/${job.id}.out`
     let held = jobOuts.get(job.id)
@@ -466,14 +521,26 @@ async function readRunning($: EngineInterface, dir: string, running: JobRead[],
     const source = sources.get(job.id)
     let step = jobSteps.get(job.id)
     if (source !== undefined && !(step?.path === source.path && isFresh(step, source))) {
+      // What another source named says nothing of this one.
+      const last = step?.path === source.path ? step : undefined
+      const parse = backend === 'codex' ? codexStep : claudeStep
       const tail = tails.get(source.path)
-      const read = backend === 'codex' ? codexStep : claudeStep
-      step = tail === undefined ? { path: source.path, mtimeMs: -1, size: -1, step: step?.step ?? 'çalışıyor' }
-        : { path: source.path, mtimeMs: source.mtimeMs, size: source.size, step: read(tail, source.size > TAIL_BYTES) }
+      let named = tail === undefined ? undefined : parse(tail, source.size > TAIL_BYTES)
+      // A session's end is often one huge line, a tool's image or a request's
+      // copy of it: the lines before it name the step.
+      const gained = last !== undefined && last.size >= 0 && last.size <= source.size ? source.size - last.size : source.size
+      if (named === null && gained >= TAIL_BYTES) {
+        const bytes = Math.min(DEEP_TAIL_BYTES, gained + 1)
+        const deep = (await fileEnds($, 'tail', bytes, [source.path])).get(source.path)
+        named = deep === undefined ? undefined : parse(deep, source.size > bytes)
+      }
+      // Unread, it keeps what it named and is read again next tick.
+      step = named === undefined ? { path: source.path, mtimeMs: -1, size: last?.size ?? -1, step: last?.step ?? null }
+        : { path: source.path, mtimeMs: source.mtimeMs, size: source.size, step: named ?? last?.step ?? null }
       jobSteps.set(job.id, step)
     }
-    // Unknown until a source shows one.
-    steps.set(job.id, source === undefined ? 'çalışıyor' : step?.step ?? 'çalışıyor')
+    // Unknown until a source names one; the last one named while none is found.
+    steps.set(job.id, step?.step ?? null)
   }
   return { outcomes, steps }
 }
@@ -522,16 +589,14 @@ async function refreshJobs($: EngineInterface): Promise<void> {
     const all = await readJobs($, dir)
     if (!(await isVisible($))) return
     const running = all.filter(({ job }) => job.status === 'running')
-    // A claude job's fallback session is never one an open chat is on: none
-    // is looked for before the chats have been read once.
+    // A claude job's fallback session is never one an open chat is on, by
+    // its session id or its path's file name: none is looked for before the
+    // chats have been read once.
     const [held, open] = await Promise.all([read($, accounts), read($, chats)])
-    const paths = chatsObserved ? new Set(open.list.map(chat => chat.transcriptPath)) : null
-    const sources = new Map<string, FileMark>()
-    for (const job of running) {
-      if (!(await isVisible($))) return
-      const source = await stepSource($, dir, job, at.home, held.list, paths)
-      if (source !== undefined) sources.set(job.job.id, source)
-    }
+    const names = chatsObserved ? new Set(open.list.flatMap(chat =>
+      [`${chat.id}.jsonl`, chat.transcriptPath.split('/').pop() ?? ''])) : null
+    const sources = await stepSources($, dir, running, at.home, held.list, names)
+    if (!(await isVisible($))) return
     const { outcomes, steps } = await readRunning($, dir, running, sources)
     const pids = running.filter(({ job }) => !outcomes.has(job.id) && job.pid > 0).map(({ job }) => job.pid)
     const live = await livePids($, pids)
@@ -837,11 +902,50 @@ async function dismissPane($: EngineInterface): Promise<void> {
   settleMotion()
 }
 
+// MARK: - Presses
+
+// What a click on a capsule part does, by its key, with the lists as they
+// stand now: a chat's focuses its tab, a job's its starter (openDelegate),
+// an agent's opens its transcript, a delegate row's a tab following the job.
+// `within`, a chat capsule's key, is the one a delegate row must sit under.
+// A key naming nothing listed does nothing.
+async function pressTarget($: EngineInterface, target: string, within?: string): Promise<void> {
+  const split = target.indexOf(':')
+  const kind = target.slice(0, split)
+  const id = target.slice(split + 1)
+  if (split < 0 || id === '') return
+  if (kind === 'chat') {
+    const chat = (await read($, chats)).list.find(one => one.id === id)
+    if (chat !== undefined && !chat.isCurrent) await focusChat($, chat)
+    return
+  }
+  if (kind === 'follow') {
+    const [listed, open] = await Promise.all([read($, jobs), read($, chats)])
+    const job = listed.list.find(one => one.id === id)
+    const chat = job === undefined ? undefined : parentChat(job, open.list)
+    if (job === undefined || chat === undefined || (within !== undefined && within !== `chat:${chat.id}`)) return
+    const at = await locate($).catch(() => null)
+    if (at !== null) await followJob($, chat, job.id, at.bin)
+    return
+  }
+  if (!(await isVisible($))) return
+  if (kind === 'agent') {
+    if ((await read($, agents)).list.some(agent => agent.id === id)) await $.ui.view({ agentId: id })
+    return
+  }
+  if (kind === 'job') {
+    const [listed, open] = await Promise.all([read($, jobs), read($, chats)])
+    const job = listed.list.find(one => one.id === id)
+    if (job !== undefined) await openDelegate($, job, open.list)
+  }
+}
+
 // MARK: - Formatting
 
 type Seg = { text: string; color?: Color; dim?: boolean; weight?: TextProps['weight'] }
 type Line = Seg[]
-// A one-line Button drawn under a capsule's own lines.
+// A one-line target under a capsule's own lines: a part of the capsule
+// module's region, or a Button of its own.
 type CapsuleRow = { key: string; line: Line; label: string; press: () => void }
 type Gauge = { kind: string; label: string; used: number; reset: string; resetsAtMs: number | null; countdown: string }
 
@@ -1255,8 +1359,39 @@ export const register: Register = on => {
     return focused
   })
 
+  // A click the capsule module posts: the part it hit. Its data came from
+  // code, so only the posting capsule's own key, or a delegate row under that
+  // chat, is acted on.
+  on('ui.message', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const heard = await next(e)
+    const target = isRecord(e.data) ? asText(e.data.target) : ''
+    if (target !== '' && (target === e.element || (target.startsWith('follow:') && e.element.startsWith('chat:')))) {
+      await pressTarget($, target, e.element)
+    }
+    return heard
+  })
+
+  // The capsule module failed on a surface: that surface draws Buttons from
+  // now on. The engine draws the pane again once this answers; one more ask
+  // covers a capsule that failed in that drawing too.
+  on('ui.fault', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const heard = await next(e)
+    $.ui.log(`Shiftover kapsülü çizilemedi (${e.phase}): ${e.reason}`, { to: 'debug' })
+    if (!faultedSurfaces.has(e.surface)) {
+      faultedSurfaces.add(e.surface)
+      $.ui.invalidate('ui.render')
+    }
+    return heard
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const table = $.ui.resolve(e)
+    const { Box, Text, Button } = table
+    // The terminal and the desktop run surface modules. VS Code and mobile
+    // have no Client (their tables draw one as an empty fragment), and a
+    // surface where the capsule module failed draws without it.
+    const Client = (e.surface === 'terminal' || e.surface === 'desktop') && 'Client' in table &&
+      !faultedSurfaces.has(e.surface) ? table.Client : undefined
     const width = Math.max(1, Math.floor(e.props.bodyColumns))
     const bordered = width >= 4
     const padding = width >= 6 ? 1 : 0
@@ -1298,12 +1433,13 @@ export const register: Register = on => {
     }
     const capsuleWidth = innerWidth
     const capsuleRoom = Math.max(1, capsuleWidth - 4)
-    // A pressable capsule is one Button holding every line, so a press
-    // anywhere inside its border opens it and no line is selected alone. A
-    // Markdown link would lose the runs' colors, take no focus ring and open
-    // its URL on a modified click. The pointer still inverts the Button: hover
-    // mutes every run, the padding columns included, to one grey block, and
-    // the keyed Box lights the border. Rows below it are Buttons of their own.
+    // Without the capsule module (clickable below), a pressable capsule is one
+    // Button holding every line, so a press anywhere inside its border opens
+    // it and no line is selected alone. A Markdown link would lose the runs'
+    // colors, take no focus ring and open its URL on a modified click. The
+    // pointer still inverts the Button: hover mutes every run, the padding
+    // columns included, to one grey block, and the keyed Box lights the
+    // border. Rows below it are Buttons of their own.
     const capsule = (key: string, first: Line, second: Line | undefined, press?: () => void,
       notes: Line[] = [], capsulePadding = 1, fixedColor?: Color, borderParts: Line[] = [], rows: CapsuleRow[] = []) => {
       const room = Math.max(1, capsuleWidth - 2 - 2 * capsulePadding)
@@ -1358,6 +1494,22 @@ export const register: Register = on => {
         </Box>}
       </Box>
     }
+    // A chat, job or agent capsule. Where the surface runs it, the capsule
+    // module draws it from fitted lines, a frame's new ones each redraw: the
+    // pointer over a part a click acts on draws the border `text` and nothing
+    // else, and a click posts the part (`ui.message`). Elsewhere, Buttons.
+    const clickable = (key: string, lines: Line[], isPressable: boolean, fixedColor: Color | undefined,
+      rows: CapsuleRow[] = []) => {
+      if (Client === undefined) {
+        return capsule(key, lines[0] ?? [], lines[1], isPressable ? () => pressTarget($, key) : undefined,
+          lines.slice(2), 1, fixedColor, [], rows)
+      }
+      const props: CapsuleProps = { key, width: capsuleWidth, padding: 1, border: fixedColor ?? 'subtle', isPressable,
+        lines: lines.map(line => fitLine(line, capsuleRoom)),
+        rows: rows.map(row => ({ key: row.key, line: fitLine(row.line, capsuleRoom) })) }
+      return <Client key={key} module="./capsule.tsx" props={props} width={capsuleWidth}
+        height={lines.length + rows.length + 2} />
+    }
     try {
       const [held, listed, roster, limits, conversations, now, accountsOpen] = await Promise.all([
         read($, accounts), read($, jobs), read($, agents),
@@ -1395,25 +1547,15 @@ export const register: Register = on => {
         // Each running job the chat started opens a tab that follows it live.
         const delegates = delegateRows(chat, conversationList, listed, held.list, now).map(({ job, line: row }) => ({
           key: `follow:${job.id}`, line: row, label: row.map(seg => seg.text).join('').replace(/\s+/g, ' ').trim(),
-          press: async () => {
-            const at = await locate($).catch(() => null)
-            if (at !== null) await followJob($, chat, job.id, at.bin)
-          },
+          press: () => pressTarget($, `follow:${job.id}`),
         }))
-        return capsule(`chat:${chat.id}`, line, [faint(metadata || ' ')],
-          chat.isCurrent ? undefined : () => focusChat($, chat), [[faint(state)]], 1,
+        return clickable(`chat:${chat.id}`, [line, [faint(metadata || ' ')], [faint(state)]], !chat.isCurrent,
           chat.isCurrent ? CURRENT_COLOR : chat.status === 'waiting'
             ? now % WAITING_BORDER_MS < WAITING_BORDER_FLASH_MS ? 'error' : 'subtle' : undefined,
-          [], delegates)
+          delegates)
       })
-      const jobRows = tasks.slice(0, CAPSULES_SHOWN).map(task => {
-        const [title, metadata] = taskLines(task, now, capsuleRoom, held.list)
-        return capsule(taskId(task), title, metadata, async () => {
-          if (!(await isVisible($))) return
-          if (task.kind === 'agent') await $.ui.view({ agentId: task.agent.id })
-          else await openDelegate($, task.job, (await read($, chats)).list)
-        })
-      })
+      const jobRows = tasks.slice(0, CAPSULES_SHOWN).map(task =>
+        clickable(taskId(task), taskLines(task, now, capsuleRoom, held.list), true, undefined))
       return (
         <Box width={width} flexDirection="column" overflow="hidden">
           {card(`Hesaplar ${accountsOpen ? '▾' : '▸'}`, accountsOpen ? <Box flexDirection="column" gap={0} paddingY={0} marginY={0}>
