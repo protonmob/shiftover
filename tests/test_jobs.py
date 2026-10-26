@@ -10,7 +10,7 @@ import pytest
 
 from shiftover import claude, paths
 from shiftover.delegate import jobs
-from tests.conftest import SRC, calls, stop_jobs
+from tests.conftest import SLOW_START, SRC, calls, stop_jobs
 
 
 def test_tail_reads_only_the_end(tmp_path):
@@ -45,7 +45,7 @@ def test_exit_waiter_records_parent_and_finalizes(home, fake_claude, fake_codex,
         job = jobs.start_codex(str(fake_codex), "quick")
     else:
         job = jobs.start(config.load().accounts["second"], "quick")
-    assert done.wait(10)
+    assert done.wait(SLOW_START)
     record = json.loads(jobs._p(job.id, "json").read_text())
     assert record["parent_session_id"] == session_id and record["parent_pid"] == 4321
     assert record["status"] == "done" and record["finished"] >= record["started"] > 0
@@ -72,7 +72,7 @@ def test_exit_waiter_finalizes_failure(home, backend):
         event = {"type": "result", "subtype": "backend failed", "is_error": True, "result": ""}
     job = jobs.Job(id="failed", account=backend, dir="", backend=backend, cwd=str(home), started=time.time())
     jobs._launch(job, [sys.executable, "-c", f"print({json.dumps(event)!r}); raise SystemExit(1)"], dict(os.environ), "x")
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + SLOW_START
     record = jobs.load(job.id)
     while record.status == "running" and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -100,7 +100,7 @@ def test_a_claude_job_knows_its_session_and_transcript_from_the_start(home, fake
     work.mkdir()
     acct = config.load().accounts["second"]
     job = jobs.start(acct, "quick", cwd=str(work))
-    jobs._procs[job.id].wait(10)
+    jobs._procs[job.id].wait(SLOW_START)
     record = jobs.load(job.id)
     assert record.status == "running" and uuid.UUID(record.session_id).version == 4
     assert record.transcript_path == str(claude.project_dir(acct.path, work) / f"{record.session_id}.jsonl")
@@ -119,7 +119,7 @@ def test_a_resumed_job_follows_the_file_its_session_began_in(home, fake_claude, 
         folder.mkdir(parents=True)
         (folder / "abc-123.jsonl").write_text("")
     job = jobs.start(acct, "more", cwd=str(home), resume_session_id="abc-123")
-    jobs._procs[job.id].wait(10)
+    jobs._procs[job.id].wait(SLOW_START)
     record = jobs.load(job.id)
     expected = (folder or claude.project_dir(acct.path, home)) / "abc-123.jsonl"
     assert record.session_id == "abc-123" and record.transcript_path == str(expected)
@@ -132,6 +132,42 @@ def test_a_codex_job_records_its_event_stream(home, fake_codex, monkeypatch):
     job = jobs.start_codex(str(fake_codex), "quick")
     record = jobs.load(job.id)
     assert record.log_path == str(jobs._p(job.id, "out")) and record.transcript_path == ""
+
+
+@pytest.mark.parametrize("resume", [None, "abc-123"])
+def test_claude_args_warn_the_headless_delegate(resume):
+    argv = jobs.build_args(model="haiku", effort="low", permission_mode="acceptEdits", allowed_tools=["Bash(npm test:*)", "Read"],
+                           json_schema=None, max_budget_usd=None, resume_session_id=resume, label="t", mcp_file="m.json",
+                           session_id="sid-1")
+    note = argv[argv.index("--append-system-prompt") + 1]
+    assert note == jobs.HEADLESS_NOTE and "exits as soon as your turn ends" in note and "background" in note
+    # The variadic flag stays last: it would swallow anything after it.
+    assert argv[-3:] == ["--allowedTools", "Bash(npm test:*)", "Read"]
+
+
+def test_codex_args_fresh_and_resumed(tmp_path):
+    from shiftover.delegate import codex
+    common = dict(model="gpt-x", effort="high", cwd=tmp_path, permission_mode="acceptEdits",
+                  last_message_file=tmp_path / "j.last", schema_file=None)
+    fresh = codex.build_args(resume_session_id=None, **common)
+    assert fresh[:2] == ["exec", "--json"] and fresh[fresh.index("-C") + 1] == str(tmp_path)
+    assert fresh[fresh.index("-s") + 1] == "workspace-write" and fresh[-1] == "-"
+    resumed = codex.build_args(resume_session_id="thread-1", **common)
+    # `codex exec resume` rejects -C and -s: the sandbox goes in as config, the folder is the process's own.
+    assert resumed[:3] == ["exec", "resume", "thread-1"] and "-C" not in resumed and "-s" not in resumed
+    assert 'sandbox_mode="workspace-write"' in resumed and resumed[resumed.index('sandbox_mode="workspace-write"') - 1] == "-c"
+    assert resumed[resumed.index("-o") + 1] == str(tmp_path / "j.last") and "--json" in resumed and "--skip-git-repo-check" in resumed
+    assert resumed[resumed.index("-m") + 1] == "gpt-x" and 'model_reasoning_effort="high"' in resumed and resumed[-1] == "-"
+
+
+def test_a_resumed_codex_job_runs_in_its_folder(home, fake_codex):
+    work = home / "proj"
+    work.mkdir()
+    job = jobs.wait(jobs.start_codex(str(fake_codex), "again", cwd=str(work), resume_session_id="thread-1"), SLOW_START)
+    assert job.status == "done" and job.result == "codex: again"
+    call = json.loads(fake_codex.parent.parent.joinpath("codex-calls.jsonl").read_text().splitlines()[-1])
+    assert call["argv"][:3] == ["exec", "resume", "thread-1"] and "-C" not in call["argv"]
+    assert os.path.realpath(call["cwd"]) == os.path.realpath(work)
 
 
 def test_finalize_gives_a_job_from_before_its_transcript(home):
@@ -218,7 +254,7 @@ def test_cancel_from_another_process_stays_cancelled(home, fake_claude, monkeypa
                           "print(jobs.cancel(jobs.load(sys.argv[1])).status)", job.id],
                          env={**os.environ, "PYTHONPATH": str(SRC)}, capture_output=True, text=True, timeout=30)
     assert out.stdout.strip() == "cancelled", out.stderr
-    assert done.wait(10)
+    assert done.wait(SLOW_START)
     record = jobs.load(job.id)
     assert record.status == "cancelled" and record.finished > 0
     assert jobs.finalize(jobs.Job(**{**vars(record), "status": "running", "finished": 0.0})).status == "cancelled"

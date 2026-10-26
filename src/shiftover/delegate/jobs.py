@@ -16,6 +16,10 @@ from . import codex
 _procs: dict[str, subprocess.Popen] = {}
 _lock = threading.RLock()
 RESULT_MAX = 8000
+# A headless `claude -p` exits when the model's turn ends and takes any background agent or shell with it.
+HEADLESS_NOTE = ("You are running headless: this process exits as soon as your turn ends. Never start agents or shell "
+                 "commands in the background; run them in the foreground and wait, or do the work yourself. Do not end "
+                 "your turn while work is still running.")
 
 
 @dataclass
@@ -95,7 +99,8 @@ def new_id() -> str:
 
 def build_args(*, model, effort, permission_mode, allowed_tools, json_schema, max_budget_usd, resume_session_id,
                label, mcp_file, session_id) -> list[str]:
-    args = ["-p", "--output-format", "json", "--name", f"delegate:{label or 'job'}"]
+    args = ["-p", "--output-format", "json", "--name", f"delegate:{label or 'job'}",
+            "--append-system-prompt", HEADLESS_NOTE]
     if resume_session_id:
         args += ["--resume", resume_session_id]
     else:

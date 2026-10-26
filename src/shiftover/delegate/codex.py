@@ -23,11 +23,13 @@ def version(path: str) -> str:
 
 
 def build_args(*, model, effort, cwd, permission_mode, resume_session_id, last_message_file, schema_file) -> list[str]:
-    args = ["exec"]
+    sandbox = SANDBOX.get(permission_mode or "default", "read-only")
     if resume_session_id:
-        args += ["resume", resume_session_id]
-    args += ["--json", "--skip-git-repo-check", "-C", str(cwd), "-o", str(last_message_file),
-             "-s", SANDBOX.get(permission_mode or "default", "read-only")]
+        # `exec resume` takes neither -C nor -s: the job starts in cwd and the sandbox goes in as config.
+        args = ["exec", "resume", resume_session_id, "--json", "--skip-git-repo-check", "-o", str(last_message_file),
+                "-c", f'sandbox_mode="{sandbox}"']
+    else:
+        args = ["exec", "--json", "--skip-git-repo-check", "-C", str(cwd), "-o", str(last_message_file), "-s", sandbox]
     if model:
         args += ["-m", model]
     if effort in EFFORTS:

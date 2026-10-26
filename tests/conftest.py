@@ -10,6 +10,9 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
+# How long a test waits for a fake claude/codex to finish. Starting a fresh script can stall in exec for 10s
+# and more on a busy macOS; every wait still returns the moment the job ends.
+SLOW_START = 60
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -43,7 +46,7 @@ def stop_jobs():
                 pass
     for th in threading.enumerate():
         if th.name.startswith("shiftover-job-"):
-            th.join(10)
+            th.join(SLOW_START)
 
 
 @pytest.fixture
@@ -88,7 +91,7 @@ def home(tmp_path, monkeypatch):
         '[accounts.main]\ndir = "~/.claude"\nemail = "one@example.com"\n'
         '[accounts.second]\ndir = "~/.claude-second"\nemail = "two@example.com"\n'
         '[accounts.third]\ndir = "~/.claude-third"\nemail = "three@example.com"\n'
-        '[handoff]\nmode = "auto"\n[delegate]\nwait_seconds = 5\n[tips]\nenabled = true\nlevels = [75, 90]\n'
+        f'[handoff]\nmode = "auto"\n[delegate]\nwait_seconds = {SLOW_START}\n[tips]\nenabled = true\nlevels = [75, 90]\n'
         '[codex]\nenabled = false\n'
     )
     yield h
