@@ -374,16 +374,27 @@ const capsules = (tree: unknown): DrawnNode[] => drawnNodes(tree).filter(node =>
   node.type === 'Box' && /^capsule:(chat|job|agent):/.test(String(node.props?.key)))
 const capsuleFor = (tree: unknown, title: string): DrawnNode | undefined =>
   capsules(tree).find(node => shownText(node).includes(title))
-const accountCapsule = (tree: unknown, name: string): DrawnNode | undefined => drawnNodes(tree).find(node =>
-  node.type === 'Box' && node.props?.borderStyle === 'round' && node.props?.borderColor === 'subtle' &&
-  ['●', '○', '◎'].some(marker => contentRows(node)[0] === `${marker} ${name}` ||
-    contentRows(node)[0]?.startsWith(`${marker} ${name} `)))
+// Columns title an account's top border with its marker and name; inline
+// draws them first on its one line. Either way, the bordered Box.
+const accountCapsule = (tree: unknown, name: string): DrawnNode | undefined => {
+  const named = (text: string | undefined): boolean =>
+    ['●', '○', '◎'].some(marker => text === `${marker} ${name}` || text?.startsWith(`${marker} ${name} `) === true)
+  return drawnNodes(tree).filter(node => node.type === 'Box' && String(node.props?.key).startsWith('capsule:account:'))
+    .flatMap(frame => {
+      const border = (frame.children as (DrawnNode | null)[] | undefined)?.find(node =>
+        node?.type === 'Box' && node.props?.borderStyle === 'round' && node.props?.borderColor === 'subtle')
+      return border && (named(shownText(titleOverlay(frame)).trim()) || named(contentRows(border)[0])) ? [border] : []
+    })[0]
+}
 const accountsCard = (tree: unknown): DrawnNode | undefined => drawnNodes(tree).find(node =>
   node.type === 'Box' && node.props?.position === 'relative' && shownText(node).includes('Hesaplar'))
 const accountFrame = (tree: unknown, name: string): DrawnNode | undefined => drawnNodes(tree).find(node =>
   node.type === 'Box' && node.props?.key === `capsule:account:${name}`)
 const resetOverlay = (tree: unknown, name: string): DrawnNode | undefined =>
-  (accountFrame(tree, name)?.children as DrawnNode[] | undefined)?.find(node => node.props?.position === 'absolute')
+  (accountFrame(tree, name)?.children as (DrawnNode | null)[] | undefined)?.find(node =>
+    node?.props?.position === 'absolute' && node.props.key !== 'title') ?? undefined
+const titleOverlay = (frame: DrawnNode | undefined): DrawnNode | undefined =>
+  (frame?.children as (DrawnNode | null)[] | undefined)?.find(node => node?.props?.key === 'title') ?? undefined
 const capsuleBorder = (tree: unknown, title: string): DrawnNode | undefined =>
   drawnNodes(capsuleFor(tree, title)).find(node => node.type === 'Box' && node.props?.borderStyle === 'round')
 const borderOverlay = (frame: DrawnNode | undefined): DrawnNode | undefined =>
@@ -411,22 +422,24 @@ function expectLimitColumns(capsule: DrawnNode, limits: readonly { label: string
   const rows = contentRows(capsule)
   const room = accountRoom(capsule)
   const width = Math.floor((room - limits.length + 1) / limits.length)
-  const bars = [...(rows[3] ?? '').matchAll(/━+/g)]
+  // Two rows: each column's label and percent together, then the bars.
+  const bars = [...(rows[1] ?? '').matchAll(/━+/g)]
   expect(bars.map(bar => cells(bar[0]))).toEqual(limits.map(() => width))
   for (const [index, entry] of limits.entries()) {
     const start = bars[index]!.index
     if (index > 0) expect(start - bars[index - 1]!.index).toBe(width + 1)
-    const label = rows[1]!.slice(start, start + width)
-    const percent = rows[2]!.slice(start, start + width)
-    expect(label.trim()).toBe(entry.label === '5 saat' && width < 6 ? '5s' : entry.label)
-    expect(percent.trim()).toBe(`${entry.percent}%`)
-    for (const value of [label, percent]) {
-      const before = value.length - value.trimStart().length
-      const after = value.length - value.trimEnd().length
-      expect(Math.abs(before - after)).toBeLessThanOrEqual(1)
-    }
+    const value = rows[0]!.slice(start, start + width)
+    // A narrow column shortens the label, never the percent.
+    const percent = `${entry.percent}%`
+    const label = entry.label === '5 saat' && cells(`${entry.label} ${percent}`) > width ? '5s' : entry.label
+    const fit = width - cells(percent) - 1
+    const shown = cells(label) <= fit ? label : fit <= 0 ? '' : `${[...label].slice(0, fit - 1).join('')}…`
+    expect(value.trim()).toBe(shown === '' ? percent : `${shown} ${percent}`)
+    const before = value.length - value.trimStart().length
+    const after = value.length - value.trimEnd().length
+    expect(Math.abs(before - after)).toBeLessThanOrEqual(1)
   }
-  expect(rows.slice(1, 4).every(row => cells(row) <= room)).toBe(true)
+  expect(rows.slice(0, 2).every(row => cells(row) <= room)).toBe(true)
 }
 const lineButtons = (tree: unknown): DrawnNode[] => drawnNodes(tree).filter(node => node.type === 'Button')
 // The pane's press targets in drawing order: the capsule Clients where the
@@ -628,17 +641,17 @@ test('every account and Codex bar uses fixed whole heavy-line cells with severit
     const rows = await paneRows(ui)
     expect(rows.join('')).not.toMatch(/[▏▎▍▌▋▊▉█░▁▇]/)
     const tree = await ui.drawn()
-    const account = contentRows(accountCapsule(tree, 'kadir'))[3]!
+    const account = contentRows(accountCapsule(tree, 'kadir'))[1]!
     const accountBox = accountCapsule(tree, 'kadir')!
     expectLimitColumns(accountBox, [{ label: '5 saat', percent: 5 }, { label: 'hafta', percent: 75 }, { label: 'Fable', percent: 96 }])
     // Codex's 5-hour window resets in an hour: its label is that countdown.
-    expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: '↻ 1sa 0dk', percent: 50 }, { label: 'hafta', percent: 90 }])
+    expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: '↻ 1h0m', percent: 50 }, { label: 'hafta', percent: 90 }])
     const bars = await ui.findAll({ type: 'Text', text: /^━+$/ })
     expect(bars.length).toBeGreaterThan(5)
     expect(bars.every(bar => ['success', 'warning', 'error', 'subtle'].includes(String(bar.props.color)))).toBe(true)
     for (const color of ['success', 'warning', 'error', 'subtle']) expect(bars.some(bar => bar.props.color === color)).toBe(true)
     await clock.advance(2000)
-    expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[3]).toBe(account)
+    expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]).toBe(account)
     await ui.unmount()
   }
 })
@@ -670,22 +683,24 @@ test('every account has its own round capsule with a name, ordered mini columns,
     const capsule = accountCapsule(tree, name)!
     expect(capsule).toBeDefined()
     expect(capsule.props).toMatchObject({ borderStyle: 'round', borderColor: 'subtle', paddingX: 1, width: 38 })
-    const rows = contentRows(capsule)
-    expect(rows[0]).toMatch(new RegExp(`[●○◎] ${name}$`))
-    const height = name === 'kadir' ? 5 : name === 'aras' ? 4 : 2
-    expect(rows).toHaveLength(height)
+    // The name titles the top border; a capsule holds the limits' two rows
+    // and a critical note only.
+    expect(shownText(titleOverlay(accountFrame(tree, name)))).toMatch(new RegExp(`^ [●○◎] ${name} $`))
+    expect(laidOutRows(accountFrame(tree, name), 38)[0]).toMatch(new RegExp(`^╭─ [●○◎] ${name} ─`))
+    const height = name === 'kadir' ? 3 : name === 'aras' ? 2 : 1
+    expect(contentRows(capsule)).toHaveLength(height)
     expect(laidOutRows(capsule, 38)).toHaveLength(height + 2)
   }
   const kadir = accountCapsule(tree, 'kadir')!
   const rows = contentRows(kadir)
   expectLimitColumns(kadir, [{ label: '5 saat', percent: 5 }, { label: 'hafta', percent: 73 }, { label: 'Fable', percent: 96 }])
-  expect(rows[4]).toBe('Fable 2g 18sa sonra açılır')
-  expect((await paneRows(ui)).filter(row => /sonra açılır$/.test(row))).toEqual(['Fable 2g 18sa sonra açılır'])
-  const name = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === 'kadir')
+  expect(rows[2]).toBe('Fable 2d18h sonra açılır')
+  expect((await paneRows(ui)).filter(row => /sonra açılır$/.test(row))).toEqual(['Fable 2d18h sonra açılır'])
+  const name = drawnNodes(titleOverlay(accountFrame(tree, 'kadir'))).find(node => node.type === 'Text' && shownText(node) === 'kadir')
   expect(name?.props).toMatchObject({ color: 'text', weight: 'bold' })
   const limitName = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === 'Fable' && node.props?.color === 'error')
   expect(limitName?.props).toMatchObject({ color: 'error', weight: 'bold' })
-  const note = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === ' 2g 18sa sonra açılır')
+  const note = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === ' 2d18h sonra açılır')
   expect(note?.props?.dimColor).toBe(true)
   await ui.unmount()
 })
@@ -706,18 +721,19 @@ test('critical notes compact reset time before truncating and never overflow nar
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     for (const [name, note] of [
-      ['kadir', width === 32 ? '5 saat 4sa sonra açılır' : '5 saat 4sa 59dk sonra açılır'],
-      ['aras', width === 32 ? '5 saat 2g18sa sonra açı…' : '5 saat 2g 18sa sonra açılır'],
-      ['yusa', width === 32 ? 'Fable 2g18sa sonra açıl…' : 'Fable 2g 18sa sonra açılır'],
+      // Minutes go first; a day count has none to drop and truncates.
+      ['kadir', width === 32 ? '5 saat 4h sonra açılır' : '5 saat 4h59m sonra açılır'],
+      ['aras', width === 32 ? '5 saat 2d18h sonra açıl…' : '5 saat 2d18h sonra açılır'],
+      ['yusa', 'Fable 2d18h sonra açılır'],
     ] as const) {
       const capsule = accountCapsule(tree, name)!
       const rows = contentRows(capsule)
-      expect(rows).toHaveLength(5)
-      expect(rows[4]).toBe(note)
-      expect(rows[4]).not.toMatch(/[\r\n—]/)
+      expect(rows).toHaveLength(3)
+      expect(rows[2]).toBe(note)
+      expect(rows[2]).not.toMatch(/[\r\n—]/)
       const room = Number(capsule.props?.width) - 2 - 2 * Number(capsule.props?.paddingX ?? 0)
       expect(cells(note)).toBeLessThanOrEqual(room)
-      expect(laidOutRows(capsule, width - 4)).toHaveLength(7)
+      expect(laidOutRows(capsule, width - 4)).toHaveLength(5)
     }
     expect(laidOutRows(tree, width).filter(row => cells(row) > width)).toEqual([])
     await ui.unmount()
@@ -733,12 +749,12 @@ test('several critical limits use one note after the bars for the highest usage'
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const capsule = accountCapsule(await ui.drawn(), 'kadir')!
   const rows = contentRows(capsule)
-  expect(rows).toHaveLength(5)
-  expect(rows[4]).toBe('Fable 2g 19sa sonra açılır')
+  expect(rows).toHaveLength(3)
+  expect(rows[2]).toBe('Fable 2d19h sonra açılır')
   expect((await paneRows(ui)).filter(row => /sonra açılır$/.test(row))).toHaveLength(1)
   expect((await ui.findAll({ type: 'Text', text: /^Fable$/ }))
     .some(name => name.props.color === 'error' && name.props.weight === 'bold')).toBe(true)
-  expect(laidOutRows(capsule, 38)).toHaveLength(7)
+  expect(laidOutRows(capsule, 38)).toHaveLength(5)
   await ui.unmount()
 })
 
@@ -762,13 +778,14 @@ test('current account follows CLAUDE_CONFIG_DIR and warning errors replace only 
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   const kadir = accountCapsule(tree, 'kadir')!
-  expect(contentRows(kadir)).toEqual(['○ kadir', 'yeniden giriş gerekli'])
+  expect(contentRows(kadir)).toEqual(['yeniden giriş gerekli'])
+  expect(shownText(titleOverlay(accountFrame(tree, 'kadir')))).toBe(' ○ kadir ')
   expect(drawnNodes(kadir).some(node => node.type === 'Text' && shownText(node) === 'yeniden giriş gerekli' && node.props?.color === 'warning')).toBe(true)
   expect(shownText(kadir)).not.toMatch(/━|%|sonra açılır/)
-  const aras = accountCapsule(tree, 'aras')!
-  expect(contentRows(aras)[0]).toBe('● aras')
+  const aras = titleOverlay(accountFrame(tree, 'aras'))
+  expect(shownText(aras)).toBe(' ● aras ')
   expect(drawnNodes(aras).some(node => node.type === 'Text' && shownText(node) === 'aras' && node.props?.color === 'text' && node.props?.weight === 'bold')).toBe(true)
-  expect(drawnNodes(kadir).some(node => node.type === 'Text' && shownText(node) === 'kadir' && node.props?.weight === 'bold')).toBe(false)
+  expect(drawnNodes(titleOverlay(accountFrame(tree, 'kadir'))).some(node => node.type === 'Text' && shownText(node) === 'kadir' && node.props?.weight === 'bold')).toBe(false)
   expect((await ui.find({ type: 'Text', text: /^● ?$/ }))?.props.color).toBe('claude')
   await ui.unmount()
 })
@@ -786,7 +803,7 @@ test('Hesaplar shows only existing limits with their model names and never uses 
   expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: 'Sonnet', percent: 12 }])
   expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 0 }, { label: 'Fable', percent: 43 }])
   const yusa = accountCapsule(tree, 'yusa')!
-  expect(contentRows(yusa)).toEqual(['○ yusa', 'şu an okunamıyor'])
+  expect(contentRows(yusa)).toEqual(['şu an okunamıyor'])
   expect(drawnNodes(yusa).some(node => node.type === 'Text' && shownText(node) === 'şu an okunamıyor' && node.props?.color === 'warning')).toBe(true)
   const card = accountsCard(tree)!
   expect(card).toBeDefined()
@@ -806,7 +823,7 @@ test('each capsule centers labels and complete percentages over equal columns at
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const rows = laidOutRows(tree, width)
-    expect(rows.filter(row => /5 saat.*hafta.*Fable/.test(row))).toHaveLength(1)
+    expect(rows.filter(row => /5(s| saat) 5%.* 73%.* 100%/.test(row))).toHaveLength(1)
     const kadir = accountCapsule(tree, 'kadir')!
     const aras = accountCapsule(tree, 'aras')!
     expectLimitColumns(kadir, [{ label: '5 saat', percent: 5 }, { label: 'hafta', percent: 73 }, { label: 'Fable', percent: 100 }])
@@ -839,8 +856,8 @@ test('the approved 58-column account fixture has the critical Fable note and no 
   expect(card).toBeDefined()
   expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '5 saat', percent: 0 }, { label: 'hafta', percent: 74 }, { label: 'Fable', percent: 96 }])
   expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 0 }, { label: 'Fable', percent: 43 }])
-  expect(contentRows(accountCapsule(tree, 'kadir'))[4]).toBe('Fable 2g 6sa sonra açılır')
-  expect(contentRows(accountCapsule(tree, 'yusa'))).toEqual(['○ yusa', 'şu an okunamıyor'])
+  expect(contentRows(accountCapsule(tree, 'kadir'))[2]).toBe('Fable 2d6h sonra açılır')
+  expect(contentRows(accountCapsule(tree, 'yusa'))).toEqual(['şu an okunamıyor'])
   expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: 'hafta', percent: 6 }])
   const preview = laidOutRows(card, 58)
   expect(preview.every(row => cells(row) === 58)).toBe(true)
@@ -889,7 +906,8 @@ test('wide accounts align three inline cells, leave missing limits blank, and in
           }
         }
       }
-      expect(contentRows(kadir)[1]).toBe('  Fable 2g 4sa sonra açılır')
+      expect(contentRows(kadir)[1]).toBe('  Fable 2d4h sonra açılır')
+      expect(titleOverlay(accountFrame(tree, 'kadir'))).toBeUndefined()
       const yusa = accountCapsule(tree, 'yusa')!
       expect(contentRows(yusa)).toEqual(['○ yusa   şu an okunamıyor'])
       expect(drawnNodes(yusa).some(node => node.type === 'Text' && shownText(node) === 'şu an okunamıyor' && node.props?.color === 'warning')).toBe(true)
@@ -905,8 +923,8 @@ test('wide accounts align three inline cells, leave missing limits blank, and in
   expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '5 saat', percent: 2 }, { label: 'hafta', percent: 75 }, { label: 'Fable', percent: 96 }])
   expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 10 }, { label: 'Fable', percent: 45 }])
   expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: 'hafta', percent: 1 }])
-  expect(contentRows(accountCapsule(tree, 'kadir'))[4]).toBe('Fable 2g 4sa sonra açılır')
-  expect(contentRows(accountCapsule(tree, 'yusa'))).toEqual(['○ yusa', 'şu an okunamıyor'])
+  expect(contentRows(accountCapsule(tree, 'kadir'))[2]).toBe('Fable 2d4h sonra açılır')
+  expect(contentRows(accountCapsule(tree, 'yusa'))).toEqual(['şu an okunamıyor'])
   await narrow.unmount()
 })
 
@@ -930,23 +948,24 @@ test('5-hour columns show their reset countdown with an arrow where it fits, els
     { used_percent: 15, window_minutes: 300, resets_at: NOW / 1000 + 35 * 60 },
     { used_percent: 5, window_minutes: 10080, resets_at: NOW / 1000 + 50 * 3600 }) })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  for (const [width, label] of [[42, '↻ 1sa 48dk'], [38, '1sa 48dk'], [32, '1sa 48…']] as const) {
+  for (const [width, label, shown] of [[58, '↻ 1h48m', '↻ 1h48m'], [42, '↻1h48m', '↻1h48m'], [38, '1h48m', '1h48m'],
+    [32, '1h48m', '1h…']] as const) {
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const kadir = accountCapsule(tree, 'kadir')!
     expectLimitColumns(kadir, [{ label, percent: 12 }, { label: 'hafta', percent: 40 }, { label: 'Fable', percent: 60 }])
-    expect(drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === label)?.props).toMatchObject({ dimColor: true })
+    expect(drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === shown)?.props).toMatchObject({ dimColor: true })
     // A missing or passed reset keeps the window's name; a passed one has
     // started over at 0%.
     expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 20 }, { label: 'hafta', percent: 30 }, { label: 'Fable', percent: 35 }])
     expectLimitColumns(accountCapsule(tree, 'yusa')!, [{ label: '5 saat', percent: 0 }, { label: 'hafta', percent: 45 }, { label: 'Fable', percent: 55 }])
-    expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: '↻ 35dk', percent: 15 }, { label: 'hafta', percent: 5 }])
+    expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: '↻ 35m', percent: 15 }, { label: 'hafta', percent: 5 }])
     expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
     await ui.unmount()
   }
-  // Too narrow for the name, a fallback still shortens to 5s.
+  // Too narrow for any label, a column keeps its whole percent.
   const tiny = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: 24 }, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await tiny.drawn(), 'aras'))[1]!.trim()).toMatch(/^5s /)
+  expect(contentRows(accountCapsule(await tiny.drawn(), 'aras'))[0]!.trim()).toMatch(/^20% +30% +35%$/)
   await tiny.unmount()
 })
 
@@ -959,7 +978,7 @@ test('wide inline cells give 5-hour countdowns one shared slot so bars line up, 
   ]
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   for (const [width, labels] of [
-    [96, { kadir: '↻ 1sa 48dk', aras: '↻ 35dk', yusa: '5s' }], [86, { kadir: '1sa 48dk', aras: '35dk', yusa: '5s' }],
+    [96, { kadir: '↻ 1h48m', aras: '↻ 35m', yusa: '5s' }], [76, { kadir: '1h48m', aras: '35m', yusa: '5s' }],
   ] as const) {
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
@@ -984,7 +1003,7 @@ test('wide inline cells give 5-hour countdowns one shared slot so bars line up, 
   }
 })
 
-test('at 76 columns a 5-hour countdown under an hour stays inline and a longer one falls back to columns', async ($, on) => {
+test('at 76 columns a 5-hour countdown stays inline: with its arrow under an hour, bare for a longer one', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
   state.accounts = countdownAccounts(59 * 60_000 + 30_000).slice(0, 2)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
@@ -993,14 +1012,14 @@ test('at 76 columns a 5-hour countdown under an hour stays inline and a longer o
   const room = accountRoom(accountCapsule(tree, 'kadir')!)
   expect(Math.floor((room - 9 - 4) / 3)).toBe(18)
   expect(contentRows(accountCapsule(tree, 'kadir'))).toEqual([
-    `● kadir  ↻ 59dk ${'━'.repeat(6)}  12%  hafta ${'━'.repeat(7)}  40%  Fable ${'━'.repeat(7)}  60%`])
-  expect(contentRows(accountCapsule(tree, 'aras'))[0]!.slice(9, 27)).toBe(`5s     ${'━'.repeat(6)}  20%`)
+    `● kadir  ↻ 59m ${'━'.repeat(7)}  12%  hafta ${'━'.repeat(7)}  40%  Fable ${'━'.repeat(7)}  60%`])
+  expect(contentRows(accountCapsule(tree, 'aras'))[0]!.slice(9, 27)).toBe(`5s    ${'━'.repeat(7)}  20%`)
   state.accounts = countdownAccounts(108 * 60_000 + 60_000).slice(0, 2)
   await clock.advance(60_000)
   tree = await ui.drawn()
-  expect(contentRows(accountCapsule(tree, 'kadir'))).toHaveLength(4)
-  expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '↻ 1sa 48dk', percent: 12 }, { label: 'hafta', percent: 40 }, { label: 'Fable', percent: 60 }])
-  expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 20 }, { label: 'hafta', percent: 30 }, { label: 'Fable', percent: 35 }])
+  expect(contentRows(accountCapsule(tree, 'kadir'))).toEqual([
+    `● kadir  1h48m ${'━'.repeat(7)}  12%  hafta ${'━'.repeat(7)}  40%  Fable ${'━'.repeat(7)}  60%`])
+  expect(contentRows(accountCapsule(tree, 'aras'))[0]!.slice(9, 27)).toBe(`5s    ${'━'.repeat(7)}  20%`)
   expect(laidOutRows(tree, 76).every(row => cells(row) <= 76)).toBe(true)
   await ui.unmount()
 })
@@ -1013,15 +1032,15 @@ test('a 5-hour countdown changes on the minute boundary with no timer of its own
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
   await clock.advance(67); redraws.length = 0
-  const label = async () => contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]?.trim()
-  expect(await label()).toBe('↻ 35dk')
+  const label = async () => contentRows(accountCapsule(await ui.drawn(), 'kadir'))[0]?.trim()
+  expect(await label()).toBe('↻ 35m 10%')
   expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 59_933 }])
   expect(clock.waits().filter(wait => wait.ms < 10_000)).toHaveLength(0)
   await clock.advance(59_932)
   expect(redraws).toHaveLength(0)
-  expect(await label()).toBe('↻ 35dk')
+  expect(await label()).toBe('↻ 35m 10%')
   await clock.advance(101)
-  expect(await label()).toBe('↻ 34dk')
+  expect(await label()).toBe('↻ 34m 10%')
   expect(clock.waits().filter(wait => wait.ms < 10_000)).toHaveLength(0)
   await ui.unmount()
 })
@@ -1039,7 +1058,7 @@ test('Codex reads the newest JSONL last rate_limits and maps primary 10080 to th
     { kind: 'weekly_all', used: 77 }, { kind: 'session', used: 16 },
   ] } })
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
-  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 1sa 0dk', percent: 16 }, { label: 'hafta', percent: 77 }])
+  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 1h0m', percent: 16 }, { label: 'hafta', percent: 77 }])
   expect(state.reads.filter(path => path === `read:${CODEX}/older.jsonl`)).toHaveLength(0)
   await ui.unmount()
 })
@@ -1053,7 +1072,7 @@ test('Codex renders only hafta for a 10080-minute primary window and never adds 
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const capsule = accountCapsule(await ui.drawn(), 'codex')!
     expectLimitColumns(capsule, [{ label: 'hafta', percent: 6 }])
-    expect(contentRows(capsule)).toHaveLength(4)
+    expect(contentRows(capsule)).toHaveLength(2)
     expect(shownText(capsule)).not.toMatch(/5 saat|5s|Fable|–/)
     expect(laidOutRows(await ui.drawn(), width).every(row => cells(row) <= width)).toBe(true)
     await ui.unmount()
@@ -1078,7 +1097,7 @@ test('Codex searches at most seven dated folders and shows a warning instead of 
   expect(dirs).toHaveLength(7)
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const capsule = accountCapsule(await ui.drawn(), 'codex')!
-  expect(contentRows(capsule)).toEqual(['◎ codex', 'şu an okunamıyor'])
+  expect(contentRows(capsule)).toEqual(['şu an okunamıyor'])
   expect(drawnNodes(capsule).some(node => node.type === 'Text' && shownText(node) === 'şu an okunamıyor' && node.props?.color === 'warning')).toBe(true)
   await ui.unmount()
 })
@@ -1095,9 +1114,9 @@ test('accounts and Codex refresh once a minute and preserve successful data afte
   expect(statusCalls(state)).toHaveLength(2)
   expect(state.reads.filter(path => path.startsWith(`list:${HOME}/.codex/`))).toHaveLength(firstCodexLists * 2)
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[2]).toMatch(/10%.*75%.*92%/)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[0]).toMatch(/10%.*75%.*92%/)
   // The kept 5-hour window still counts down: 202 minutes, one gone.
-  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[1]?.trim()).toMatch(/^↻ 3sa 21dk /)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[0]?.trim()).toMatch(/^↻ ?3h21m 10% /)
   expect(await rowText(ui, /tvOSBrowser/)).toBeDefined()
   await ui.unmount()
 })
@@ -1357,8 +1376,9 @@ test('no absolute Box covers a Button, and every overlay hangs from a borderless
         // each, or the title's alone where the capsule module draws the rest.
         expect(lineButtons(tree)).toHaveLength(surface === 'terminal' || surface === 'desktop' ? 1 : 9)
         expect(coveredButtons(tree, width)).toEqual([])
-        // Three card titles, and two accounts' reset times while open.
-        expect(absoluteParents(tree)).toHaveLength(isOpen ? 5 : 3)
+        // Three card titles and, while open, two accounts' reset times; in
+        // columns every account's frame also carries its name.
+        expect(absoluteParents(tree)).toHaveLength(isOpen ? width === 76 ? 5 : 7 : 3)
         for (const parent of absoluteParents(tree)) {
           expect(parent.props?.borderStyle).toBeUndefined()
           expect(isUnpadded(parent)).toBe(true)
@@ -1873,15 +1893,15 @@ test('gauge values appear immediately and refresh instantly without any idle ani
   state.accounts = oneAccount([limit(40), limit(92, 'weekly_scoped', 'Fable')])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/40%.*92%/)
-  const initial = contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[0]).toMatch(/40%.*92%/)
+  const initial = contentRows(accountCapsule(await ui.drawn(), 'kadir'))[0]
   await clock.advance(2000)
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toBe(initial)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[0]).toBe(initial)
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
   expect(clock.waits().filter(wait => wait.ms < 10_000)).toHaveLength(0)
   state.accounts = oneAccount([limit(70), limit(96, 'weekly_scoped', 'Fable')])
   await clock.advance(58_000)
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/70%.*96%/)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[0]).toMatch(/70%.*96%/)
   await clock.advance(100)
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
   expect((await ui.findAll({ type: 'Text', text: /^━+$/ })).some(node => node.props.color === 'text')).toBe(false)
@@ -2185,7 +2205,7 @@ test('cached snapshots after reload form a steady baseline without entrance or c
       status: 'done', pid: 1, startedMs: NOW - 1000, finishedMs: NOW, durationMs: 1000, costUsd: null }], at: NOW, error: null },
   }, version: 1 } }))
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/70%/)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[0]).toMatch(/70%/)
   expect(await rowText(ui, /cached completion/)).toMatch(/^✓/)
   expect(clock.waits()).toHaveLength(0)
   await clock.advance(300)
@@ -2850,10 +2870,11 @@ test('account borders list reset times over an hour apart with faint labels and 
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const kadir = resetOverlay(tree, 'kadir')!
-    expect(shownText(kadir)).toBe(' hafta 1g 2sa · Fable 2g 2sa ')
+    // Beside the narrow layout's title, the trailing part gives way.
+    expect(shownText(kadir)).toBe(width === 76 ? ' hafta 1d2h · Fable 2d2h ' : ' hafta 1d2h ')
     // The border never carries the 5-hour window.
-    expect(shownText(kadir)).not.toMatch(/5s|5 saat|35dk/)
-    expect(shownText(resetOverlay(tree, 'aras'))).toBe(' ↻ 2g 15sa ')
+    expect(shownText(kadir)).not.toMatch(/5s|5 saat|35m/)
+    expect(shownText(resetOverlay(tree, 'aras'))).toBe(' ↻ 2d15h ')
     for (const name of ['kadir', 'aras']) {
       const frame = accountFrame(tree, name)!
       const border = laidOutRows(frame, width - 4)[0]!
@@ -2862,15 +2883,15 @@ test('account borders list reset times over an hour apart with faint labels and 
       expect(Number(resetOverlay(tree, name)?.props?.left)).toBeGreaterThanOrEqual(2)
     }
     const spans = drawnNodes(kadir).filter(node => node.type === 'Text')
-    for (const label of ['hafta ', 'Fable ']) {
+    for (const label of width === 76 ? ['hafta ', 'Fable '] : ['hafta ']) {
       expect(spans.find(node => shownText(node) === label)?.props?.dimColor).toBe(true)
     }
-    const weekly = spans.find(node => shownText(node) === '1g 2sa')
+    const weekly = spans.find(node => shownText(node) === '1d2h')
     expect(weekly?.props?.dimColor).toBe(true)
     expect(weekly?.props?.color).toBeUndefined()
-    expect(spans.find(node => shownText(node) === '2g 2sa')?.props).toMatchObject({ color: 'error' })
+    if (width === 76) expect(spans.find(node => shownText(node) === '2d2h')?.props).toMatchObject({ color: 'error' })
     expect(contentRows(accountCapsule(tree, 'kadir')).slice(-1)[0]).toBe(
-      `${width === 76 ? '  ' : ''}Fable 2g 2sa sonra açılır`)
+      `${width === 76 ? '  ' : ''}Fable 2d2h sonra açılır`)
     expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
     await ui.unmount()
   }
@@ -2903,17 +2924,17 @@ test('reset borders omit missing and passed resets, use the cell model name, and
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const overlay = resetOverlay(tree, 'kadir')!
-    expect(shownText(overlay)).toBe(' ↻ 35dk ')
-    expect(drawnNodes(overlay).find(node => shownText(node) === '35dk')?.props).toMatchObject({ color: 'error' })
+    expect(shownText(overlay)).toBe(' ↻ 35m ')
+    expect(drawnNodes(overlay).find(node => shownText(node) === '35m')?.props).toMatchObject({ color: 'error' })
     const named = resetOverlay(tree, 'named')!
-    expect(shownText(named)).toBe(' hafta 2g 2sa · Sonnet 35dk ')
-    expect(drawnNodes(named).find(node => shownText(node) === '35dk')?.props).toMatchObject({ color: 'error' })
+    expect(shownText(named)).toBe(width === 76 ? ' hafta 2d2h · Sonnet 35m ' : ' hafta 2d2h ')
+    if (width === 76) expect(drawnNodes(named).find(node => shownText(node) === '35m')?.props).toMatchObject({ color: 'error' })
     for (const name of ['passed', 'unreadable', 'unknown', 'session-only', 'codex']) expect(resetOverlay(tree, name)).toBeUndefined()
     await ui.unmount()
   }
 })
 
-test('reset parts are dropped from the end and disappear completely before touching the left corner', async ($, on) => {
+test('reset parts are dropped from the end and disappear completely before touching the title', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
   // Two hours apart, the weekly times stay a labelled list to drop from.
   state.accounts = oneAccount([
@@ -2922,12 +2943,13 @@ test('reset parts are dropped from the end and disappear completely before touch
     { ...limit(95, 'weekly_scoped', 'Extremely long model name'), resets_at: iso(NOW + 52 * 3_600_000) },
   ])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
-  for (const [width, expected] of [[42, ' hafta 2g 2sa '], [24, ' hafta 2g 2sa '], [16, '']] as const) {
+  for (const [width, expected] of [[58, ' hafta 2d2h '], [42, ' hafta 2d2h '], [24, ''], [16, '']] as const) {
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     expect(shownText(resetOverlay(tree, 'kadir'))).toBe(expected)
     const border = laidOutRows(accountFrame(tree, 'kadir'), width - 4)[0]!
-    expect(border).toMatch(/^╭─.*─╮$/)
+    // The name keeps its place whole, down to the right corner itself.
+    expect(border).toMatch(width === 16 ? /^╭─ ● kadir ╮$/ : /^╭─ ● kadir ─.*─╮$/)
     expect(cells(border)).toBe(width - 4)
     expect(border).not.toMatch(/…/)
     await ui.unmount()
@@ -2943,9 +2965,9 @@ test('Codex reset borders use only its existing windows and their actual reset t
   for (const width of [76, 42]) {
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const overlay = resetOverlay(await ui.drawn(), 'codex')!
-    expect(shownText(overlay)).toBe(' ↻ 2g 2sa ')
-    expect(shownText(overlay)).not.toMatch(/5s|35dk/)
-    expect(drawnNodes(overlay).find(node => shownText(node) === '2g 2sa')?.props?.color).toBe('error')
+    expect(shownText(overlay)).toBe(' ↻ 2d2h ')
+    expect(shownText(overlay)).not.toMatch(/5s|35m/)
+    expect(drawnNodes(overlay).find(node => shownText(node) === '2d2h')?.props?.color).toBe('error')
     expect(drawnNodes(overlay).find(node => shownText(node) === '↻ ')?.props?.dimColor).toBe(true)
     expect(shownText(overlay)).not.toContain('Fable')
     await ui.unmount()
@@ -2958,13 +2980,13 @@ test('reset border text changes only on minute boundaries even while another row
   state.accounts = oneAccount([{ ...limit(10, 'weekly_all'), resets_at: iso(NOW + 108 * 60_000) }])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
-  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1sa 48dk ')
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1h48m ')
   for (const target of [NOW + 1000, NOW + 30_000, NOW + 59_900]) {
     await clock.set(target)
-    expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1sa 48dk ')
+    expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1h48m ')
   }
   await clock.set(NOW + 60_100)
-  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1sa 47dk ')
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1h47m ')
   await ui.unmount()
 })
 
@@ -2980,9 +3002,49 @@ test('quiet reset borders schedule a minute callback with no one-second timer', 
   expect(clock.waits().some(wait => wait.ms === 1000)).toBe(false)
   await clock.advance(59_932)
   expect(redraws).toHaveLength(0)
-  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 35dk ')
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 35m ')
   await clock.advance(101)
-  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 34dk ')
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 34m ')
+  await ui.unmount()
+})
+
+test('remaining times read in compact units, and a narrow capsule titles its top border with its name', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  const weekly = (name: string, ms: number): RawAccount => ({ name, email: '', dir: `/${name}`,
+    limits: [{ ...limit(40, 'weekly_all'), resets_at: iso(NOW + ms) }] })
+  state.accounts = [
+    ...oneAccount([{ ...limit(12), resets_at: iso(NOW + 108 * 60_000) },
+      { ...limit(76, 'weekly_all'), resets_at: iso(NOW + 25 * 3_600_000) },
+      { ...limit(96, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + 25 * 3_600_000) }]),
+    weekly('soon', 30_000), weekly('mins', 35 * 60_000), weekly('hour', 2 * 3_600_000),
+  ]
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await mount($,{ ...PANE, surface: 'terminal' })
+  const tree = await ui.drawn()
+  // Days and hours, hours and minutes, minutes, under a minute.
+  for (const [name, shown] of [['kadir', ' ↻ 1d1h '], ['hour', ' ↻ 2h0m '], ['mins', ' ↻ 35m '], ['soon', ' ↻ <1m ']] as const) {
+    expect(shownText(resetOverlay(tree, name))).toBe(shown)
+  }
+  // The name on the left, the reset time on the right of one top border.
+  const frame = accountFrame(tree, 'kadir')!
+  expect(laidOutRows(frame, 38)[0]).toBe(`╭─ ● kadir ${'─'.repeat(17)} ↻ 1d1h ─╮`)
+  const title = drawnNodes(titleOverlay(frame)).filter(node => node.type === 'Text')
+  expect(title.find(node => shownText(node) === '● ')?.props?.color).toBe('claude')
+  expect(title.find(node => shownText(node) === 'kadir')?.props).toMatchObject({ color: 'text', weight: 'bold' })
+  expect(shownText(titleOverlay(accountFrame(tree, 'soon')))).toBe(' ○ soon ')
+  // Two rows: each label beside its percent, then the bars; the note after.
+  const kadir = accountCapsule(tree, 'kadir')!
+  expectLimitColumns(kadir, [{ label: '↻1h48m', percent: 12 }, { label: 'hafta', percent: 76 }, { label: 'Fable', percent: 96 }])
+  expect(contentRows(kadir)).toHaveLength(3)
+  expect(contentRows(kadir)[2]).toBe('Fable 1d1h sonra açılır')
+  expect(drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === '76%')?.props)
+    .toMatchObject({ color: 'warning', weight: 'bold' })
+  expect(drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === 'hafta')?.props?.dimColor).toBe(true)
+  expect(laidOutRows(frame, 38)).toHaveLength(5)
+  for (const name of ['soon', 'mins', 'hour']) {
+    expectLimitColumns(accountCapsule(tree, name)!, [{ label: 'hafta', percent: 40 }])
+    expect(laidOutRows(accountFrame(tree, name), 38)).toHaveLength(4)
+  }
   await ui.unmount()
 })
 
@@ -3009,9 +3071,11 @@ test('weekly resets at most an hour apart show one earliest time, colored for th
   for (const width of [76, 42]) {
     const ui = await mount($,{ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
+    // Beside the narrow layout's title, a list that does not fit keeps its
+    // first part: one cell more of name than days has.
     for (const [name, shown] of [
-      ['same', ' ↻ 2g 2sa '], ['hour', ' ↻ 2g 2sa '], ['apart', ' hafta 2g 3sa · Fable 2g 2sa '],
-      ['days', ' hafta 1g 2sa · Fable 2g 2sa '], ['one', ' ↻ 35dk '], ['hot', ' ↻ 2g 2sa '], ['codex', ' ↻ 1g 2sa '],
+      ['same', ' ↻ 2d2h '], ['hour', ' ↻ 2d2h '], ['apart', width === 76 ? ' hafta 2d3h · Fable 2d2h ' : ' hafta 2d3h '],
+      ['days', ' hafta 1d2h · Fable 2d2h '], ['one', ' ↻ 35m '], ['hot', ' ↻ 2d2h '], ['codex', ' ↻ 1d2h '],
     ] as const) {
       expect(shownText(resetOverlay(tree, name))).toBe(shown)
       const border = laidOutRows(accountFrame(tree, name), width - 4)[0]!
@@ -3024,12 +3088,12 @@ test('weekly resets at most an hour apart show one earliest time, colored for th
       expect(span(name, '↻ ')).toMatchObject({ dimColor: true })
       expect(span(name, '↻ ')?.color).toBeUndefined()
     }
-    for (const [name, value] of [['same', '2g 2sa'], ['hour', '2g 2sa'], ['one', '35dk']] as const) {
+    for (const [name, value] of [['same', '2d2h'], ['hour', '2d2h'], ['one', '35m']] as const) {
       expect(span(name, value)).toMatchObject({ dimColor: true })
       expect(span(name, value)?.color).toBeUndefined()
     }
-    expect(span('hot', '2g 2sa')).toMatchObject({ color: 'error' })
-    expect(span('codex', '1g 2sa')).toMatchObject({ color: 'error' })
+    expect(span('hot', '2d2h')).toMatchObject({ color: 'error' })
+    expect(span('codex', '1d2h')).toMatchObject({ color: 'error' })
     expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
     await ui.unmount()
   }
@@ -3076,7 +3140,10 @@ for (const width of [76, 42]) {
     const frames = drawnNodes(card).filter(node => /^capsule:account:/.test(String(node.props?.key)))
     const expectedHeight = frames.reduce((sum, frame) => sum + laidOutRows(frame, width - 4).length, 2)
     expect(rows).toHaveLength(expectedHeight)
-    expect(rows).toHaveLength(width === 76 ? 15 : 27)
+    expect(rows).toHaveLength(width === 76 ? 15 : 19)
+    // A narrow capsule: its titled top border, the limits' two rows, a
+    // critical account's note, the bottom border.
+    if (width === 42) expect(frames.map(frame => laidOutRows(frame, width - 4).length)).toEqual([5, 4, 4, 4])
     expect(rows.every(row => !/^[│\s]*$/.test(row))).toBe(true)
     expect(rows[1]).toMatch(/╭─/)
     expect(rows[rows.length - 2]).toMatch(/╰─/)
@@ -3242,7 +3309,7 @@ test('a Codex file over 4 MiB is read by its tail, never whole', async ($, on) =
   expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', String(1024 * 1024), '--', `${CODEX}/huge.jsonl`]])
   expect(codexUsed(state)).toEqual([33, 44])
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
-  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 1sa 0dk', percent: 33 }, { label: 'hafta', percent: 44 }])
+  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 1h0m', percent: 33 }, { label: 'hafta', percent: 44 }])
   await ui.unmount()
 })
 
@@ -3267,7 +3334,7 @@ test('a newest Codex file with no rate limits yet falls back to older files, and
   expect(state.writes.filter(key => key === 'codex')).toHaveLength(writes)
   expect(codexUsed(state)).toEqual([21, 31])
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
-  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 58dk', percent: 21 }, { label: 'hafta', percent: 31 }])
+  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 58m', percent: 21 }, { label: 'hafta', percent: 31 }])
   await ui.unmount()
 })
 
@@ -3286,9 +3353,9 @@ test('a window whose reset has passed draws as reset at that time: 0%, no critic
   await start($, clock)
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
   let tree = await ui.drawn()
-  expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '↻ <1dk', percent: 92 }, { label: 'hafta', percent: 0 },
+  expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '↻ <1m', percent: 92 }, { label: 'hafta', percent: 0 },
     { label: 'Fable', percent: 40 }])
-  expect(contentRows(accountCapsule(tree, 'kadir'))[4]).toBe('5 saat <1dk sonra açılır')
+  expect(contentRows(accountCapsule(tree, 'kadir'))[2]).toBe('5 saat <1m sonra açılır')
   expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: '5 saat', percent: 0 }, { label: 'hafta', percent: 50 }])
   expect(shownText(accountsCard(tree))).not.toMatch(/95%|97%/)
   // The 5-hour window resets thirty seconds in: it draws as reset right then.
@@ -3296,7 +3363,7 @@ test('a window whose reset has passed draws as reset at that time: 0%, no critic
   tree = await ui.drawn()
   expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '5 saat', percent: 0 }, { label: 'hafta', percent: 0 },
     { label: 'Fable', percent: 40 }])
-  expect(contentRows(accountCapsule(tree, 'kadir'))).toHaveLength(4)
+  expect(contentRows(accountCapsule(tree, 'kadir'))).toHaveLength(2)
   await ui.press({ key: 'accounts:toggle' }); await clock.settle()
   expect(summaryRows(await ui.drawn())).toEqual(['● kadir 40%  ◎ codex 50%'])
   await ui.unmount()
@@ -3479,7 +3546,7 @@ test('a reload raises session.start again: an old accounts-1 value is declined, 
   expect(statusCalls(state)).toHaveLength(1)
   expect(state.snapshots.get('accounts')).toMatchObject({ shape: 'accounts-3' })
   expect(JSON.stringify(state.snapshots.get('accounts'))).not.toMatch(/@example\.com|"email"/)
-  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[2]).toMatch(/10%.*75%.*92%/)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[0]).toMatch(/10%.*75%.*92%/)
   const agentCalls = state.agentCalls
   await clock.advance(30_000)
   expect(state.agentCalls).toBe(agentCalls + 3)
@@ -3501,7 +3568,10 @@ test('account errors read briefly: a renewing key, a needed login, an expired to
   await start($, clock)
   const ui = await mount($,{ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
-  for (const [name, , shown] of cases) expect(contentRows(accountCapsule(tree, name)), name).toEqual([`○ ${name}`, shown])
+  for (const [name, , shown] of cases) {
+    expect(contentRows(accountCapsule(tree, name)), name).toEqual([shown])
+    expect(shownText(titleOverlay(accountFrame(tree, name))), name).toBe(` ○ ${name} `)
+  }
   await ui.unmount()
 })
 

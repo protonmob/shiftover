@@ -1037,9 +1037,9 @@ function untilReset(resetsAtMs: number | null, now: number): string {
   const minutes = Math.floor((resetsAtMs - now) / 60_000)
   const days = Math.floor(minutes / 1440)
   const hours = Math.floor((minutes % 1440) / 60)
-  if (minutes < 1) return '<1dk'
-  if (days > 0) return `${days}g ${hours}sa`
-  return hours > 0 ? `${hours}sa ${minutes % 60}dk` : `${minutes}dk`
+  if (minutes < 1) return '<1m'
+  if (days > 0) return `${days}d${hours}h`
+  return hours > 0 ? `${hours}h${minutes % 60}m` : `${minutes}m`
 }
 
 function bar(used: number, cells: number, color: Color): Line {
@@ -1101,14 +1101,22 @@ function gaugeColumns(gauges: Gauge[], room: number): Line[] {
   const inset = Math.max(0, Math.floor((room - (width + 1) * gauges.length + 1) / 2))
   const join = (column: (gauge: Gauge) => Line): Line => [plain(' '.repeat(inset)),
     ...gauges.flatMap((gauge, index) => [...(index === 0 ? [] : [plain(' ')]), ...column(gauge)])]
-  // A countdown keeps its arrow only where the column holds both.
+  const percentOf = (gauge: Gauge): string => `${Math.round(clamp(gauge.used, 0, 100))}%`
+  const fits = (label: string, gauge: Gauge): boolean => textCells(`${label} ${percentOf(gauge)}`) <= width
+  // The label shares its row with the percent: a countdown keeps its arrow,
+  // then the arrow without its space, only where the column holds both.
   const labelOf = (gauge: Gauge): string => gauge.countdown === ''
-    ? gauge.label === '5 saat' && width < 6 ? '5s' : gauge.label
-    : textCells(`↻ ${gauge.countdown}`) <= width ? `↻ ${gauge.countdown}` : gauge.countdown
+    ? gauge.label === '5 saat' && !fits(gauge.label, gauge) ? '5s' : gauge.label
+    : [`↻ ${gauge.countdown}`, `↻${gauge.countdown}`].find(label => fits(label, gauge)) ?? gauge.countdown
+  // A column too narrow for both shortens the label, never the percent.
+  const valueOf = (gauge: Gauge): Line => {
+    const percent = percentOf(gauge)
+    const label = fitLine([faint(labelOf(gauge))], width - textCells(percent) - 1)
+    return [...label, ...(label.length === 0 ? [] : [faint(' ')]),
+      { text: percent, color: severity(gauge.used), weight: 'bold' }]
+  }
   return [
-    join(gauge => centered([faint(labelOf(gauge))], width)),
-    join(gauge => centered([{ text: `${Math.round(clamp(gauge.used, 0, 100))}%`,
-      color: severity(gauge.used), weight: 'bold' }], width)),
+    join(gauge => centered(valueOf(gauge), width)),
     join(gauge => bar(gauge.used, width, severity(gauge.used))),
   ]
 }
@@ -1171,7 +1179,7 @@ function accountLines(snapshot: AccountsSnapshot, limits: CodexSnapshot, now: nu
       .sort((a, b) => b.used - a.used).slice(0, 1).map(gauge => {
         let reset = gauge.reset
         if (textCells(`${gauge.label} ${reset} sonra açılır`) > room - (inline ? 2 : 0)) {
-          reset = reset.replace(/(\d+)g (\d+)sa/, '$1g$2sa').replace(/(\d+)sa \d+dk/, '$1sa')
+          reset = reset.replace(/^(\d+h)\d+m$/, '$1')
         }
         return [...(inline ? [plain('  ')] : []), { text: gauge.label, color: 'error', weight: 'bold' },
           faint(` ${reset === '' ? 'açılış -' : `${reset} sonra açılır`}`)]
@@ -1191,6 +1199,12 @@ function accountLines(snapshot: AccountsSnapshot, limits: CodexSnapshot, now: nu
       }))
       body = []
     }
+    // Columns title the capsule's top border with the name instead.
+    const title = inline ? [] : first
+    if (!inline) {
+      first = body[0] ?? []
+      body = body.slice(1)
+    }
     // Border times share a minute sample even when spinners redraw faster.
     const minute = Math.floor(now / ACCOUNTS_MS) * ACCOUNTS_MS
     const weekly = unreadable ? [] : gauges.filter(gauge => (gauge.kind === 'weekly_all' ||
@@ -1206,7 +1220,7 @@ function accountLines(snapshot: AccountsSnapshot, limits: CodexSnapshot, now: nu
     const resets: Line[] = earliest !== undefined && Math.max(...times) - Math.min(...times) <= RESET_GROUP_MS
       ? [[faint('↻ '), value(earliest, Math.max(...weekly.map(gauge => gauge.used)))]]
       : weekly.map(gauge => [faint(`${gauge.label} `), value(gauge, gauge.used)])
-    return { key: account.name, first, body, notes, resets }
+    return { key: account.name, title, first, body, notes, resets }
   })
 }
 
@@ -1441,7 +1455,8 @@ export const register: Register = on => {
     // columns included, to one grey block, and the keyed Box lights the
     // border. Rows below it are Buttons of their own.
     const capsule = (key: string, first: Line, second: Line | undefined, press?: () => void,
-      notes: Line[] = [], capsulePadding = 1, fixedColor?: Color, borderParts: Line[] = [], rows: CapsuleRow[] = []) => {
+      notes: Line[] = [], capsulePadding = 1, fixedColor?: Color, borderParts: Line[] = [], rows: CapsuleRow[] = [],
+      title: Line = []) => {
       const room = Math.max(1, capsuleWidth - 2 - 2 * capsulePadding)
       const lines = [first, ...(second === undefined ? [] : [second]), ...notes]
       // The ring rests on the capsule's Button, keyed as the capsule, or on a
@@ -1449,11 +1464,16 @@ export const register: Register = on => {
       const isFocused = (target: string): boolean => e.props.isFocused && focusedCapsule === target
       const isRinged = (press !== undefined && isFocused(key)) || rows.some(row => isFocused(row.key))
       const borderColor = fixedColor ?? (isRinged ? 'text' : 'subtle')
+      // A title sits on the top border's left like a card's, up to the right
+      // corner; the parts give way to it, never the other way round.
+      const heading = title.length === 0 ? [] : fitLine([plain(' '), ...title, plain(' ')], capsuleWidth - 3)
       const parts = [...borderParts]
       const borderLine = (): Line => [faint(' '), ...parts.flatMap((part, index) =>
         [...(index === 0 ? [] : [faint(' · ')]), ...part]), faint(' ')]
-      // Leave a border cell at either corner; drop complete trailing parts.
-      while (parts.length > 0 && lineCells(borderLine()) > capsuleWidth - 4) parts.pop()
+      // Leave a border cell at either corner and one after the title; drop
+      // complete trailing parts.
+      while (parts.length > 0 && lineCells(borderLine()) > capsuleWidth - 4 -
+        (heading.length === 0 ? 0 : lineCells(heading) + 1)) parts.pop()
       const detail = parts.length === 0 ? [] : borderLine()
       const compact = key.startsWith('account:') ? { gap: 0, paddingY: 0, marginY: 0 } : {}
       const label = first.map(seg => seg.text).join('').replace(/\s+/g, ' ').trim()
@@ -1491,6 +1511,9 @@ export const register: Register = on => {
         {detail.length === 0 ? null : <Box position="absolute" top={0}
           left={capsuleWidth - 2 - lineCells(detail)} width={lineCells(detail)}>
           {draw(detail, lineCells(detail))}
+        </Box>}
+        {heading.length === 0 ? null : <Box key="title" position="absolute" top={0} left={2} width={lineCells(heading)}>
+          {draw(heading, lineCells(heading))}
         </Box>}
       </Box>
     }
@@ -1561,7 +1584,7 @@ export const register: Register = on => {
           {card(`Hesaplar ${accountsOpen ? '▾' : '▸'}`, accountsOpen ? <Box flexDirection="column" gap={0} paddingY={0} marginY={0}>
             {held.list.length === 0 && held.error !== null ? draw([faint('hesaplar okunamadı')]) : null}
             {accountRows.map(row => capsule(`account:${row.key}`, row.first, row.body[0], undefined,
-              [...row.body.slice(1), ...row.notes], 1, undefined, row.resets))}
+              [...row.body.slice(1), ...row.notes], 1, undefined, row.resets, [], row.title))}
           </Box> : draw(accountSummary(held, limits, innerWidth, now)),
             isReadingAccounts ? [{ text: spinner(now), color: 'suggestion' }] : [], async () => {
               const open = await update($, isAccountsOpen, value => !value)
