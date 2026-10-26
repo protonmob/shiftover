@@ -89,7 +89,8 @@ class Server:
                 d["headroom"] = usage.headroom(r["limits"])
                 d["windows"] = [{"kind": lim["kind"], "model": lim.get("model") or None, "used_percent": lim["used"],
                                  "resets_in": usage.reset_in(lim) or None} for lim in r["limits"]]
-            else:
+            # Windows kept through a failed read come with the error that kept them.
+            if r.get("err") or "limits" not in r:
                 d["error"] = r.get("err", "unknown")
             out.append(d)
         cx = codex.binary(cfg)

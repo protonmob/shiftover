@@ -151,6 +151,17 @@ def test_over_cached_reads_the_model_window_the_status_line_lacks(home, monkeypa
     assert spawned == []
 
 
+def test_over_cached_reads_the_limits_a_429_kept(home, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(usage, "refresh_detached", lambda: spawned.append(1))
+    cfg = config.load()
+    main = cfg.accounts["main"]
+    paths.write_json(usage.cache_path(), {str(main.path): {
+        "ts": 10**12, "email": main.email, "err": "HTTP 429", "retry_at": 10**13, "limits_ts": 1,
+        "limits": [{"kind": "weekly_all", "model": "", "used": 97, "resets_at": None}]}})
+    assert hooks._over_cached(cfg, main, None) == "weekly window 97% used" and spawned == []
+
+
 def test_over_cached_with_a_stale_entry_only_schedules_a_refresh(home, monkeypatch):
     spawned = []
     monkeypatch.setattr(usage, "refresh_detached", lambda: spawned.append(1))

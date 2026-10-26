@@ -1,5 +1,6 @@
 """Which account to open or hand work to."""
 import datetime
+import random
 
 from . import usage
 from .config import Config
@@ -14,16 +15,26 @@ def label(lim: dict) -> str:
 
 def rows_for(cfg: Config, entries: dict) -> list[dict]:
     rows = []
+    now = datetime.datetime.now(datetime.timezone.utc)
     for a in cfg.ordered():
         e = entries.get(str(a.path)) or {}
         row = {"account": a, "name": a.name, "email": e.get("email") or a.email, "dir": str(a.path)}
+        row["fetched_at"] = e.get("ts")
+        nxt = usage.next_refresh(e)
+        # Jittered so the tabs polling `status --json` do not all wake in the same second.
+        row["next_refresh_at"] = nxt + random.uniform(0, usage.JITTER) if nxt is not None else None
         if not e.get("email"):
             row["err"] = "not logged in"
             row["email"] = ""
         elif e.get("err"):
-            row["err"] = e["err"]
+            row["err"] = usage.error(e)
         if "limits" in e:
-            row["limits"] = e["limits"]
+            lims = e["limits"]
+            if e.get("err"):
+                # Kept through a failed read: they still decide, minus windows that have reset since.
+                lims = [lim for lim in lims if not usage.reset_passed(lim, now)]
+            row["limits"] = lims
+            row["limits_fetched_at"] = e.get("limits_ts", e.get("ts"))
         if e.get("extra"):
             row["extra"] = e["extra"]
         rows.append(row)

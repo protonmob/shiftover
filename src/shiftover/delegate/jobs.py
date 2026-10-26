@@ -4,6 +4,7 @@ import os
 import secrets
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -13,6 +14,7 @@ from ..config import Account
 from . import codex
 
 _procs: dict[str, subprocess.Popen] = {}
+_lock = threading.RLock()
 RESULT_MAX = 8000
 
 
@@ -40,6 +42,8 @@ class Job:
     prompt_chars: int = 0
     backend: str = "claude"
     usage: dict | None = None
+    parent_session_id: str = ""
+    parent_pid: int = 0
 
 
 def _p(job_id: str, ext: str):
@@ -67,7 +71,7 @@ def list_all() -> list[Job]:
     for f in files:
         j = load(f.stem)
         if j:
-            out.append(j)
+            out.append(refresh(j))
     return sorted(out, key=lambda j: j.started, reverse=True)
 
 
@@ -153,6 +157,9 @@ def _private_file(path):
 
 
 def _launch(job: Job, argv: list[str], env: dict, prompt: str) -> Job:
+    # Fixed when the MCP server started, so /clear or /resume can leave it stale: parent_pid is the stable key.
+    job.parent_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    job.parent_pid = os.getppid()
     for k in ("SHIFTOVER_RUN_ID", "SHIFTOVER_PID"):
         env.pop(k, None)
     paths.ensure_dir(paths.jobs_dir())
@@ -180,12 +187,22 @@ def _launch(job: Job, argv: list[str], env: dict, prompt: str) -> Job:
     except (OSError, ValueError):
         pass
     save(job)
+    threading.Thread(target=_wait_for_exit, args=(job, proc), name=f"shiftover-job-{job.id}", daemon=True).start()
     return job
 
 
-def _command_of(pid: int) -> str:
+def _wait_for_exit(job: Job, proc: subprocess.Popen) -> None:
+    proc.wait()
+    with _lock:
+        current = load(job.id)
+        if current is not None:
+            job.__dict__.update(vars(finalize(current)))
+
+
+def _process_info(pid: int) -> str:
     try:
-        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+        return subprocess.run(["ps", "-o", "stat=", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -197,7 +214,8 @@ def alive(job: Job) -> bool:
     if not job.pid or not claude.pid_alive(job.pid):
         return False
     # After a restart the pid may belong to anything; only our own backend binary counts.
-    return job.backend in _command_of(job.pid) or "claude" in _command_of(job.pid)
+    info = _process_info(job.pid).split(None, 1)
+    return len(info) == 2 and not info[0].startswith("Z") and (job.backend in info[1] or "claude" in info[1])
 
 
 def _tail(path, n=2000) -> str:
@@ -239,11 +257,32 @@ def _finalize_codex(job: Job) -> Job:
     job.finished = job.finished or time.time()
     job.duration_ms = int((job.finished - job.started) * 1000)
     _cleanup(job)
-    save(job)
+    _save_final(job)
     return job
 
 
+def _save_final(job: Job) -> None:
+    # Another process may cancel while this one reads the output: a "cancelled" on disk always wins.
+    current = load(job.id)
+    if current and current.status == "cancelled":
+        job.status = "cancelled"
+    save(job)
+
+
 def finalize(job: Job) -> Job:
+    with _lock:
+        # A waiter, monitor or cancellation may already have settled this record.
+        current = load(job.id)
+        if current and current.status != "running" and current.finished:
+            job.__dict__.update(vars(current))
+            return job
+        if current and current.status == "cancelled":
+            # Cancelled from another process, which saved that before signalling.
+            job.status = "cancelled"
+        return _finalize(job)
+
+
+def _finalize(job: Job) -> Job:
     if job.backend == "codex":
         return _finalize_codex(job)
     raw = _tail(_p(job.id, "out"), 50_000_000)
@@ -279,7 +318,7 @@ def finalize(job: Job) -> Job:
         job.error = _tail(_p(job.id, "err")) or (raw[-2000:] if raw else "no output")
     job.finished = job.finished or time.time()
     _cleanup(job)
-    save(job)
+    _save_final(job)
     return job
 
 
@@ -318,30 +357,34 @@ def _signal_group(job: Job, sig) -> None:
 
 
 def cancel(job: Job) -> Job:
-    refresh(job)
-    if job.status == "running" and alive(job):
-        _signal_group(job, signal.SIGTERM)
-        job.status = "cancelled"
-        deadline = time.time() + 3
-        while alive(job) and time.time() < deadline:
-            time.sleep(0.1)
-        if alive(job):
-            _signal_group(job, signal.SIGKILL)
-            time.sleep(0.2)
-        proc = _procs.get(job.id)
-        if proc is not None:
-            try:
-                proc.wait(1)
-            except subprocess.TimeoutExpired:
-                pass
-        finalize(job)
-    return job
+    with _lock:
+        refresh(job)
+        if job.status == "running" and alive(job):
+            # Saved before the signal: the server that owns the job reaps it within ms and must find it cancelled.
+            job.status = "cancelled"
+            save(job)
+            _signal_group(job, signal.SIGTERM)
+            deadline = time.time() + 3
+            while alive(job) and time.time() < deadline:
+                time.sleep(0.1)
+            if alive(job):
+                _signal_group(job, signal.SIGKILL)
+                time.sleep(0.2)
+            proc = _procs.get(job.id)
+            if proc is not None:
+                try:
+                    proc.wait(1)
+                except subprocess.TimeoutExpired:
+                    pass
+            finalize(job)
+        return job
 
 
 def summary(job: Job, max_chars: int = RESULT_MAX) -> dict:
     d = {
         "job_id": job.id, "status": job.status, "account": job.account, "backend": job.backend, "model": job.model,
         "effort": job.effort, "label": job.label, "cwd": job.cwd, "session_id": job.session_id,
+        "parent_session_id": job.parent_session_id, "parent_pid": job.parent_pid,
         "elapsed_s": round((job.finished or time.time()) - job.started, 1),
     }
     if job.status != "running":

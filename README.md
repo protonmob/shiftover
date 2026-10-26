@@ -126,6 +126,10 @@ sequenceDiagram
   is intact. If no account has headroom, nothing happens and Claude Code's own wait-for-reset behaviour takes over.
 - Other accounts' windows come from the OAuth usage endpoint Claude Code itself uses, read with each account's own token,
   cached for five minutes. It is not a documented API; when it fails shiftover degrades to the official data it has.
+- Access tokens last about eight hours and Claude Code renews them only while it runs, so an account left idle overnight
+  stops answering. The background refresh then runs one tiny `claude -p` turn (haiku, hooks and MCP servers off, nothing
+  saved) on that account, which makes Claude Code renew its token; until then the account shows "renewing token" with its
+  last windows. If the token does not move ahead, it shows "login required" and the next try waits 15 minutes.
 - `delegate` runs `claude -p --output-format json` under the chosen account. Nothing from the calling conversation is
   shared except the prompt you write.
 
@@ -241,7 +245,8 @@ account when one is throttled can be read that way. That judgement is yours to m
 
 ## Privacy and security
 
-- Tokens are read from the Keychain (`security find-generic-password`) only to call the usage endpoint, never written or logged.
+- Tokens are read from the Keychain (`security find-generic-password`) only to call the usage endpoint and to see when
+  they expire, never written or logged; renewing one is left to `claude` itself, whose output is discarded.
 - State lives in `~/.cache/shiftover` with `0600` files. Temporary `--mcp-config` files are removed when the job ends.
 - No telemetry, no network calls other than Anthropic's usage endpoint and whatever `claude` itself does.
 

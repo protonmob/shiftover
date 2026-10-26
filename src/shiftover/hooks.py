@@ -81,9 +81,8 @@ def _over_cached(cfg, cur, family: str | None) -> str:
         now = datetime.datetime.now(datetime.timezone.utc)
         reasons = []
         for lim in entry.get("limits") or []:
-            ends = usage.parse_ts(lim.get("resets_at"))
             # A window that reset after the entry was cached no longer says anything.
-            if (ends is None or ends > now) and usage.applies(lim, family) and float(lim["used"]) >= cfg.threshold:
+            if not usage.reset_passed(lim, now) and usage.applies(lim, family) and float(lim["used"]) >= cfg.threshold:
                 reasons.append(f"{_window(lim)} {float(lim['used']):.0f}% used")
         return "; ".join(reasons)
     except Exception:  # noqa: BLE001 - a malformed cache entry must not break the hook

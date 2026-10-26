@@ -132,6 +132,41 @@ def _seed_limits(home, spec):
         {"kind": k, "model": m, "used": u, "resets_at": None} for k, m, u in lims]} for n, lims in spec.items()})
 
 
+def test_accounts_show_kept_windows_with_their_error(home):
+    from shiftover import config, usage
+    from shiftover.delegate import mcp
+    _seed_limits(home, {"second": [("session", "", 10)], "third": [("session", "", 20)]})
+    cache = usage.load_cache()
+    main = config.load().accounts["main"]
+    cache[str(main.path)] = {"ts": 10**12, "email": main.email, "token_fp": "", "err": "HTTP 429", "retry_at": 10**13,
+                             "limits": [{"kind": "session", "model": "", "used": 100, "resets_at": None}], "limits_ts": 1}
+    paths.write_json(usage.cache_path(), cache)
+    out = {a["name"]: a for a in mcp.Server().accounts({})}
+    assert out["main"]["windows"][0]["used_percent"] == 100 and out["main"]["error"].startswith("HTTP 429")
+    assert "error" not in out["second"] and out["second"]["windows"]
+
+
+def test_accounts_say_a_token_is_being_renewed_and_keep_its_windows(home, monkeypatch):
+    from shiftover import config, i18n, usage
+    from shiftover.delegate import mcp
+    monkeypatch.setattr(i18n, "LANG", "en")
+    _seed_limits(home, {"second": [("session", "", 10)], "third": [("session", "", 20)]})
+    cache = usage.load_cache()
+    main = config.load().accounts["main"]
+    cache[str(main.path)] = {"ts": 1, "email": main.email, "token_fp": "",
+                             "limits": [{"kind": "session", "model": "", "used": 40, "resets_at": None}]}
+    paths.write_json(usage.cache_path(), cache)
+    tok = usage.claude.Token("test")
+    tok.expires_at = 1.0
+    monkeypatch.setattr(usage.claude, "access_token", lambda d: tok)
+    monkeypatch.setattr(usage, "fetch", lambda t: pytest.fail("an expired token was sent"))
+    spawned = []
+    monkeypatch.setattr(usage, "refresh_detached", lambda: spawned.append(1))
+    out = {a["name"]: a for a in mcp.Server().accounts({})}
+    assert out["main"]["error"] == "renewing token" and out["main"]["windows"][0]["used_percent"] == 40
+    assert "error" not in out["second"] and spawned == [1]
+
+
 def test_auto_without_a_model_counts_the_settings_model_window(home, fake_claude):
     from shiftover.delegate import mcp
     (home / ".claude" / "settings.json").write_text(json.dumps({"model": "fable"}))

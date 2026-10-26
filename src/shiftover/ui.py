@@ -97,6 +97,8 @@ def build_lines(rows, st: Style, selected=None, cols=200):
                 out.append((f"     {labels[k]:<{lw}}  {plain}", f"     {st.dim}{labels[k]:<{lw}}{st.reset}  {colored}"))
             if r.get("extra"):
                 out.append((f"     {r['extra']}", f"     {st.dim}{r['extra']}{st.reset}"))
+            if r.get("err"):
+                out.append((f"     {r['err']}", f"     {st.yellow}{r['err']}{st.reset}"))
             continue
         plain_line, colored_line = f"{n_p}  {e_p}", f"{n_c}  {e_c}"
         for k in kinds:
@@ -107,6 +109,10 @@ def build_lines(rows, st: Style, selected=None, cols=200):
         if r.get("extra"):
             plain_line += GAP + r["extra"]
             colored_line += GAP + f"{st.dim}{r['extra']}{st.reset}"
+        # Limits kept through a failed read: say why they are not fresh.
+        if r.get("err"):
+            plain_line += GAP + r["err"]
+            colored_line += GAP + f"{st.yellow}{r['err']}{st.reset}"
         out.append((plain_line.rstrip(), colored_line.rstrip()))
     return out
 

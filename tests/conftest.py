@@ -1,13 +1,49 @@
 import json
 import os
+import signal
 import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def sandbox(tmp_path_factory):
+    """shiftover's config, cache and data dirs for the whole run: a test without `home`, or a thread
+    outliving its test's monkeypatch, lands here and never in the real ~/.cache or ~/.config."""
+    from shiftover import claude, paths
+    base = tmp_path_factory.mktemp("sandbox")
+    mp = pytest.MonkeyPatch()
+    mp.setenv("XDG_CONFIG_HOME", str(base / ".config"))
+    mp.setenv("XDG_CACHE_HOME", str(base / ".cache"))
+    mp.setenv("XDG_DATA_HOME", str(base / ".local" / "share"))
+    mp.setattr(paths, "HOME", base)
+    # A token renewal starts the real claude binary: a test that renews replaces this guard with a fake.
+    mp.setattr(claude, "renew", lambda d: pytest.fail("a test started a real token renewal"))
+    yield base
+    mp.undo()
+    # Every test that writes shiftover state has its own `home`: anything here escaped one.
+    leaked = sorted(str(p.relative_to(base)) for p in base.rglob("*") if p.is_file())
+    assert not leaked, f"written outside a test's home: {leaked}"
+
+
+def stop_jobs():
+    """Kills the job processes a test left running and waits for their exit waiters to finish."""
+    from shiftover.delegate import jobs
+    for proc in list(jobs._procs.values()):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+    for th in threading.enumerate():
+        if th.name.startswith("shiftover-job-"):
+            th.join(10)
 
 
 @pytest.fixture
@@ -22,12 +58,22 @@ def home(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("SHIFTOVER_ACCOUNT_DIR", raising=False)
     monkeypatch.delenv("SHIFTOVER_RUN_ID", raising=False)
+    # Jobs record the chat that started them: never the real Claude Code session running the tests.
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     # Tests often run inside a real `shiftover run`: never let one signal that wrapper or inherit its account or model.
     monkeypatch.delenv("SHIFTOVER_PID", raising=False)
     monkeypatch.delenv("SHIFTOVER_ACCOUNT", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.delenv("SHIFTOVER_DEPTH", raising=False)
     import shiftover.claude as c
+    # Keep parent and subprocess tests off the real keychain.
+    monkeypatch.setattr(c, "access_token", lambda d: "")
+    bindir = h / "bin"
+    bindir.mkdir()
+    security = bindir / "security"
+    security.write_text("#!/bin/sh\nexit 1\n")
+    security.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ.get('PATH', '')}")
     monkeypatch.setattr(c, "DEFAULT_DIR", h / ".claude")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: h))
     for name, email in (("main", "one@example.com"), ("second", "two@example.com"), ("third", "three@example.com")):
@@ -45,7 +91,9 @@ def home(tmp_path, monkeypatch):
         '[handoff]\nmode = "auto"\n[delegate]\nwait_seconds = 5\n[tips]\nenabled = true\nlevels = [75, 90]\n'
         '[codex]\nenabled = false\n'
     )
-    return h
+    yield h
+    # Before monkeypatch restores the env: a late waiter would otherwise save into another home.
+    stop_jobs()
 
 
 @pytest.fixture

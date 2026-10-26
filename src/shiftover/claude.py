@@ -3,12 +3,18 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
 from . import paths
 
 DEFAULT_DIR = Path.home() / ".claude"
+RENEW_TIMEOUT = 90
+# One tiny turn makes Claude Code renew an expired access token. Hooks are off (the user's hooks pop notifications and
+# shiftover's own Stop hook would run inside it), and no MCP server starts or transcript is saved.
+RENEW_ARGS = ["-p", "ok", "--model", "haiku", "--max-turns", "1", "--settings", '{"disableAllHooks": true}',
+              "--mcp-config", '{"mcpServers": {}}', "--strict-mcp-config", "--no-session-persistence"]
 PASSTHROUGH = {
     "auth", "mcp", "update", "doctor", "plugin", "setup-token", "config", "install",
     "migrate-installer", "agents", "--version", "-v", "--help", "-h",
@@ -77,7 +83,20 @@ def default_model(d) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
-def access_token(d) -> str:
+class Token(str):
+    """An access token that also carries its expiry: epoch seconds, None when the blob does not say."""
+    expires_at: float | None = None
+
+
+def _expiry(value) -> float | None:
+    # Claude Code writes expiresAt in milliseconds; seconds are taken as they are.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value / 1000 if value > 1e11 else float(value)
+
+
+def access_token(d) -> Token:
+    """The account's OAuth access token and its expiry, from one keychain lookup (or .credentials.json)."""
     blob = ""
     try:
         blob = subprocess.run(
@@ -90,11 +109,16 @@ def access_token(d) -> str:
         try:
             blob = (norm(d) / ".credentials.json").read_text(encoding="utf-8")
         except OSError:
-            return ""
+            return Token()
     try:
-        return json.loads(blob).get("claudeAiOauth", {}).get("accessToken") or ""
-    except ValueError:
-        return ""
+        oauth = json.loads(blob).get("claudeAiOauth") or {}
+    except (ValueError, AttributeError):
+        return Token()
+    if not isinstance(oauth, dict) or not isinstance(oauth.get("accessToken"), str):
+        return Token()
+    tok = Token(oauth["accessToken"])
+    tok.expires_at = _expiry(oauth.get("expiresAt"))
+    return tok
 
 
 def pid_alive(pid: int) -> bool:
@@ -141,6 +165,34 @@ def env_for(d, extra: dict | None = None) -> dict:
     if extra:
         env.update(extra)
     return env
+
+
+def renew_env(d) -> dict:
+    """env_for(d) minus CLAUDECODE and every CLAUDE_CODE_* variable: a renewal is no child of the session that asked."""
+    return {k: v for k, v in env_for(d).items() if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")}
+
+
+def renew(d) -> bool:
+    """Runs RENEW_ARGS on account d, output discarded; True if claude exited cleanly. Callers re-read the token."""
+    b = claude_bin()
+    if not b:
+        return False
+    try:
+        # A fixed empty folder: Claude Code keeps per-folder records, which a fresh temp dir each time would pile up.
+        cwd = paths.ensure_dir(paths.tmp_dir() / "renew")
+        proc = subprocess.Popen([b, *RENEW_ARGS], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, cwd=str(cwd), env=renew_env(d), start_new_session=True)
+    except OSError:
+        return False
+    try:
+        return proc.wait(RENEW_TIMEOUT) == 0
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        return False
 
 
 def current_dir() -> Path:

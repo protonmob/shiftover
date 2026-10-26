@@ -573,14 +573,25 @@ def cmd_usage(ns) -> int:
     if ns.raw:
         for a in cfg.ordered():
             tok = claude.access_token(a.path)
-            data, err = usage.fetch(tok) if tok else (None, "no token")
+            key = str(a.path)
+            e = usage.load_cache().get(key) or {}
+            if usage.fresh(e, 0, usage.fingerprint(tok)):
+                print(f"{a.name}: {usage.error(e)}")
+                continue
+            data, err, retry = usage.fetch(tok) if tok else (None, "no token", None)
+            if err == "HTTP 429":
+                now, em = time.time(), claude.email(a.path)
+                e = {"ts": now, "email": em, "token_fp": usage.fingerprint(tok),
+                     "err": err, "retry_at": now + usage.retry_after(retry), **usage.known_limits(e, em)}
+                usage.store(key, e)
+                err = usage.error(e)
             print(f"{a.name}: {json.dumps(data, ensure_ascii=False) if data else err}")
         return 0
-    entries = usage.refresh(_dirs(cfg), force=ns.refresh, ttl=0 if ns.refresh else usage.TTL)
+    entries = usage.refresh_stale(_dirs(cfg)) if ns.stale else usage.refresh(_dirs(cfg), force=ns.refresh)
     if not ns.quiet:
         for a in cfg.ordered():
             e = entries.get(str(a.path)) or {}
-            print(f"{a.name}: {e.get('err') or pick.summary({'limits': e.get('limits') or []})}")
+            print(f"{a.name}: {usage.error(e) or pick.summary({'limits': e.get('limits') or []})}")
     return 0
 
 
@@ -656,9 +667,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--purge", action="store_true")
 
     s = sub.add_parser("usage", help="refresh or dump the usage cache")
-    s.add_argument("--refresh", action="store_true")
+    mode = s.add_mutually_exclusive_group()
+    mode.add_argument("--refresh", action="store_true")
+    mode.add_argument("--stale", action="store_true", help="(internal) refresh stale entries once across tabs")
+    mode.add_argument("--raw", action="store_true")
     s.add_argument("--quiet", action="store_true")
-    s.add_argument("--raw", action="store_true")
 
     s = sub.add_parser("hook", help="(internal) Claude Code hook entry point")
     s.add_argument("event")
