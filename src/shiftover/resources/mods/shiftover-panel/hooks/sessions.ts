@@ -26,7 +26,12 @@ const normalizeDir = (value: string, home: string): string =>
 type SourceCache = { file: string; mtimeMs: number; raw: string; configText: string }
 type TabsCache = { panels: OpenPanel[]; missing: Set<string>; at: number }
 type PidsCache = { checked: Set<number>; alive: Set<number>; at: number }
-type ChatModel = { model: string; effort: string }
+// A chat as the sessions file and cmux name it, before its transcript is
+// read: the tab's title and the folder's name stand in line for its titles.
+type Parsed = { chat: ChatSession; tab: string; folder: string }
+// What a transcript's tail says: the last model and effort, the latest
+// `/rename` and Claude's own title, and when it last changed.
+type ChatModel = { model: string; effort: string; customTitle?: string; aiTitle?: string }
 type TranscriptCache = { size: number; mtimeMs: number; value: ChatModel }
 type Starter = { sessionId: string | null; at: number }
 let sourceCache: SourceCache | null = null
@@ -35,14 +40,11 @@ let pidsCache: PidsCache | null = null
 // Counts every change of the three caches above: the last list parsed names
 // the revision and accounts it was parsed from. The last list answered.
 let revision = 0
-let parsed: { list: ChatSession[]; basis: string } | null = null
+let parsed: { rows: Parsed[]; basis: string } | null = null
 let lastList: ChatSession[] = []
 let isReading = false
 let isSearching = false
 let cmux: string | null = null
-// Each chat's place in the order it was first seen: see inSeenOrder.
-const seen = new Map<string, number>()
-let seenCount = 0
 // Transcript search answers by job id, from refreshes and clicks: a found tab
 // holds while open; a miss or a closed tab is searched again after a minute.
 const starters = new Map<string, Starter>()
@@ -141,13 +143,13 @@ function sessionRecords(raw: string): [string, Record<string, unknown>][] {
   return Object.entries(data.sessions).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
 }
 
-export function parseSessions(raw: string, options: ParseOptions): ChatSession[] {
+function parseRows(raw: string, options: ParseOptions): Parsed[] {
   const panels = new Map(options.panels.map(panel => [key(panel.surfaceId), panel]))
   const names = configAccounts(options.configText, options.home)
   for (const account of options.accounts) {
     if (account.dir) names.set(normalizeDir(account.dir, options.home), account.name)
   }
-  const chats: ChatSession[] = []
+  const rows: Parsed[] = []
   const seenSurfaces = new Set<string>()
   for (const [id, row] of sessionRecords(raw)) {
     const surfaceId = text(row.surfaceId)
@@ -157,36 +159,47 @@ export function parseSessions(raw: string, options: ParseOptions): ChatSession[]
     const launch = isRecord(row.launchCommand) ? row.launchCommand : {}
     const environment = isRecord(launch.environment) ? launch.environment : {}
     const dir = text(environment.CLAUDE_CONFIG_DIR) || `${options.home}/.claude`
-    const fallback = text(row.cwd).replace(/\/+$/, '').split('/').pop() || 'Claude Code'
-    chats.push({
+    const folder = text(row.cwd).replace(/\/+$/, '').split('/').pop() || 'Claude Code'
+    rows.push({ chat: {
       id,
       surfaceId,
       workspaceId: panel.workspaceId,
       pid,
-      title: panel.title || fallback,
+      title: '',
       account: names.get(normalizeDir(dir, options.home)) ?? '-',
       model: '',
       effort: '',
       status: chatStatus(row),
       isCurrent: id === options.currentSessionId || (options.currentSurfaceId !== '' && key(surfaceId) === key(options.currentSurfaceId)),
       transcriptPath: text(row.transcriptPath),
-    })
+    }, tab: panel.title.trim(), folder })
     seenSurfaces.add(key(surfaceId))
   }
-  const rank = { waiting: 0, running: 1, idle: 2 }
-  // A stable sort preserves the source order within each status group.
-  return chats.sort((a, b) => rank[a.status] - rank[b.status])
+  return rows
 }
 
-// A chat keeps the place it first took within its status group, whatever
-// order cmux writes its file in: capsules move only when a status changes,
-// so a click lands on the capsule that was under the pointer.
-function inSeenOrder(list: ChatSession[]): ChatSession[] {
-  const ids = new Set(list.map(chat => chat.id))
-  for (const id of [...seen.keys()]) if (!ids.has(id)) seen.delete(id)
-  for (const chat of list) if (!seen.has(chat.id)) seen.set(chat.id, seenCount++)
-  const rank = { waiting: 0, running: 1, idle: 2 }
-  return [...list].sort((a, b) => rank[a.status] - rank[b.status] || (seen.get(a.id) ?? 0) - (seen.get(b.id) ?? 0))
+// The open chats in the sessions file's order, titled without their
+// transcripts: the tab's title unless a shell's, else the folder's name.
+export function parseSessions(raw: string, options: ParseOptions): ChatSession[] {
+  return parseRows(raw, options).map(row => ({ ...row.chat, title: titleOf(row, { model: '', effort: '' }) }))
+}
+
+// A plain shell's tab title names no chat: `user@host:~`, a bare path, or
+// the shell itself.
+export const isShellTitle = (title: string): boolean =>
+  /^[\w.-]+@[\w.-]+(?::.*)?$/.test(title) || /^(?:~|\/)\S*$/.test(title) || /^-?(?:zsh|bash|fish|sh|login)$/.test(title)
+
+// A `/rename` wins at once, wherever the tab's title stands; Claude's own
+// title only when the tab names nothing better.
+function titleOf(row: Parsed, model: ChatModel): string {
+  return model.customTitle || (row.tab !== '' && !isShellTitle(row.tab) ? row.tab : '') || model.aiTitle || row.folder
+}
+
+// Waiting chats first, then every other one by its transcript's last change,
+// newest first. A refresh sorts once; drawing keeps the order it was given.
+function inActivityOrder(rows: { chat: ChatSession; activeAt: number }[]): ChatSession[] {
+  const isWaiting = (chat: ChatSession): number => chat.status === 'waiting' ? 0 : 1
+  return [...rows].sort((a, b) => isWaiting(a.chat) - isWaiting(b.chat) || b.activeAt - a.activeAt).map(row => row.chat)
 }
 
 // MARK: - Chat models
@@ -197,53 +210,73 @@ export function formatModelId(id: string): string {
   return [family.charAt(0).toUpperCase() + family.slice(1), version.join('.')].filter(Boolean).join(' ')
 }
 
+// The last assistant line names the model and effort. `/rename` appends a
+// `custom-title` line and Claude its own `ai-title`: the latest of each.
 export function parseTranscriptTail(raw: string, truncated = false): ChatModel {
   const lines = raw.split('\n')
+  let last: ChatModel | null = null
+  let customTitle: string | undefined
+  let aiTitle: string | undefined
   for (let index = lines.length - 1; index >= (truncated ? 1 : 0); index -= 1) {
+    const line = lines[index]!
+    // Once the model is known only a title line is worth parsing.
+    if (last !== null && !line.includes('"custom-title"') && !line.includes('"ai-title"')) continue
     try {
-      const row: unknown = JSON.parse(lines[index]!)
-      if (!isRecord(row) || row.type !== 'assistant') continue
-      const message = isRecord(row.message) ? row.message : {}
-      return { model: text(message.model), effort: text(row.effort) }
+      const row: unknown = JSON.parse(line)
+      if (!isRecord(row)) continue
+      if (row.type === 'custom-title') customTitle ??= text(row.customTitle).trim() || undefined
+      else if (row.type === 'ai-title') aiTitle ??= text(row.aiTitle).trim() || undefined
+      else if (row.type === 'assistant' && last === null) {
+        const message = isRecord(row.message) ? row.message : {}
+        last = { model: text(message.model), effort: text(row.effort) }
+      }
     } catch { /* A tail can start mid-line or end during a write. */ }
+    if (last !== null && customTitle !== undefined && aiTitle !== undefined) break
   }
-  return { model: '', effort: '' }
+  return { ...(last ?? { model: '', effort: '' }), customTitle, aiTitle }
 }
 
-async function transcriptModel($: EngineInterface, path: string): Promise<ChatModel> {
-  const unknown = { model: '', effort: '' }
-  if (path === '') return unknown
+// A title read once holds while later tails no longer reach its line; a
+// newer one replaces it. Null for a transcript that cannot be stat'ed.
+async function transcriptModel($: EngineInterface, path: string): Promise<{ value: ChatModel; mtimeMs: number } | null> {
+  if (path === '') return null
   try {
     const stat = await $.fs.stat(path)
     const cached = transcripts.get(path)
-    if (cached?.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.value
-    let value = unknown
+    if (cached?.size === stat.size && cached.mtimeMs === stat.mtimeMs) return { value: cached.value, mtimeMs: stat.mtimeMs }
+    let value: ChatModel = { model: '', effort: '' }
     try {
       const result = await $.process.run(['tail', '-c', String(TRANSCRIPT_TAIL_BYTES), '--', path], { timeoutMs: TIMEOUT_MS })
       if (result.exitCode === 0) value = parseTranscriptTail(result.stdout, stat.size > TRANSCRIPT_TAIL_BYTES)
     } catch { /* An unreadable transcript leaves the model and effort unknown. */ }
+    value = { ...value, customTitle: value.customTitle ?? cached?.value.customTitle,
+      aiTitle: value.aiTitle ?? cached?.value.aiTitle }
     transcripts.set(path, { size: stat.size, mtimeMs: stat.mtimeMs, value })
-    return value
+    return { value, mtimeMs: stat.mtimeMs }
   } catch {
-    return unknown
+    return null
   }
 }
 
-// shiftover keeps each session's model under its cache directory, which
-// honours XDG_CACHE_HOME as its jobs do.
-async function chatModels($: EngineInterface, list: ChatSession[], cacheDir: string): Promise<ChatSession[]> {
-  const paths = new Set(list.map(chat => chat.transcriptPath))
+// Each chat's transcript names its model, effort and titles and says when it
+// last changed; shiftover keeps each session's model under its cache
+// directory, which honours XDG_CACHE_HOME as its jobs do.
+async function readChats($: EngineInterface, rows: Parsed[], cacheDir: string): Promise<ChatSession[]> {
+  const paths = new Set(rows.map(row => row.chat.transcriptPath))
   for (const path of transcripts.keys()) if (!paths.has(path)) transcripts.delete(path)
-  return Promise.all(list.map(async chat => {
+  return inActivityOrder(await Promise.all(rows.map(async row => {
     const [last, current] = await Promise.all([
-      transcriptModel($, chat.transcriptPath),
-      $.fs.read(`${cacheDir}/sessions/${chat.id}.json`).then(raw => {
-        const row: unknown = JSON.parse(raw)
-        return isRecord(row) && isRecord(row.model) ? row.model : {}
+      transcriptModel($, row.chat.transcriptPath),
+      $.fs.read(`${cacheDir}/sessions/${row.chat.id}.json`).then(raw => {
+        const record: unknown = JSON.parse(raw)
+        return isRecord(record) && isRecord(record.model) ? record.model : {}
       }).catch(() => ({} as Record<string, unknown>)),
     ])
-    return { ...chat, model: text(current.display_name) || formatModelId(text(current.id) || last.model), effort: last.effort }
-  }))
+    const model = last?.value ?? { model: '', effort: '' }
+    return { chat: { ...row.chat, title: titleOf(row, model),
+      model: text(current.display_name) || formatModelId(text(current.id) || model.model), effort: model.effort },
+    activeAt: last?.mtimeMs ?? 0 }
+  })))
 }
 
 // MARK: - Reading open tabs
@@ -315,21 +348,23 @@ export async function refreshChats($: EngineInterface, options: {
       revision += 1
     }
     const basis = `${revision}\n${options.accounts.map(account => `${account.name}=${account.dir}`).join('\n')}`
-    let list = parsed?.basis === basis && !force ? parsed.list : null
-    if (list === null) {
+    let rows = parsed?.basis === basis && !force ? parsed.rows : null
+    if (rows === null) {
       if (!(await isVisible($))) return null
       const [currentSessionId, currentSurfaceId] = await Promise.all([
         $.session.id().catch(() => ''),
         $.env.get('CMUX_SURFACE_ID').then(value => value ?? '').catch(() => ''),
       ])
-      list = inSeenOrder(parseSessions(source.raw, { ...options, configText: source.configText, panels: tabs.panels,
-        alivePids: checked.alive, currentSessionId, currentSurfaceId }))
-      parsed = { list, basis }
+      rows = parseRows(source.raw, { ...options, configText: source.configText, panels: tabs.panels,
+        alivePids: checked.alive, currentSessionId, currentSurfaceId })
+      parsed = { rows, basis }
     }
-    const modeled = await chatModels($, list, options.cacheDir)
+    // Titles, models and the order follow the transcripts every tick, so a
+    // `/rename` shows at once though cmux is listed only every thirty seconds.
+    const list = await readChats($, rows, options.cacheDir)
     if (!(await isVisible($))) return null
-    lastList = modeled
-    return { list: modeled, at: options.now, error: null }
+    lastList = list
+    return { list, at: options.now, error: null }
   } catch {
     // A transient cmux, ps or half-written file: read all again next tick.
     sourceCache = null
@@ -437,6 +472,25 @@ export async function focusChat($: EngineInterface, chat: ChatSession): Promise<
     // the click's navigation even when that first command hides its source.
     const focused = await $.process.run([bin, 'focus-panel', '--panel', chat.surfaceId, '--workspace', chat.workspaceId], { timeoutMs: TIMEOUT_MS })
     if (focused.exitCode !== 0) throw new Error('panel')
+  } catch {
+    $.ui.toast('sekme açılamadı')
+  }
+}
+
+// cmux runs a new tab's command through a shell: a word with anything but
+// the plain path characters goes in single quotes.
+const shellWord = (word: string): string => /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`
+
+// A new tab in the starter chat's workspace that follows the job live.
+export async function followJob($: EngineInterface, chat: ChatSession, jobId: string, shiftover: string): Promise<void> {
+  if (!(await isVisible($))) return
+  try {
+    const bin = await executable($)
+    if (!(await isVisible($))) return
+    const command = [shiftover, 'jobs', 'follow', jobId].map(shellWord).join(' ')
+    const opened = await $.process.run([bin, 'new-surface', '--workspace', chat.workspaceId, '--command', command,
+      '--focus', 'true'], { timeoutMs: TIMEOUT_MS })
+    if (opened.exitCode !== 0) throw new Error('surface')
   } catch {
     $.ui.toast('sekme açılamadı')
   }

@@ -1,7 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import type { AgentInfo, On } from 'claude-code'
-import { chatStatus, formatModelId, parsePanels, parseSessions, parseTranscriptTail, parseWorkspaces } from './sessions'
+import { chatStatus, formatModelId, isShellTitle, parsePanels, parseSessions, parseTranscriptTail, parseWorkspaces } from './sessions'
+import { claudeStep, codexStep, commandStep, projectFolders } from './steps'
 
 const PANE = {
   plugin: 'shiftover-panel', component: 'Pane', requestId: 'shiftover-panel',
@@ -28,11 +29,12 @@ const spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 type RawLimit = { kind: string; model: string; used: number; resets_at: string | null }
 type RawAccount = { name: string; email: string; dir: string; err?: string; limits?: RawLimit[];
-  next_refresh_at?: number | string | null; fetched_at?: number | string | null }
+  next_refresh_at?: number | string | null; fetched_at?: number | string | null; display?: string | null }
 type RawJob = {
   id: string; account: string; model: string | null; label: string; cwd?: string; status: string;
   pid: number; started: number; finished: number; cost_usd: number | null; duration_ms: number | null;
   parent_session_id?: string; parent_pid?: number; backend?: string;
+  transcript_path?: string; log_path?: string; dir?: string;
 }
 const STATUS: RawAccount[] = [
   { name: 'kadir', email: 'kadir@example.com', dir: `${HOME}/.claude`, err: 'HTTP 401 (token expired)' },
@@ -150,9 +152,13 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
         name: `${id}.out`, kind: 'file' as const, size: out.size ?? out.text.length, mtimeMs: out.mtimeMs, isLink: false,
       }))] }
     }
-    return { value: [...state.codexFiles.entries()].filter(([path]) => path.slice(0, path.lastIndexOf('/')) === e.path)
+    // Codex's dated folders and Claude's session folders hold what the test
+    // put there; a session folder with nothing in it is not there at all.
+    const entries = [...state.codexFiles.entries(), ...state.chatFiles.entries()]
+      .filter(([path]) => path.slice(0, path.lastIndexOf('/')) === e.path)
       .map(([path, file]) => ({ name: path.slice(path.lastIndexOf('/') + 1), kind: 'file' as const,
-        size: file.size ?? file.text.length, mtimeMs: file.mtimeMs, isLink: false })) }
+        size: file.size ?? file.text.length, mtimeMs: file.mtimeMs, isLink: false }))
+    return entries.length === 0 && e.path.includes('/projects/') ? { deny: `ENOENT ${e.path}` } : { value: entries }
   })
   on('fs.read', (_, e) => {
     state.reads.push(`read:${e.path}`)
@@ -194,16 +200,32 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
       return ran(isMissing ? 2 : found.length > 0 ? 0 : 1, found.join(''))
     }
     if (e.argv[0] === 'tail') {
-      const path = e.argv[e.argv.length - 1]!
-      const out = path.startsWith(`${JOBS}/`) && path.endsWith('.out') ? state.outs.get(path.slice(JOBS.length + 1, -4)) : undefined
-      const file = out ?? state.chatFiles.get(path) ?? state.codexFiles.get(path)
-      return file ? ran(0, file.text.slice(-Number(e.argv[2]))) : ran(1, '', 'transcript unavailable')
+      // As BSD tail: with several files, each one's end under `==> path <==`,
+      // a newline before every later head; a missing file gets no head.
+      const fileOf = (path: string) => (path.startsWith(`${JOBS}/`) && path.endsWith('.out')
+        ? state.outs.get(path.slice(JOBS.length + 1, -4)) : undefined) ?? state.chatFiles.get(path) ?? state.codexFiles.get(path)
+      const paths = e.argv.slice(e.argv.indexOf('--') + 1)
+      const bytes = Number(e.argv[2])
+      if (paths.length === 1) {
+        const file = fileOf(paths[0]!)
+        return file ? ran(0, file.text.slice(-bytes)) : ran(1, '', 'transcript unavailable')
+      }
+      let stdout = ''
+      let isMissing = false
+      for (const path of paths) {
+        const file = fileOf(path)
+        if (!file) { isMissing = true; continue }
+        stdout += `${stdout === '' ? '' : '\n'}==> ${path} <==\n${file.text.slice(-bytes)}`
+      }
+      return ran(isMissing ? 1 : 0, stdout, isMissing ? 'tail: No such file or directory\n' : '')
     }
     if (state.isCmuxDown && (e.argv[1] === 'list-workspaces' || e.argv[1] === 'list-panels')) return ran(1, '', 'socket unavailable\n')
     if (e.argv[1] === 'list-workspaces') return ran(0, `* workspace:1 ${WS} Main\n`)
     if (e.argv[1] === 'list-panels') return ran(0, state.panels.map((panel, index) =>
       `surface:${index + 1} ${panel.id} terminal ${index === 0 ? '[focused] ' : ''}${JSON.stringify(panel.title)}`).join('\n'))
-    if (e.argv[1] === 'select-workspace' || e.argv[1] === 'focus-panel') return ran(state.isFocusDown ? 1 : 0, '')
+    if (e.argv[1] === 'select-workspace' || e.argv[1] === 'focus-panel' || e.argv[1] === 'new-surface') {
+      return ran(state.isFocusDown ? 1 : 0, '')
+    }
     if (state.accountsGate) await state.accountsGate
     return state.isShiftoverDown ? ran(2, '', 'config not found\n') : ran(0, JSON.stringify(state.accounts))
   })
@@ -364,7 +386,12 @@ const capsuleBorder = (tree: unknown, title: string): DrawnNode | undefined =>
 const borderOverlay = (frame: DrawnNode | undefined): DrawnNode | undefined =>
   (frame?.children as DrawnNode[] | undefined)?.find(node =>
     node.type === 'Box' && node.props?.position === 'absolute' && node.props.borderStyle === undefined)
-const delegateOverlay = (tree: unknown, title: string): DrawnNode | undefined => borderOverlay(capsuleFor(tree, title))
+// A chat's running delegates: a row Button each under the chat's own lines.
+const followButtonsIn = (capsule: DrawnNode | undefined): DrawnNode[] => drawnNodes(capsule)
+  .filter(node => node.type === 'Button' && String(node.props?.key).startsWith('follow:'))
+const followButtons = (tree: unknown, title: string): DrawnNode[] => followButtonsIn(capsuleFor(tree, title))
+const subRows = (tree: unknown, title: string): string[] => followButtons(tree, title).flatMap(node => contentRows(node))
+const subRow = (name: string, step = 'çalışıyor'): RegExp => new RegExp(`^└ [${spinner}] ${name}  ${step}$`)
 const contentRows = (tree: unknown): string[] => {
   if (typeof tree !== 'object' || tree === null) return []
   const node = tree as DrawnNode
@@ -415,11 +442,12 @@ const printed = (state: World, path: string, ...ids: string[]): void => {
   state.transcripts.set(path, ids.map(id => JSON.stringify({ type: 'user', message: { role: 'user', content: [{
     type: 'tool_result', tool_use_id: 'toolu_bash', content: `ID                    STATUS\n${id}  running` }] } })).join('\n'))
 }
-const OPEN_TRANSCRIPTS = ['/transcripts/1002.jsonl', '/transcripts/1003.jsonl', '/transcripts/1001.jsonl', '/transcripts/1004.jsonl']
+// The open chats' transcripts in list order: the waiting one first, then the
+// file's order while no transcript has changed.
+const OPEN_TRANSCRIPTS = ['/transcripts/1002.jsonl', '/transcripts/1001.jsonl', '/transcripts/1004.jsonl', '/transcripts/1003.jsonl']
 const jobIdPattern = (id: string): string => `job_id\\\\?"[[:space:]]*:[[:space:]]*\\\\?"${id}\\\\?"`
 const starterSearch = (...ids: string[]): string[] =>
   ['grep', '-o', '-H', '-E', '-s', ...ids.flatMap(id => ['-e', jobIdPattern(id)]), '--', ...OPEN_TRANSCRIPTS]
-const badge = (name: string): RegExp => new RegExp(`^ [${spinner}] ${name} $`)
 // The spinner advances every 250 ms.
 const spinnerAt = (now: number): string => spinner[Math.floor(now / 250) % spinner.length]!
 const codexLine = (type: string): string => JSON.stringify({ type })
@@ -436,6 +464,7 @@ const idle = (state: World): void => { state.accounts = []; state.jobs = []; sta
 const cmuxCalls = (state: World, command: string) => state.calls.filter(call => call.argv[1] === command)
 const statusCalls = (state: World) => state.calls.filter(call => call.argv[1] === 'status')
 const actionCalls = (state: World) => state.calls.filter(call => call.argv[1] === 'select-workspace' || call.argv[1] === 'focus-panel')
+const surfaceCalls = (state: World) => state.calls.filter(call => call.argv[1] === 'new-surface')
 const TYPED = { command: 'shiftover-panel', args: '', origin: { kind: 'composer' },
   presentation: { isFullscreen: true, columns: 160 } } as const
 
@@ -987,11 +1016,12 @@ test('session records are filtered by open panel and alive PID, and use cmux tit
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
   const chats = state.snapshots.get('chats')
+  // Waiting first; no transcript has changed yet, so the rest keep the file's order.
   expect(chats).toMatchObject({ shape: 'chats-2', value: { list: [
     { id: 'waiting-session', title: 'Needs approval', status: 'waiting', account: 'kadir' },
-    { id: 'runner-session', title: 'Analysis tab', status: 'running' },
     { id: 'current-session', title: 'Current tab', isCurrent: true },
     { id: 'idle-session', title: 'Idle tab', account: 'aras' },
+    { id: 'runner-session', title: 'Analysis tab', status: 'running' },
   ] } })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /Dead process|Closed tab/)).toBeUndefined()
@@ -1036,8 +1066,8 @@ test('each chat has a self-contained three-line round capsule, with an arrow onl
   }
   const rows = laidOutRows(tree, 42)
   const first = rows.findIndex(row => /Needs approval/.test(row))
-  const second = rows.findIndex(row => /Analysis tab/.test(row))
-  const third = rows.findIndex(row => /Current tab/.test(row))
+  const second = rows.findIndex(row => /Current tab/.test(row))
+  const third = rows.findIndex(row => /Idle tab/.test(row))
   expect(second - first).toBe(5)
   expect(third - second).toBe(5)
   expect(await rowText(ui, /sohbet daha/)).toBeUndefined()
@@ -1157,10 +1187,14 @@ test('a clickable capsule is one Button holding every line across its padding, i
         else expect((child as DrawnNode).type).toBe('Text')
       }
       expect(drawnNodes(button).filter(node => node.type === 'Text').every(node => !shownText(node).includes('\n'))).toBe(true)
+      // The Button's own keyed Box scopes its hover to it alone.
       const frame = capsuleBorder(capsule, title)!
       expect(frame.props?.position).toBeUndefined()
       expect(frame.props?.paddingX).toBe(0)
-      expect(frame.children).toEqual([button])
+      expect(frame.children).toHaveLength(1)
+      const target = frame.children![0] as DrawnNode
+      expect(target).toMatchObject({ type: 'Box', props: { key: `target:${key}` } })
+      expect(target.children).toEqual([button])
       expect((capsule.children ?? [])[0]).toBe(frame)
       const rows = laidOutRows(capsule, 38)
       expect(rows).toHaveLength(height)
@@ -1206,13 +1240,16 @@ test('no absolute Box covers a Button, and every overlay hangs from a borderless
         const tree = await ui.drawn()
         expect(await rowText(ui, /Hesaplar/)).toMatch(new RegExp(`^ Hesaplar ${isOpen ? '▾' : '▸'} [${spinner}] $`))
         if (isOpen) for (const name of ['aras', 'yusa']) expect(resetOverlay(tree, name)).toBeDefined()
-        expect(shownText(delegateOverlay(tree, 'Needs approval'))).toMatch(badge('codex'))
-        expect(shownText(delegateOverlay(tree, 'Idle tab'))).toMatch(badge('aras'))
+        // Delegates are rows inside their chats now, never a border overlay.
+        expect(subRows(tree, 'Needs approval')).toEqual([expect.stringMatching(subRow('codex'))])
+        expect(subRows(tree, 'Idle tab')).toEqual([expect.stringMatching(subRow('aras'))])
+        for (const title of ['Needs approval', 'Idle tab']) expect(borderOverlay(capsuleFor(tree, title))).toBeUndefined()
         expect(capsuleBorder(tree, 'Current tab')?.props?.borderColor).toBe('claude')
-        // Three chats, three jobs and the title: one Button each.
-        expect(lineButtons(tree)).toHaveLength(7)
+        // Three chats, three jobs, two delegate rows and the title: one Button each.
+        expect(lineButtons(tree)).toHaveLength(9)
         expect(coveredButtons(tree, width)).toEqual([])
-        expect(absoluteParents(tree).length).toBeGreaterThan(4)
+        // Three card titles, and two accounts' reset times while open.
+        expect(absoluteParents(tree)).toHaveLength(isOpen ? 5 : 3)
         for (const parent of absoluteParents(tree)) {
           expect(parent.props?.borderStyle).toBeUndefined()
           expect(isUnpadded(parent)).toBe(true)
@@ -1283,13 +1320,16 @@ test('cmux parsing handles multiple workspaces, terminal titles, escaped quotes,
   expect(list[0]).toMatchObject({ isCurrent: true, account: 'kadir' })
 })
 
-test('all open chats render in full beyond the pane window, retaining waiting and running first', async ($, on) => {
+test('all open chats render in full beyond the pane window, waiting first, then by last activity', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   for (let index = 0; index < 7; index += 1) {
     const id = `extra-${index}`; const pid = 2000 + index
     state.panels = [...state.panels, { id, title: `Extra tab ${index}` }]
     state.sessions[id] = rawSession(id, pid); state.alivePids.add(pid)
   }
+  // The analysis tab's transcript changed after the current tab's.
+  state.chatFiles.set('/transcripts/1003.jsonl', { mtimeMs: NOW - 1000, text: '' })
+  state.chatFiles.set('/transcripts/1001.jsonl', { mtimeMs: NOW - 5000, text: '' })
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows: 5 } }, surface: 'terminal' })
   const chatButtons = (await ui.findAll({ type: 'Button' })).filter(node => /^chat:/.test(node.key ?? ''))
@@ -1360,7 +1400,7 @@ test('a session on a tab no listing saw lists cmux at once, while a closed tab l
 test('a transient cmux failure keeps the open chats, names the error, and lists again on the next poll', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   const chats = () => (state.snapshots.get('chats') as { value: { list: { id: string }[]; error: string | null } }).value
-  const ids = ['waiting-session', 'runner-session', 'current-session', 'idle-session']
+  const ids = ['waiting-session', 'current-session', 'idle-session', 'runner-session']
   await start($, clock)
   expect(chats().list.map(chat => chat.id)).toEqual(ids)
   state.isCmuxDown = true
@@ -1379,29 +1419,35 @@ test('a transient cmux failure keeps the open chats, names the error, and lists 
   await ui.unmount()
 })
 
-test('chats keep their places when cmux rewrites its file in another order; only a status change moves one', async ($, on) => {
+test('waiting chats lead, the rest follow their transcripts\' last change, newest first, re-sorted once a tick', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   const order = () => (state.snapshots.get('chats') as { value: { list: { id: string }[] } }).value.list.map(chat => chat.id)
+  const touch = (pid: number, mtimeMs: number) => state.chatFiles.set(`/transcripts/${pid}.jsonl`, { mtimeMs, text: '' })
+  // The idle tab spoke last, then the current one, the running one long ago;
+  // the waiting tab's transcript is oldest of all.
+  touch(1004, NOW - 1000); touch(1001, NOW - 2000); touch(1003, NOW - 60_000); touch(1002, NOW - 90_000)
   await start($, clock)
-  expect(order()).toEqual(['waiting-session', 'runner-session', 'current-session', 'idle-session'])
-  // The same records, written in reverse: nothing moves and nothing is written.
-  const writes = state.writes.filter(key => key === 'chats').length
-  state.sessions = Object.fromEntries(Object.entries(state.sessions).reverse()); state.sessionsRevision += 1
-  await clock.advance(9_000)
-  expect(state.reads.filter(path => path === `read:${SESSIONS}`)).toHaveLength(2)
-  expect(order()).toEqual(['waiting-session', 'runner-session', 'current-session', 'idle-session'])
-  expect(state.writes.filter(key => key === 'chats')).toHaveLength(writes)
-  // The idle tab starts running: it alone moves, to the end of the running group.
-  state.sessions['idle-session'] = { ...(state.sessions['idle-session'] as object), agentLifecycle: 'running' }
+  expect(order()).toEqual(['waiting-session', 'idle-session', 'current-session', 'runner-session'])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const at = (rows: string[], title: string) => rows.findIndex(row => row.includes(title))
+  const drawnOrder = async () => {
+    const rows = laidOutRows(await ui.drawn(), 42)
+    return ['Needs approval', 'Idle tab', 'Current tab', 'Analysis tab'].sort((a, b) => at(rows, a) - at(rows, b))
+  }
+  expect(await drawnOrder()).toEqual(['Needs approval', 'Idle tab', 'Current tab', 'Analysis tab'])
+  // The running tab writes now: frames redraw its spinner, the order waits for the tick.
+  touch(1003, NOW + 2000)
+  await clock.advance(5_000)
+  expect(order()).toEqual(['waiting-session', 'idle-session', 'current-session', 'runner-session'])
+  expect(await drawnOrder()).toEqual(['Needs approval', 'Idle tab', 'Current tab', 'Analysis tab'])
+  await clock.advance(4_000)
+  expect(order()).toEqual(['waiting-session', 'runner-session', 'idle-session', 'current-session'])
+  expect(await drawnOrder()).toEqual(['Needs approval', 'Analysis tab', 'Idle tab', 'Current tab'])
+  // Waiting chats lead whatever their transcripts say, newest of them first.
+  state.sessions['idle-session'] = { ...(state.sessions['idle-session'] as object), agentLifecycle: 'needsInput' }
   state.sessionsRevision += 1
   await clock.advance(10_000)
-  expect(order()).toEqual(['waiting-session', 'runner-session', 'idle-session', 'current-session'])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const rows = laidOutRows(await ui.drawn(), 42)
-  const at = (title: string) => rows.findIndex(row => row.includes(title))
-  expect(at('Needs approval')).toBeLessThan(at('Analysis tab'))
-  expect(at('Analysis tab')).toBeLessThan(at('Idle tab'))
-  expect(at('Idle tab')).toBeLessThan(at('Current tab'))
+  expect(order()).toEqual(['idle-session', 'waiting-session', 'runner-session', 'current-session'])
   await ui.unmount()
 })
 
@@ -1437,7 +1483,7 @@ test('a delegate without parent fields searches only open transcripts once, then
   const grep = grepCalls(state)
   expect(grep).toHaveLength(1)
   expect(grep[0]?.argv).toEqual(['grep', '-o', '-H', '-E', '-s', '-e', `job_id\\\\?"[[:space:]]*:[[:space:]]*\\\\?"${RUNNING.id}\\\\?"`,
-    '--', '/transcripts/1002.jsonl', '/transcripts/1003.jsonl', '/transcripts/1001.jsonl', '/transcripts/1004.jsonl'])
+    '--', '/transcripts/1002.jsonl', '/transcripts/1001.jsonl', '/transcripts/1004.jsonl', '/transcripts/1003.jsonl'])
   expect(grep[0]?.timeoutMs).toBe(5000)
   expect(actionCalls(state).map(call => call.argv)).toEqual([
     [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', RUNNER, '--workspace', WS],
@@ -2021,11 +2067,11 @@ test('cached snapshots after reload form a steady baseline without entrance or c
   const clock = observedClock(on); const state = world(on)
   state.isOpen = true
   on('state.get', { key: 'accounts' }, () => ({ value: { value: {
-    shape: 'accounts-2', value: { list: [{ name: 'kadir', dir: `${HOME}/.claude`, err: null,
+    shape: 'accounts-3', value: { list: [{ name: 'kadir', display: null, dir: `${HOME}/.claude`, err: null,
       limits: [{ kind: 'session', model: '', used: 70, resetsAtMs: null }] }], current: 'kadir', at: NOW, error: null },
   }, version: 1 } }))
   on('state.get', { key: 'jobs' }, () => ({ value: { value: {
-    shape: 'jobs-1', value: { list: [{ id: 'cached-done', account: 'aras', model: '', label: 'cached completion',
+    shape: 'jobs-2', value: { list: [{ id: 'cached-done', account: 'aras', model: '', label: 'cached completion',
       status: 'done', pid: 1, startedMs: NOW - 1000, finishedMs: NOW, durationMs: 1000, costUsd: null }], at: NOW, error: null },
   }, version: 1 } }))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -2219,7 +2265,7 @@ for (const status of ['idle', 'running'] as const) {
   })
 }
 
-test('delegate badges match session ids before pids and ignore old, closed, finished and stale jobs', async ($, on) => {
+test('delegate rows match session ids before pids and ignore old, closed, finished and stale jobs', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.jobs = [
     { ...RUNNING, id: 'session', parent_session_id: 'waiting-session', parent_pid: 1004 },
@@ -2237,18 +2283,19 @@ test('delegate badges match session ids before pids and ignore old, closed, fini
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   const glyph = spinnerAt(clock.now())
-  expect(shownText(delegateOverlay(tree, 'Needs approval'))).toBe(` ${glyph} codex · ${glyph} yusa `)
-  expect(shownText(delegateOverlay(tree, 'Idle tab'))).toBe(` ${glyph} aras `)
-  for (const title of ['Current tab', 'Analysis tab']) expect(delegateOverlay(tree, title)).toBeUndefined()
+  expect(subRows(tree, 'Needs approval')).toEqual([`└ ${glyph} codex  çalışıyor`, `└ ${glyph} yusa  çalışıyor`])
+  expect(subRows(tree, 'Idle tab')).toEqual([`└ ${glyph} aras  çalışıyor`])
+  for (const title of ['Current tab', 'Analysis tab']) expect(subRows(tree, title)).toEqual([])
+  expect(followButtons(tree, 'Needs approval').map(node => node.props?.key)).toEqual(['follow:session', 'follow:fallback'])
   // Only the two running jobs without parent fields are searched, in one call.
   expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id, 'empty')])
   await ui.unmount()
 })
 
-test('delegate badges count per account, order by earliest start, share spinner phase and fit 76 and 42 columns', async ($, on) => {
+test('delegate rows list each running job by earliest start, share the spinner, color the account and fit narrow capsules', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.jobs = ['kadir', 'codex', 'yusa', 'aras', 'codex'].map((account, index) => ({
-    ...RUNNING, id: `badge-${index}`, account, parent_session_id: 'idle-session',
+    ...RUNNING, id: `row-${index}`, account, parent_session_id: 'idle-session',
     started: (NOW - (index + 1) * 1000) / 1000,
   }))
   await start($, clock)
@@ -2258,36 +2305,45 @@ test('delegate badges count per account, order by earliest start, share spinner 
       await clock.advance(elapsed)
       await ui.redraw(); await clock.settle()
       const tree = await ui.drawn()
-      const idleCapsule = capsules(tree).find(node => node.props?.key === 'capsule:chat:idle-session')
-      const overlay = borderOverlay(idleCapsule)
+      // Narrow titles truncate: the capsules are found by key.
+      const byKey = (key: string) => capsules(tree).find(node => node.props?.key === `capsule:chat:${key}`)!
+      const idleCapsule = byKey('idle-session')
+      const buttons = followButtonsIn(idleCapsule)
       const glyph = spinnerAt(clock.now())
-      expect(shownText(overlay)).toBe(width === 16 ? ''
-        : ` ${glyph} codex ×2 · ${glyph} aras · ${glyph} yusa${width === 76 ? ` · ${glyph} kadir` : ''} `)
-      if (overlay) {
-        expect(overlay.props?.top).toBe(0)
-        expect(Number(overlay.props?.left)).toBeGreaterThanOrEqual(2)
-        const spans = drawnNodes(overlay).filter(node => node.type === 'Text')
-        for (const [name, color] of [['codex ×2', 'success'], ['aras', 'suggestion'], ['yusa', 'remember'],
-          ...(width === 76 ? [['kadir', 'claude']] : [])]) {
-          expect(spans.find(node => shownText(node) === name)?.props?.color).toBe(color)
-        }
-        expect(spans.filter(node => shownText(node) === ' · ').every(node => node.props?.dimColor === true)).toBe(true)
-        expect(spans.filter(node => shownText(node) === `${glyph} `)).toHaveLength(width === 76 ? 4 : 3)
-        const marker = drawnNodes(capsuleFor(tree, 'Analysis tab')).find(node =>
-          node.type === 'Text' && shownText(node) === glyph)
-        expect(marker).toBeDefined()
-      }
-      const rows = laidOutRows(idleCapsule, width - 4)
+      const room = width - 4 - 4
+      const names = ['codex', 'aras', 'yusa', 'codex', 'kadir']
+      expect(buttons.map(node => node.props?.key)).toEqual(['row-4', 'row-3', 'row-2', 'row-1', 'row-0'].map(id => `follow:${id}`))
+      const rows = buttons.flatMap(node => contentRows(node))
       expect(rows).toHaveLength(5)
-      expect(rows[0]).toMatch(/^╭─.*─╮$/)
-      expect(cells(rows[0]!)).toBe(width - 4)
+      for (const [index, row] of rows.entries()) {
+        const full = `└ ${glyph} ${names[index]}  çalışıyor`
+        expect(row).toBe(cells(full) <= room ? full : `${[...full].slice(0, room - 1).join('')}…`)
+        expect(cells(row)).toBeLessThanOrEqual(room)
+      }
+      // The spinner and account in the account's color; the branch and step faint.
+      if (width === 76) {
+        for (const [index, color] of ['success', 'suggestion', 'remember', 'success', 'claude'].entries()) {
+          const spans = drawnNodes(buttons[index]).filter(node => node.type === 'Text')
+          expect(spans.find(node => shownText(node) === names[index])?.props?.color).toBe(color)
+          expect(spans.find(node => shownText(node) === `${glyph} `)?.props?.color).toBe(color)
+          expect(spans.find(node => shownText(node) === '└ ')?.props?.dimColor).toBe(true)
+          expect(spans.find(node => shownText(node) === 'çalışıyor')?.props?.dimColor).toBe(true)
+        }
+      }
+      // One spinner phase for the rows and the running chat's marker.
+      expect(drawnNodes(byKey('runner-session')).some(node => node.type === 'Text' && shownText(node) === glyph)).toBe(true)
+      // The capsule grows a row per job; no overlay rides its border.
+      const laid = laidOutRows(idleCapsule, width - 4)
+      expect(laid).toHaveLength(10)
+      expect(laid[0]).toBe(`╭${'─'.repeat(width - 6)}╮`)
+      expect(borderOverlay(idleCapsule)).toBeUndefined()
       expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
     }
     await ui.unmount()
   }
 })
 
-test('delegate badges retain the existing two-hour staleness guard when ps is unavailable', async ($, on) => {
+test('delegate rows retain the existing two-hour staleness guard when ps is unavailable', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.jobPsFailure = 'deny'
   state.jobs = [
@@ -2296,8 +2352,7 @@ test('delegate badges retain the existing two-hour staleness guard when ps is un
   ]
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const glyph = spinnerAt(clock.now())
-  expect(shownText(delegateOverlay(await ui.drawn(), 'Idle tab'))).toBe(` ${glyph} codex `)
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.unmount()
 })
 
@@ -2319,10 +2374,10 @@ test('parentless running delegates find their starters in one batched grep of op
     await clock.advance(elapsed)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
     const tree = await ui.drawn()
-    expect(shownText(delegateOverlay(tree, 'Idle tab'))).toMatch(badge('codex'))
-    expect(shownText(delegateOverlay(tree, 'Analysis tab'))).toMatch(badge('aras'))
-    expect(shownText(delegateOverlay(tree, 'Needs approval'))).toMatch(badge('yusa'))
-    expect(delegateOverlay(tree, 'Current tab')).toBeUndefined()
+    expect(subRows(tree, 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
+    expect(subRows(tree, 'Analysis tab')).toEqual([expect.stringMatching(subRow('aras'))])
+    expect(subRows(tree, 'Needs approval')).toEqual([expect.stringMatching(subRow('yusa'))])
+    expect(subRows(tree, 'Current tab')).toEqual([])
     expect(grepCalls(state)).toHaveLength(1)
     await ui.unmount()
   }
@@ -2335,7 +2390,7 @@ test('an unmatched starter is searched again only after a minute, and presses re
   mention(state, '/transcripts/1004.jsonl', RUNNING.id)
   await clock.advance(58_000)
   const early = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(delegateOverlay(await early.drawn(), 'Idle tab')).toBeUndefined()
+  expect(subRows(await early.drawn(), 'Idle tab')).toEqual([])
   await early.press({ key: `job:${RUNNING.id}` })
   expect(state.toasts).toEqual(['başlatan sekme kapalı'])
   expect(grepCalls(state)).toHaveLength(1)
@@ -2343,7 +2398,7 @@ test('an unmatched starter is searched again only after a minute, and presses re
   await clock.advance(1_000)
   expect(grepCalls(state)).toHaveLength(2)
   const found = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(shownText(delegateOverlay(await found.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  expect(subRows(await found.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await found.press({ key: `job:${RUNNING.id}` })
   expect(actionCalls(state).map(call => call.argv)).toEqual([
     [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', IDLE, '--workspace', WS]])
@@ -2362,7 +2417,7 @@ test('delegates with parent fields, finished or stale ones are never searched in
   expect(grepCalls(state)).toHaveLength(0)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   for (const title of ['Needs approval', 'Analysis tab', 'Current tab', 'Idle tab']) {
-    expect(delegateOverlay(await ui.drawn(), title)).toBeUndefined()
+    expect(subRows(await ui.drawn(), title)).toEqual([])
   }
   // A press still searches for a job whose parent tab closed.
   await ui.press({ key: 'job:closed-parent' })
@@ -2396,7 +2451,7 @@ test('a starter search waits for an open transcript without spending an attempt'
   expect(grepCalls(state).map(call => call.argv)).toEqual([
     ['grep', '-o', '-H', '-E', '-s', '-e', jobIdPattern(RUNNING.id), '--', '/transcripts/1004.jsonl']])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(shownText(delegateOverlay(await ui.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.unmount()
 })
 
@@ -2406,13 +2461,13 @@ test('a finished delegate keeps its found starter for presses until it leaves th
   await start($, clock)
   expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
   const running = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(shownText(delegateOverlay(await running.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  expect(subRows(await running.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await running.unmount()
   state.jobs = [{ ...RUNNING, status: 'done', finished: (NOW + 5_000) / 1000, duration_ms: 60_000 }, DONE]
   state.jobsRevision += 1
   await clock.advance(3 * 60_000)
   const done = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(delegateOverlay(await done.drawn(), 'Idle tab')).toBeUndefined()
+  expect(subRows(await done.drawn(), 'Idle tab')).toEqual([])
   await done.press({ key: `job:${RUNNING.id}` })
   expect(actionCalls(state).map(call => call.argv)).toEqual([
     [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', IDLE, '--workspace', WS]])
@@ -2428,7 +2483,7 @@ test('a finished delegate keeps its found starter for presses until it leaves th
 
 // MARK: - Finished jobs
 
-test('a zombie delegate process is not running: its job is stale and loses its badge', async ($, on) => {
+test('a zombie delegate process is not running: its job is stale and loses its row', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
   state.processes.set(4242, { stat: 'Z', command: '(codex)' })
@@ -2436,12 +2491,12 @@ test('a zombie delegate process is not running: its job is stale and loses its b
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'stale' }] } })
   expect(await rowText(ui, /ads review/)).toMatch(/^\? .*ads review/)
-  expect(delegateOverlay(await ui.drawn(), 'Idle tab')).toBeUndefined()
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([])
   expect(jobPsCalls(state).map(call => call.argv)).toEqual([['ps', '-ww', '-o', 'pid=,stat=,command=', '-p', '4242']])
   state.processes.set(4242, { stat: 'S+', command: '/opt/bin/codex exec -' })
   await clock.advance(10_000)
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'running' }] } })
-  expect(shownText(delegateOverlay(await ui.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.unmount()
 })
 
@@ -2455,7 +2510,7 @@ for (const [name, job, lines, status, glyph] of [
   ['claude error result', { account: 'aras' }, [JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true })], 'failed', '✗'],
   ['a codex backend named in the file', { account: 'yusa', backend: 'codex' }, [codexLine('turn.completed')], 'done', '✓'],
 ] as const) {
-  test(`a running job whose .out ended (${name}) shows ${status} with a fixed duration and no badge`, async ($, on) => {
+  test(`a running job whose .out ended (${name}) shows ${status} with a fixed duration and no row`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW }); const state = world(on)
     state.jobs = [{ ...RUNNING, ...job, parent_session_id: 'idle-session', started: (NOW - 10 * 60_000) / 1000 }]
     state.outs.set(RUNNING.id, { mtimeMs: NOW - 2 * 60_000, text: `${lines.join('\n')}\n` })
@@ -2470,7 +2525,7 @@ for (const [name, job, lines, status, glyph] of [
       const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
       expect(await rowText(ui, /ads review/)).toMatch(new RegExp(`^${glyph} .*ads review`))
       expect(await rowText(ui, new RegExp(`^${job.account} · 8 dk`))).toBeDefined()
-      expect(delegateOverlay(await ui.drawn(), 'Idle tab')).toBeUndefined()
+      expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([])
       await ui.unmount()
     }
     expect(tailCalls(state)).toHaveLength(1)
@@ -2487,7 +2542,7 @@ test('a still-running .out keeps its job running and is tailed again only after 
   expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', '262144', '--', `${JOBS}/${RUNNING.id}.out`]])
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'running', finishedMs: null }] } })
   const running = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(shownText(delegateOverlay(await running.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  expect(subRows(await running.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await running.unmount()
   await clock.advance(30_000)
   expect(tailCalls(state)).toHaveLength(1)
@@ -2497,11 +2552,11 @@ test('a still-running .out keeps its job running and is tailed again only after 
   expect(tailCalls(state)).toHaveLength(2)
   expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'done' }] } })
   const done = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(delegateOverlay(await done.drawn(), 'Idle tab')).toBeUndefined()
+  expect(subRows(await done.drawn(), 'Idle tab')).toEqual([])
   await done.unmount()
 })
 
-test('a truncated .out tail ignores its partial first line', async ($, on) => {
+test('a truncated .out tail ignores its partial first line, both ends read by one tail', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
   state.jobs = [RUNNING, { ...RUNNING, id: 'claude-job', account: 'aras' }]
   // Cut mid-line, a first line that looks ended is no evidence.
@@ -2511,7 +2566,8 @@ test('a truncated .out tail ignores its partial first line', async ($, on) => {
   await start($, clock)
   const list = (state.snapshots.get('jobs') as { value: { list: { id: string; status: string }[] } }).value.list
   expect(list.map(job => [job.id, job.status])).toEqual([[RUNNING.id, 'running'], ['claude-job', 'running']])
-  expect(tailCalls(state)).toHaveLength(2)
+  expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', '262144', '--',
+    `${JOBS}/${RUNNING.id}.out`, `${JOBS}/claude-job.out`]])
 })
 
 test('one batched ps checks every running delegate whose .out has not ended, zombies included', async ($, on) => {
@@ -3133,9 +3189,9 @@ test('only the delegate tool answer names a starter: a tab that printed the id, 
   expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
-  expect(delegateOverlay(tree, 'Needs approval')).toBeUndefined()
-  expect(delegateOverlay(tree, 'Analysis tab')).toBeUndefined()
-  expect(shownText(delegateOverlay(tree, 'Idle tab'))).toMatch(badge('codex'))
+  expect(subRows(tree, 'Needs approval')).toEqual([])
+  expect(subRows(tree, 'Analysis tab')).toEqual([])
+  expect(subRows(tree, 'Idle tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.press({ key: `job:${RUNNING.id}` })
   expect(actionCalls(state).map(call => call.argv)).toEqual([
     [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', IDLE, '--workspace', WS]])
@@ -3148,7 +3204,7 @@ test('a compact delegate answer, as a structured tool result keeps it, names its
     toolUseResult: { job_id: RUNNING.id, status: 'running' } }))
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(shownText(delegateOverlay(await ui.drawn(), 'Analysis tab'))).toMatch(badge('codex'))
+  expect(subRows(await ui.drawn(), 'Analysis tab')).toEqual([expect.stringMatching(subRow('codex'))])
   await ui.unmount()
 })
 
@@ -3158,7 +3214,7 @@ test('account emails never reach $.state, which any plugin may read', async ($, 
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
   expect(state.accounts.every(account => account.email.endsWith('@example.com'))).toBe(true)
-  expect(state.snapshots.get('accounts')).toMatchObject({ shape: 'accounts-2', value: { list: [{ name: 'kadir' }, { name: 'aras' }] } })
+  expect(state.snapshots.get('accounts')).toMatchObject({ shape: 'accounts-3', value: { list: [{ name: 'kadir' }, { name: 'aras' }] } })
   expect(JSON.stringify([...state.snapshots.values()])).not.toMatch(/@example\.com|"email"/)
 })
 
@@ -3176,7 +3232,7 @@ test('a reload raises session.start again: an old accounts-1 value is declined, 
   // As the engine raises it for a module it loaded fresh.
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   expect(statusCalls(state)).toHaveLength(1)
-  expect(state.snapshots.get('accounts')).toMatchObject({ shape: 'accounts-2' })
+  expect(state.snapshots.get('accounts')).toMatchObject({ shape: 'accounts-3' })
   expect(JSON.stringify(state.snapshots.get('accounts'))).not.toMatch(/@example\.com|"email"/)
   expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[2]).toMatch(/10%.*75%.*92%/)
   const agentCalls = state.agentCalls
@@ -3216,5 +3272,364 @@ test('chat models come from shiftover\'s session cache under XDG_CACHE_HOME, as 
   expect(await rowText(ui, /^kadir · Opus 5\.5$/)).toBeDefined()
   expect(state.reads).toContain('list:/xdg/shiftover/jobs')
   expect(state.reads.filter(path => path.startsWith(`read:${HOME}/.cache/`))).toEqual([])
+  await ui.unmount()
+})
+
+// MARK: - Delegate steps
+
+const assistantBlocks = (...content: Record<string, unknown>[]): string => JSON.stringify({ type: 'assistant', message: { content } })
+const toolUse = (name: string, input: Record<string, unknown>): string => assistantBlocks({ type: 'tool_use', name, input })
+const codexItem = (type: string, item: Record<string, unknown>): string => JSON.stringify({ type, item })
+
+test('a claude step reads the last assistant block: the tool with its file or command, text or thinking', async () => {
+  for (const [line, step] of [
+    [toolUse('Edit', { file_path: '/x/hooks/register.tsx' }), 'register.tsx düzenleniyor'],
+    [toolUse('Write', { file_path: '/x/README.md' }), 'README.md düzenleniyor'],
+    [toolUse('MultiEdit', { file_path: '/x/a.ts', edits: [] }), 'a.ts düzenleniyor'],
+    [toolUse('NotebookEdit', { notebook_path: '/x/n.ipynb' }), 'n.ipynb düzenleniyor'],
+    [toolUse('Read', { file_path: '/x/hooks/sessions.ts' }), 'sessions.ts okunuyor'],
+    [toolUse('Grep', { pattern: 'isVisible' }), 'aranıyor'], [toolUse('Glob', { pattern: '**/*.ts' }), 'aranıyor'],
+    [toolUse('Bash', { command: 'npx -y -p typescript@5.9.3 tsc -p .' }), 'testler çalışıyor'],
+    [toolUse('Bash', { command: 'claude plugin test .' }), 'testler çalışıyor'],
+    [toolUse('Bash', { command: 'git status' }), 'komut çalışıyor'],
+    [toolUse('Agent', { prompt: 'look' }), 'alt ajan çalışıyor'], [toolUse('Task', { prompt: 'look' }), 'alt ajan çalışıyor'],
+    [assistantBlocks({ type: 'text', text: 'Bitti.' }), 'yazıyor'],
+    [assistantBlocks({ type: 'thinking', thinking: '…' }), 'düşünüyor'],
+    [toolUse('WebFetch', { url: 'https://example.com' }), 'çalışıyor'],
+    [toolUse('Edit', {}), 'çalışıyor'],
+  ] as const) expect(claudeStep(`${line}\n`), line).toBe(step)
+  // The last assistant line counts, past the tool's result; of its blocks, the last.
+  expect(claudeStep([toolUse('Read', { file_path: '/a/b.ts' }),
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'x' }] } })].join('\n'))).toBe('b.ts okunuyor')
+  expect(claudeStep(assistantBlocks({ type: 'thinking' }, { type: 'tool_use', name: 'Grep', input: {} }))).toBe('aranıyor')
+  // A tail cut mid-line drops its first line; nothing known reads as working.
+  expect(claudeStep(`${toolUse('Edit', { file_path: '/x/cut.ts' })}\n`, true)).toBe('çalışıyor')
+  expect(claudeStep('')).toBe('çalışıyor')
+})
+
+test('a command reads as tests running when a test, typecheck or build tool runs it', async () => {
+  for (const command of ['npm test', 'bun test --watch', 'pytest -q tests/', 'npx tsc --noEmit', 'npx jest', 'vitest run',
+    'claude plugin test .', 'xcodebuild -scheme App test', './gradlew build', 'gradle test', 'go test ./...', 'pnpm run test:unit']) {
+    expect(commandStep(command), command).toBe('testler çalışıyor')
+  }
+  for (const command of ['git status', 'cat test.txt', 'ls tests-old', 'rg testing', 'npm run lint', 'swift build']) {
+    expect(commandStep(command), command).toBe('komut çalışıyor')
+  }
+})
+
+test('a codex step reads the last item: a command, a file change, a message or reasoning', async () => {
+  for (const [line, step] of [
+    [codexItem('item.started', { id: 'a', type: 'command_execution', command: "bash -lc 'npm test'" }), 'testler çalışıyor'],
+    [codexItem('item.completed', { type: 'command_execution', command: ['bash', '-lc', 'ls -la'] }), 'komut çalışıyor'],
+    [codexItem('item.started', { type: 'file_change', changes: [{ path: '/x/a.ts', kind: 'update' },
+      { path: '/x/hooks/register.tsx', kind: 'update' }] }), 'register.tsx düzenleniyor'],
+    [codexItem('item.completed', { type: 'agent_message', text: 'Bitti.' }), 'yazıyor'],
+    [codexItem('item.completed', { type: 'reasoning', text: '…' }), 'düşünüyor'],
+    [codexItem('item.completed', { item_type: 'reasoning', text: '…' }), 'düşünüyor'],
+    [codexItem('item.started', { type: 'mcp_tool_call', server: 'x' }), 'çalışıyor'],
+  ] as const) expect(codexStep(`${codexLine('turn.started')}\n${line}\n${codexLine('turn.started')}\n`), line).toBe(step)
+  expect(codexStep(`${codexLine('thread.started')}\n${codexLine('turn.started')}\n`)).toBe('çalışıyor')
+})
+
+test('a cwd names its session folder with / and . made -, its other characters tried both ways', async () => {
+  expect(projectFolders('/Users/kadir/Documents/claude-mods/work/shiftover-panel'))
+    .toEqual(['-Users-kadir-Documents-claude-mods-work-shiftover-panel'])
+  expect(projectFolders('/Users/k/my_app.v2/')).toEqual(['-Users-k-my-app-v2', '-Users-k-my_app-v2'])
+  expect(projectFolders('/Users/k/Belgeler/şirket app')).toEqual(['-Users-k-Belgeler--irket-app', '-Users-k-Belgeler-şirket app'])
+})
+
+test('a claude delegate\'s row says its step from its live transcript, read again only after it changes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  const transcript = `${HOME}/.claude-aras/projects/-Users-k-project/delegate.jsonl`
+  state.jobs = [{ ...RUNNING, id: 'claude-job', account: 'aras', parent_session_id: 'idle-session', transcript_path: transcript }]
+  const file = { mtimeMs: NOW - 1000, text: `${toolUse('Edit', { file_path: '/Users/k/project/hooks/register.tsx' })}\n` }
+  state.chatFiles.set(transcript, file)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', 'register.tsx düzenleniyor'))])
+  expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: 'claude-job', step: 'register.tsx düzenleniyor' }] } })
+  const tails = () => tailCalls(state).filter(call => call.argv.includes(transcript)).length
+  expect(tails()).toBe(1)
+  await clock.advance(20_000)
+  expect(tails()).toBe(1)
+  file.text += `${toolUse('Bash', { command: 'claude plugin test .' })}\n`; file.mtimeMs = clock.now()
+  await clock.advance(10_000)
+  expect(tails()).toBe(2)
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', 'testler çalışıyor'))])
+  await ui.unmount()
+})
+
+test('a codex delegate\'s row says its step from its .out, the one tail that also tells how it ended', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
+  const out = { mtimeMs: NOW - 1000, text: `${codexLine('turn.started')}\n${codexItem('item.started',
+    { type: 'file_change', changes: [{ path: '/Users/k/project/hooks/sessions.ts', kind: 'update' }] })}\n` }
+  state.outs.set(RUNNING.id, out)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex', 'sessions.ts düzenleniyor'))])
+  // At 42 columns the step is cut to the row, with an ellipsis.
+  const narrow = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(subRows(await narrow.drawn(), 'Idle tab')).toEqual([expect.stringMatching(/^└ . codex  sessions\.ts düzenleniy…$/)])
+  expect(cells(subRows(await narrow.drawn(), 'Idle tab')[0]!)).toBe(34)
+  await narrow.unmount()
+  expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', '262144', '--', `${JOBS}/${RUNNING.id}.out`]])
+  out.text += `${codexItem('item.started', { type: 'command_execution', command: "bash -lc 'npx vitest run'" })}\n`
+  out.mtimeMs = clock.now()
+  await clock.advance(10_000)
+  expect(tailCalls(state)).toHaveLength(2)
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('codex', 'testler çalışıyor'))])
+  await ui.unmount()
+})
+
+test('every changed end, .outs, transcripts and logs, is read by one tail a tick', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  const transcript = '/delegates/claude.jsonl'
+  const log = '/delegates/codex.jsonl'
+  state.jobs = [{ ...RUNNING, id: 'claude-job', account: 'aras', parent_pid: 1004, transcript_path: transcript },
+    { ...RUNNING, id: 'codex-job', parent_pid: 1004, log_path: log }]
+  state.chatFiles.set(transcript, { mtimeMs: NOW - 1000, text: `${assistantBlocks({ type: 'text', text: 'x' })}\n` })
+  state.chatFiles.set(log, { mtimeMs: NOW - 1000, text: `${codexItem('item.completed', { type: 'reasoning', text: 'x' })}\n` })
+  state.outs.set('claude-job', { mtimeMs: NOW - 1000, text: '' })
+  state.outs.set('codex-job', { mtimeMs: NOW - 1000, text: `${codexLine('turn.started')}\n` })
+  await start($, clock)
+  expect(tailCalls(state).map(call => call.argv.slice(4).sort())).toEqual([[transcript, log,
+    `${JOBS}/claude-job.out`, `${JOBS}/codex-job.out`].sort()])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(subRows(await ui.drawn(), 'Idle tab').sort()).toEqual([expect.stringMatching(subRow('aras', 'yazıyor')),
+    expect.stringMatching(subRow('codex', 'düşünüyor'))].sort())
+  await clock.advance(30_000)
+  expect(tailCalls(state)).toHaveLength(1)
+  await ui.unmount()
+})
+
+for (const folderName of ['-Users-k-my-app-v2', '-Users-k-my_app-v2']) {
+  test(`a claude delegate with no transcript path follows its account folder's newest session since it started (${folderName})`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on)
+    const folder = `${HOME}/.claude-aras/projects/${folderName}`
+    state.jobs = [{ ...RUNNING, id: 'found', account: 'aras', cwd: '/Users/k/my_app.v2', parent_session_id: 'idle-session',
+      started: (NOW - 60_000) / 1000 }]
+    // Older than the job, the delegate's own, and newer but an open chat's.
+    state.chatFiles.set(`${folder}/before.jsonl`, { mtimeMs: NOW - 120_000, text: toolUse('Read', { file_path: '/x/old.ts' }) })
+    state.chatFiles.set(`${folder}/delegate.jsonl`, { mtimeMs: NOW - 5_000, text: toolUse('Grep', { pattern: 'x' }) })
+    state.chatFiles.set(`${folder}/chat.jsonl`, { mtimeMs: NOW - 1_000, text: toolUse('Edit', { file_path: '/x/chat.ts' }) })
+    state.sessions['idle-session'] = { ...(state.sessions['idle-session'] as object), transcriptPath: `${folder}/chat.jsonl` }
+    await start($, clock)
+    // Until the open chats are known no folder is searched, so no open chat's
+    // session passes for the delegate's.
+    expect(state.reads).not.toContain(`list:${folder}`)
+    await clock.advance(9_000)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', 'aranıyor'))])
+    expect(state.reads).toContain(`list:${folder}`)
+    expect(tailCalls(state).some(call => call.argv.includes(`${folder}/delegate.jsonl`))).toBe(true)
+    expect(tailCalls(state).some(call => call.argv.includes(`${folder}/before.jsonl`))).toBe(false)
+    await ui.unmount()
+  })
+}
+
+test('a job file\'s own config folder outranks its account\'s for the fallback session', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  const folder = '/other/claude/projects/-Users-k-project'
+  state.jobs = [{ ...RUNNING, id: 'own-dir', account: 'aras', cwd: '/Users/k/project', dir: '/other/claude', parent_pid: 1004 }]
+  state.chatFiles.set(`${folder}/delegate.jsonl`, { mtimeMs: NOW - 1_000, text: toolUse('Read', { file_path: '/x/notes.md' }) })
+  await start($, clock)
+  await clock.advance(9_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(subRows(await ui.drawn(), 'Idle tab')).toEqual([expect.stringMatching(subRow('aras', 'notes\\.md okunuyor'))])
+  expect(state.reads.some(path => path.startsWith(`list:${HOME}/.claude-aras/`))).toBe(false)
+  await ui.unmount()
+})
+
+test('pressing a delegate row opens a cmux tab in its chat\'s workspace that follows the job live', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }, { ...RUNNING, id: "odd id's", parent_session_id: 'idle-session' }]
+  await start($, clock)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(followButtons(await ui.drawn(), 'Idle tab').map(node => node.props?.key)).toEqual([`follow:${RUNNING.id}`, "follow:odd id's"])
+    const before = surfaceCalls(state).length
+    await ui.press({ key: `follow:${RUNNING.id}` })
+    expect(surfaceCalls(state).slice(before).map(call => call.argv)).toEqual([[CMUX, 'new-surface', '--workspace', WS,
+      '--command', `${HOME}/.local/bin/shiftover jobs follow ${RUNNING.id}`, '--focus', 'true']])
+    await ui.unmount()
+  }
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // An id a shell would split stays one word.
+  await ui.press({ key: "follow:odd id's" })
+  expect(surfaceCalls(state).slice(-1)[0]?.argv[5]).toBe(`${HOME}/.local/bin/shiftover jobs follow 'odd id'\\''s'`)
+  // The row neither focuses the chat nor is the chat's Button; that one still does.
+  expect(actionCalls(state)).toHaveLength(0)
+  await ui.press({ key: 'chat:idle-session' })
+  expect(actionCalls(state).map(call => call.argv)).toEqual([
+    [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', IDLE, '--workspace', WS]])
+  // A tab cmux would not open says so.
+  state.isFocusDown = true
+  await ui.press({ key: `follow:${RUNNING.id}` })
+  expect(state.toasts).toEqual(['sekme açılamadı'])
+  await ui.unmount()
+})
+
+test('the current chat shows its delegates as rows too, and a job whose starter tab closed stays only in İşler', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, parent_session_id: 'current-session' },
+    { ...RUNNING, id: 'orphan', label: 'yetim iş', account: 'aras', parent_session_id: 'closed-session', parent_pid: 1005 }]
+  await start($, clock)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const tree = await ui.drawn()
+    const current = capsuleFor(tree, 'Current tab')!
+    // Its own lines press nothing; the row is the one Button, under them.
+    expect(lineButtons(current).map(node => node.props?.key)).toEqual([`follow:${RUNNING.id}`])
+    expect(subRows(tree, 'Current tab')).toEqual([expect.stringMatching(subRow('codex'))])
+    expect(capsuleBorder(tree, 'Current tab')?.props).toMatchObject({ borderColor: 'claude', paddingX: 0 })
+    expect(capsuleBorder(tree, 'Current tab')?.hover).toBeUndefined()
+    const rows = laidOutRows(current, 38)
+    expect(rows.slice(1, 4).map(row => row.slice(0, 4))).toEqual(['│ ○ ', '│ ka', '│ bu'])
+    expect(rows).toHaveLength(6)
+    // The orphan has no chat to sit under: İşler alone lists it.
+    for (const title of ['Needs approval', 'Analysis tab', 'Idle tab']) expect(subRows(tree, title)).toEqual([])
+    expect(await rowText(ui, /yetim iş/)).toMatch(/yetim iş.*›$/)
+    expect(coveredButtons(tree, 42)).toEqual([])
+    await ui.unmount()
+  }
+})
+
+test('a delegate row has its own keyed Box: hover and focus mute it alone and light the chat\'s border', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  on('ui.focus', () => ({}))
+  state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'terminal' })
+  let tree = await ui.drawn()
+  const row = followButtons(tree, 'Idle tab')[0]!
+  const target = drawnNodes(capsuleFor(tree, 'Idle tab')).find(node => (node.children ?? []).includes(row))!
+  expect(target.props).toMatchObject({ key: `target:follow:${RUNNING.id}` })
+  expect(row.hover).toEqual({ color: 'inactive' })
+  expect(drawnNodes(row).filter(node => node.type === 'Text').every(node => node.hover?.color === 'inactive')).toBe(true)
+  expect(contentRows(row)).toHaveLength(1)
+  expect(cells(shownText(row))).toBe(36)
+  expect(coveredButtons(tree, 42)).toEqual([])
+  await $.ui.focus({ component: 'Pane', requestId: 'shiftover-panel', plugin: 'shiftover-panel',
+    element: `follow:${RUNNING.id}`, origin: { kind: 'person' } })
+  await clock.advance(100)
+  tree = await ui.drawn()
+  expect(capsuleBorder(tree, 'Idle tab')?.props?.borderColor).toBe('text')
+  const muted = drawnNodes(followButtons(tree, 'Idle tab')[0]).filter(node => node.type === 'Text' && node.props?.color === 'inactive')
+  expect(muted.map(shownText).join('')).toBe(shownText(followButtons(tree, 'Idle tab')[0]))
+  // The chat's own lines stay as they were.
+  expect(drawnNodes(lineButtons(capsuleFor(tree, 'Idle tab')).find(node => node.props?.key === 'chat:idle-session'))
+    .some(node => node.type === 'Text' && node.props?.color === 'inactive')).toBe(false)
+  await ui.unmount()
+})
+
+test('delegate steps are read only while the pane shows: hidden, no stat, listing or tail of a transcript or log', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  const transcript = `${HOME}/.claude-aras/projects/-Users-k-project/delegate.jsonl`
+  state.jobs = [{ ...RUNNING, id: 'claude-job', account: 'aras', parent_session_id: 'idle-session', transcript_path: transcript },
+    { ...RUNNING, id: 'fallback-job', account: 'aras', cwd: '/Users/k/project', parent_pid: 1004 },
+    { ...RUNNING, id: 'codex-job', parent_pid: 1004, log_path: '/delegates/codex.jsonl' }]
+  const file = { mtimeMs: NOW - 1000, text: `${toolUse('Read', { file_path: '/x/a.ts' })}\n` }
+  state.chatFiles.set(transcript, file)
+  await start($, clock)
+  expect(state.reads.some(path => path === `stat:${transcript}`)).toBe(true)
+  state.isShown = false
+  await clock.advance(10_000)
+  const reads = state.reads.length
+  const calls = state.calls.length
+  file.text += `${toolUse('Grep', { pattern: 'x' })}\n`; file.mtimeMs = NOW + 5_000
+  await clock.advance(60_000)
+  expect(state.reads.slice(reads)).toEqual([])
+  expect(state.calls.slice(calls)).toEqual([])
+  // Shown again, the changed transcript is read at once.
+  state.isShown = true
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  expect(tailCalls(state).slice(-1)[0]?.argv).toContain(transcript)
+  expect(subRows(await ui.drawn(), 'Idle tab')[0]).toMatch(subRow('aras', 'aranıyor'))
+  await ui.unmount()
+})
+
+// MARK: - Chat titles
+
+test('a plain shell\'s tab title is no chat title', async () => {
+  for (const title of ['kadir@Kadirs-MacBook-Pro:~', 'kadir@host: ~/Documents/project', 'user@host', '~/Documents/x', '/Users/k', '~',
+    'zsh', '-zsh', 'bash', 'fish']) expect(isShellTitle(title), title).toBe(true)
+  for (const title of ['Analysis tab', '✳ Refactor auth', 'Fix login@home page', 'tests: green']) {
+    expect(isShellTitle(title), title).toBe(false)
+  }
+  const tail = [JSON.stringify({ type: 'ai-title', aiTitle: 'Eski AI' }), JSON.stringify({ type: 'custom-title', customTitle: 'Eski ad' }),
+    assistantLine('claude-opus-5-5', 'high'), JSON.stringify({ type: 'ai-title', aiTitle: 'Yeni AI' }),
+    JSON.stringify({ type: 'custom-title', customTitle: ' Yeni ad ' })].join('\n')
+  expect(parseTranscriptTail(tail)).toEqual({ model: 'claude-opus-5-5', effort: 'high', customTitle: 'Yeni ad', aiTitle: 'Yeni AI' })
+})
+
+test('a chat\'s title is its /rename, else its tab title unless a shell\'s, else Claude\'s own, else its folder', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.panels = state.panels.map(panel => panel.id === IDLE ? { ...panel, title: 'kadir@Kadirs-MacBook-Pro:~/project' }
+    : panel.id === RUNNER ? { ...panel, title: 'zsh' } : panel)
+  const transcript = (pid: number, ...rows: object[]) => {
+    const file = { mtimeMs: NOW - pid, text: `${rows.map(row => JSON.stringify(row)).join('\n')}\n` }
+    state.chatFiles.set(`/transcripts/${pid}.jsonl`, file)
+    return file
+  }
+  // Renamed twice, though its tab has a title of its own: the latest name.
+  transcript(1002, { type: 'ai-title', aiTitle: 'AI başlığı' }, { type: 'custom-title', customTitle: 'Eski ad' },
+    { type: 'custom-title', customTitle: 'Yeni ad' })
+  // A shell's tab title: Claude's own title.
+  const idleFile = transcript(1004, { type: 'ai-title', aiTitle: 'Önbellek düzeltmesi' })
+  // A shell's tab title and no titles at all: the folder's name.
+  transcript(1003, { type: 'user', message: { content: 'hi' } })
+  await start($, clock)
+  const titles = () => Object.fromEntries((state.snapshots.get('chats') as { value: { list: { id: string; title: string }[] } })
+    .value.list.map(chat => [chat.id, chat.title]))
+  expect(titles()).toEqual({ 'waiting-session': 'Yeni ad', 'idle-session': 'Önbellek düzeltmesi', 'runner-session': 'project',
+    'current-session': 'Current tab' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await rowText(ui, /Önbellek düzeltmesi/)).toMatch(/^○ Önbellek düzeltmesi +›$/)
+  // A /rename shows on the next tick, cmux not listed again.
+  idleFile.text += `${JSON.stringify({ type: 'custom-title', customTitle: 'Yeniden adlandırıldı' })}\n`
+  idleFile.mtimeMs = NOW + 1000
+  await clock.advance(9_000)
+  expect(titles()['idle-session']).toBe('Yeniden adlandırıldı')
+  expect(await rowText(ui, /Yeniden adlandırıldı/)).toBeDefined()
+  expect(cmuxCalls(state, 'list-workspaces')).toHaveLength(1)
+  // A tail that no longer reaches the rename keeps it.
+  idleFile.text = `${'x'.repeat(300_000)}\n`; idleFile.mtimeMs = NOW + 2000
+  await clock.advance(10_000)
+  expect(titles()['idle-session']).toBe('Yeniden adlandırıldı')
+  await ui.unmount()
+})
+
+// MARK: - Display names
+
+test('accounts draw their display name wherever one is set, else their name; Codex keeps its own', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.accounts = [{ ...STATUS[0]!, display: null }, { ...STATUS[1]!, display: 'mehemed' }]
+  state.jobs = [{ ...RUNNING, id: 'aras-job', account: 'aras', label: 'aras işi', parent_session_id: 'idle-session' },
+    { ...RUNNING, parent_session_id: 'idle-session' }]
+  await start($, clock)
+  expect(state.snapshots.get('accounts')).toMatchObject({ value: { list: [{ name: 'kadir', display: null },
+    { name: 'aras', display: 'mehemed' }] } })
+  expect(JSON.stringify(state.snapshots.get('accounts'))).not.toMatch(/@example\.com/)
+  for (const width of [42, 76]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    // Hesaplar: the display name, else the name; the codex row as it was.
+    expect(accountCapsule(tree, 'mehemed')).toBeDefined()
+    expect(accountCapsule(tree, 'aras')).toBeUndefined()
+    expect(accountCapsule(tree, 'kadir')).toBeDefined()
+    expect(accountCapsule(tree, 'codex')).toBeDefined()
+    // The chat's second line, the job's in İşler and the delegate row.
+    expect(contentRows(capsuleFor(tree, 'Idle tab'))[1]).toBe('mehemed')
+    expect(await rowText(ui, /^mehemed · \d+ sn$/)).toBeDefined()
+    expect(subRows(tree, 'Idle tab').sort()).toEqual([expect.stringMatching(subRow('codex')), expect.stringMatching(subRow('mehemed'))].sort())
+    expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+    await ui.unmount()
+  }
+  // Collapsed, the summary names it the same way.
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+  expect(summaryRows(await ui.drawn())).toEqual(['● kadir ?  ○ mehemed 92%  ◎ codex ?'])
   await ui.unmount()
 })

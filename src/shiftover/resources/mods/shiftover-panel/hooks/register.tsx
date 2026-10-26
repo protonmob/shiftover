@@ -6,8 +6,9 @@ import type { Account, AccountsSnapshot, AgentsSnapshot, ChatSession, CodexSnaps
   Limit, PaneAgent } from '../types'
 
 import { readCodexLimits } from './codex'
-import { refreshChats, refreshStarters, focusChat, openDelegate, parentChat } from './sessions'
+import { refreshChats, refreshStarters, focusChat, followJob, openDelegate, parentChat } from './sessions'
 import type { ChatsSnapshot } from './sessions'
+import { claudeStep, codexStep, projectFolders } from './steps'
 
 // MARK: - Constants
 
@@ -40,6 +41,10 @@ const JOBS_KEPT_MS = 24 * 60 * 60_000
 const UNVERIFIED_RUNNING_MS = 2 * 60 * 60 * 1000
 const RESET_GROUP_MS = 60 * 60_000
 const TAIL_BYTES = 256 * 1024
+// Files one `tail` reads at most: their ends stay under its 4 MiB of output.
+const TAILS_PER_RUN = 12
+// The accounts' own colors, by name, for a delegate's row; text for others.
+const ACCOUNT_COLORS: Record<string, Color> = { codex: 'success', aras: 'suggestion', yusa: 'remember', kadir: CURRENT_COLOR }
 // Requested dock width; drawing uses the actual bodyColumns grant.
 const DOCK_COLUMNS = 76
 
@@ -54,9 +59,9 @@ const NO_AGENTS: AgentsSnapshot = { list: [], at: 0, error: null }
 // Bump a tag when its snapshot's fields change: what an earlier version
 // stored outlives a reload, and the tag is how the new code declines it.
 const accounts = atom({ plugin: 'shiftover-panel', key: 'accounts' } as const, NO_ACCOUNTS, {
-  shape: 'accounts-2',
+  shape: 'accounts-3',
 })
-const jobs = atom({ plugin: 'shiftover-panel', key: 'jobs' } as const, NO_JOBS, { shape: 'jobs-1' })
+const jobs = atom({ plugin: 'shiftover-panel', key: 'jobs' } as const, NO_JOBS, { shape: 'jobs-2' })
 const isDismissed = atom({ plugin: 'shiftover-panel', key: 'isDismissed' } as const, false)
 const isAccountsOpen = atom({ plugin: 'shiftover-panel', key: 'isAccountsOpen' } as const, true)
 const codex = atom({ plugin: 'shiftover-panel', key: 'codex' } as const, NO_CODEX, { shape: 'codex-1' })
@@ -65,10 +70,15 @@ const agents = atom({ plugin: 'shiftover-panel', key: 'agents' } as const, NO_AG
 
 // What the module keeps between timer ticks; a reload starts it over.
 type Files = { home: string; cacheDir: string; jobsDir: string; configFile: string; bin: string }
-// The backend stays here, out of the stored Job shape.
-type CachedJob = { mtimeMs: number; size: number; job: Job | null; backend: string }
+// The backend, the job's folders and where it records its steps stay here,
+// out of the stored Job shape: an empty path is one the file does not name.
+type JobPlace = { backend: string; cwd: string; dir: string; transcriptPath: string; logPath: string }
+type CachedJob = JobPlace & { mtimeMs: number; size: number; job: Job | null }
 type CachedOut = { mtimeMs: number; size: number; verdict: string | null }
-type JobRead = { job: Job; backend: string; out: FsEntry | undefined }
+type CachedStep = { path: string; mtimeMs: number; size: number; step: string }
+type JobRead = JobPlace & { job: Job; out: FsEntry | undefined }
+// A file as a listing or a stat last saw it.
+type FileMark = { path: string; size: number; mtimeMs: number }
 
 let files: Files | null = null
 let poller: Timer | null = null
@@ -84,6 +94,8 @@ let motionJobs = NO_JOBS
 let motionAgents = NO_AGENTS
 let jobsObserved = false
 let agentsObserved = false
+// Whether a refresh has read the open chats since this module loaded.
+let chatsObserved = false
 const jobStatuses = new Map<string, string>()
 const finishedMotion = new Map<string, number>()
 let isReadingJobs = false
@@ -101,6 +113,7 @@ let accountsFailures = 0
 let missedTick = false
 const jobFiles = new Map<string, CachedJob>()
 const jobOuts = new Map<string, CachedOut>()
+const jobSteps = new Map<string, CachedStep>()
 
 // MARK: - Parsing
 
@@ -132,7 +145,8 @@ function parseLimit(row: Record<string, unknown>): Limit[] {
   return [{ kind: asText(row.kind), model: asText(row.model), used, resetsAtMs: toEpochMs(row.resets_at) }]
 }
 
-// The email shiftover reports stays out: any plugin may read $.state.
+// The email shiftover reports stays out: any plugin may read $.state. A
+// display name, when set, is what the pane draws for the account.
 function parseAccounts(stdout: string): Account[] {
   const data: unknown = JSON.parse(stdout)
   if (!Array.isArray(data)) throw new Error('shiftover status: liste bekleniyordu')
@@ -140,6 +154,7 @@ function parseAccounts(stdout: string): Account[] {
     .filter(isRecord)
     .map(row => ({
       name: asText(row.name),
+      display: asText(row.display).trim() || null,
       dir: asText(row.dir),
       nextRefreshAtMs: toEpochMs(row.next_refresh_at),
       fetchedAtMs: toEpochMs(row.fetched_at),
@@ -162,12 +177,18 @@ function retryDelay(failures: number): number {
   return Math.round(delay * (1 + ACCOUNTS_RETRY_JITTER * Math.random()))
 }
 
-function parseJob(raw: string, fileName: string): Pick<CachedJob, 'job' | 'backend'> | null {
+function parseJob(raw: string, fileName: string): (JobPlace & { job: Job }) | null {
   const row: unknown = JSON.parse(raw)
   if (!isRecord(row)) return null
   const finished = asNumber(row.finished)
   const account = asText(row.account)
   return {
+    cwd: asText(row.cwd),
+    // The account's config folder, when the file names it.
+    dir: asText(row.dir),
+    // A claude job's live session and a codex job's JSON-lines log.
+    transcriptPath: asText(row.transcript_path),
+    logPath: asText(row.log_path),
     job: {
       id: asText(row.id) || fileName.replace(/\.json$/, ''),
       account,
@@ -331,49 +352,130 @@ async function readJobs($: EngineInterface, dir: string): Promise<JobRead[]> {
   const outs = new Map(listing.filter(f => f.name.endsWith('.out')).map(f => [f.name, f]))
   const names = new Set(entries.map(entry => entry.name))
   for (const name of [...jobFiles.keys()]) if (!names.has(name)) jobFiles.delete(name)
+  const unread: JobPlace = { backend: 'claude', cwd: '', dir: '', transcriptPath: '', logPath: '' }
   for (const entry of entries) {
     const held = jobFiles.get(entry.name)
     if (held && held.mtimeMs === entry.mtimeMs && held.size === entry.size) continue
     try {
       if (!(await isVisible($))) return []
       const parsed = parseJob(await $.fs.read(`${dir}/${entry.name}`), entry.name)
-      jobFiles.set(entry.name, { mtimeMs: entry.mtimeMs, size: entry.size, job: parsed?.job ?? null,
-        backend: parsed?.backend ?? 'claude' })
+      jobFiles.set(entry.name, { ...unread, ...parsed, mtimeMs: entry.mtimeMs, size: entry.size, job: parsed?.job ?? null })
     } catch {
       // Caught mid-write: keep what it held, read it again next tick.
-      jobFiles.set(entry.name, { mtimeMs: -1, size: -1, job: held?.job ?? null, backend: held?.backend ?? 'claude' })
+      jobFiles.set(entry.name, { ...unread, ...held, mtimeMs: -1, size: -1, job: held?.job ?? null })
     }
   }
-  return [...jobFiles.values()].flatMap(held => (held.job
-    ? [{ job: held.job, backend: held.backend, out: outs.get(`${held.job.id}.out`) }] : []))
+  return [...jobFiles.values()].flatMap(({ mtimeMs, size, job, ...place }) => (job
+    ? [{ ...place, job, out: outs.get(`${job.id}.out`) }] : []))
 }
 
-// A running job's .out can say how it ended before its file does. Its tail
-// is read again only after the listing shows the .out changed.
-async function readOutcomes($: EngineInterface, dir: string, running: JobRead[]): Promise<Map<string, string>> {
+// The ends of several files from one `tail`, a dozen at most per run. With
+// more than one file it heads each with `==> path <==`, every later head after
+// a newline of its own; a file it cannot read gets no head and no entry.
+async function tailFiles($: EngineInterface, paths: string[]): Promise<Map<string, string>> {
+  const tails = new Map<string, string>()
+  for (let at = 0; at < paths.length; at += TAILS_PER_RUN) {
+    const batch = paths.slice(at, at + TAILS_PER_RUN)
+    try {
+      if (!(await isVisible($))) return tails
+      const ran = await $.process.run(['tail', '-c', String(TAIL_BYTES), '--', ...batch], { timeoutMs: 5_000 })
+      // A cut output may have cut a file's end: read them all again next tick.
+      if (ran.isStdoutTruncated) continue
+      if (batch.length === 1) {
+        if (ran.exitCode === 0) tails.set(batch[0]!, ran.stdout)
+        continue
+      }
+      const heads: { path: string; start: number; end: number }[] = []
+      for (const path of batch) {
+        const head = `==> ${path} <==\n`
+        const start = ran.stdout.indexOf(head, heads[heads.length - 1]?.end ?? 0)
+        if (start >= 0) heads.push({ path, start, end: start + head.length })
+      }
+      heads.forEach((head, index) => {
+        const next = heads[index + 1]
+        tails.set(head.path, ran.stdout.slice(head.end, next === undefined ? undefined : Math.max(head.end, next.start - 1)))
+      })
+    } catch {
+      // A refused or slow `tail` leaves these for the next tick.
+    }
+  }
+  return tails
+}
+
+// Where a running job records its steps, as it stands now: a codex job's log,
+// else its .out; a claude job's transcript, else the newest session in its
+// account's folder for its cwd changed since it started that no open chat is
+// on, once the open chats are known. Undefined while there is none.
+async function stepSource($: EngineInterface, dir: string, read: JobRead, home: string,
+  list: Account[], open: ReadonlySet<string> | null): Promise<FileMark | undefined> {
+  const stat = (path: string): Promise<FileMark | undefined> => $.fs.stat(path)
+    .then(found => ({ path, size: found.size, mtimeMs: found.mtimeMs })).catch(() => undefined)
+  const { job, out } = read
+  if (read.backend === 'codex') {
+    const outPath = `${dir}/${job.id}.out`
+    if (read.logPath !== '' && read.logPath !== outPath) return stat(read.logPath)
+    return out === undefined ? undefined : { path: outPath, size: out.size, mtimeMs: out.mtimeMs }
+  }
+  if (read.transcriptPath !== '') return stat(read.transcriptPath)
+  const config = normalizeDir(read.dir || list.find(account => account.name === job.account)?.dir || '', home)
+  if (open === null || config === '' || read.cwd === '') return undefined
+  for (const name of projectFolders(normalizeDir(read.cwd, home))) {
+    const folder = `${config}/projects/${name}`
+    const entries = await $.fs.list(folder).catch(() => null)
+    if (entries === null) continue
+    const newest = entries.filter(entry => entry.kind === 'file' && entry.name.endsWith('.jsonl') &&
+      entry.mtimeMs >= job.startedMs && !open.has(`${folder}/${entry.name}`))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)[0]
+    return newest === undefined ? undefined : { path: `${folder}/${newest.name}`, size: newest.size, mtimeMs: newest.mtimeMs }
+  }
+  return undefined
+}
+
+// A running job's .out can say how it ended before its file does, and its
+// step source what it does now; a codex job's source is often that same
+// .out. Each end is read again only after its size or time changed, all of
+// them in one `tail`.
+async function readRunning($: EngineInterface, dir: string, running: JobRead[],
+  sources: Map<string, FileMark>): Promise<{ outcomes: Map<string, string>; steps: Map<string, string> }> {
   const ids = new Set(running.map(({ job }) => job.id))
   for (const id of [...jobOuts.keys()]) if (!ids.has(id)) jobOuts.delete(id)
+  for (const id of [...jobSteps.keys()]) if (!ids.has(id)) jobSteps.delete(id)
+  const isFresh = (held: { size: number; mtimeMs: number } | undefined, mark: { size: number; mtimeMs: number }): boolean =>
+    held !== undefined && held.size === mark.size && held.mtimeMs === mark.mtimeMs
+  const due = new Set<string>()
+  for (const { job, out } of running) {
+    if (out !== undefined && !isFresh(jobOuts.get(job.id), out)) due.add(`${dir}/${job.id}.out`)
+    const source = sources.get(job.id)
+    const held = jobSteps.get(job.id)
+    if (source !== undefined && !(held?.path === source.path && isFresh(held, source))) due.add(source.path)
+  }
+  const tails = await tailFiles($, [...due])
   const outcomes = new Map<string, string>()
+  const steps = new Map<string, string>()
   for (const { job, backend, out } of running) {
-    if (out === undefined) continue
+    const outPath = `${dir}/${job.id}.out`
     let held = jobOuts.get(job.id)
-    if (held?.size !== out.size || held.mtimeMs !== out.mtimeMs) {
-      try {
-        if (!(await isVisible($))) return outcomes
-        const ran = await $.process.run(['tail', '-c', String(TAIL_BYTES), '--', `${dir}/${job.id}.out`], {
-          timeoutMs: 5_000,
-        })
-        if (ran.exitCode !== 0) throw new Error('tail')
-        held = { mtimeMs: out.mtimeMs, size: out.size, verdict: outcomeOf(ran.stdout, backend, out.size > TAIL_BYTES) }
-      } catch {
-        // Keep what it said and read it again next tick.
-        held = { mtimeMs: -1, size: -1, verdict: held?.verdict ?? null }
-      }
+    if (out !== undefined && due.has(outPath)) {
+      const tail = tails.get(outPath)
+      // Unread, it keeps what it said and is read again next tick.
+      held = tail === undefined ? { mtimeMs: -1, size: -1, verdict: held?.verdict ?? null }
+        : { mtimeMs: out.mtimeMs, size: out.size, verdict: outcomeOf(tail, backend, out.size > TAIL_BYTES) }
       jobOuts.set(job.id, held)
     }
-    if (held.verdict !== null) outcomes.set(job.id, held.verdict)
+    if (held?.verdict) outcomes.set(job.id, held.verdict)
+    const source = sources.get(job.id)
+    let step = jobSteps.get(job.id)
+    if (source !== undefined && !(step?.path === source.path && isFresh(step, source))) {
+      const tail = tails.get(source.path)
+      const read = backend === 'codex' ? codexStep : claudeStep
+      step = tail === undefined ? { path: source.path, mtimeMs: -1, size: -1, step: step?.step ?? 'çalışıyor' }
+        : { path: source.path, mtimeMs: source.mtimeMs, size: source.size, step: read(tail, source.size > TAIL_BYTES) }
+      jobSteps.set(job.id, step)
+    }
+    // Unknown until a source shows one.
+    steps.set(job.id, source === undefined ? 'çalışıyor' : step?.step ?? 'çalışıyor')
   }
-  return outcomes
+  return { outcomes, steps }
 }
 
 // A job's file says `running` until shiftover collects it; `ps` says whether
@@ -415,12 +517,23 @@ async function refreshJobs($: EngineInterface): Promise<void> {
   if (isReadingJobs || !(await isVisible($))) return
   isReadingJobs = true
   try {
-    const dir = (await locate($)).jobsDir
+    const at = await locate($)
+    const dir = at.jobsDir
     const all = await readJobs($, dir)
     if (!(await isVisible($))) return
-    const outcomes = await readOutcomes($, dir, all.filter(({ job }) => job.status === 'running'))
-    const pids = all.filter(({ job }) => job.status === 'running' && !outcomes.has(job.id) && job.pid > 0)
-      .map(({ job }) => job.pid)
+    const running = all.filter(({ job }) => job.status === 'running')
+    // A claude job's fallback session is never one an open chat is on: none
+    // is looked for before the chats have been read once.
+    const [held, open] = await Promise.all([read($, accounts), read($, chats)])
+    const paths = chatsObserved ? new Set(open.list.map(chat => chat.transcriptPath)) : null
+    const sources = new Map<string, FileMark>()
+    for (const job of running) {
+      if (!(await isVisible($))) return
+      const source = await stepSource($, dir, job, at.home, held.list, paths)
+      if (source !== undefined) sources.set(job.job.id, source)
+    }
+    const { outcomes, steps } = await readRunning($, dir, running, sources)
+    const pids = running.filter(({ job }) => !outcomes.has(job.id) && job.pid > 0).map(({ job }) => job.pid)
     const live = await livePids($, pids)
     const now = await $.clock.now()
     const isStale = (job: Job): boolean => {
@@ -431,10 +544,12 @@ async function refreshJobs($: EngineInterface): Promise<void> {
       return !(job.startedMs > 0 && age >= 0 && age < UNVERIFIED_RUNNING_MS)
     }
     // An ended .out outranks the process check; its time stops the duration.
+    // Only a job still running carries its step.
     const list = pickJobs(all.map(({ job, out }) => {
       const outcome = outcomes.get(job.id)
       if (outcome !== undefined) return { ...job, status: outcome, finishedMs: job.finishedMs ?? out?.mtimeMs ?? now }
-      return isStale(job) ? { ...job, status: 'stale' } : job
+      if (isStale(job)) return { ...job, status: 'stale' }
+      return job.status === 'running' ? { ...job, step: steps.get(job.id) ?? 'çalışıyor' } : job
     }), now)
     const snapshot = { list, at: now, error: null }
     observeJobs(snapshot, now, await isVisible($))
@@ -516,6 +631,7 @@ async function refreshConversations($: EngineInterface, force = false): Promise<
     if (snapshot !== null) {
       observeChats(snapshot)
       if (!isSame(await read($, chats), snapshot)) await update($, chats, () => snapshot)
+      chatsObserved = true
     }
   } finally {
     isReadingChats = false
@@ -558,11 +674,6 @@ function observeAgents(snapshot: AgentsSnapshot, now: number, animate: boolean):
   motionAgents = snapshot
   agentsObserved = true
   observeTaskMotion(now, animate)
-}
-
-function chatsOf(snapshot: ChatsSnapshot): ChatSession[] {
-  const rank = { waiting: 0, running: 1, idle: 2 }
-  return [...snapshot.list].sort((a, b) => rank[a.status] - rank[b.status])
 }
 
 function observeChats(snapshot: ChatsSnapshot): void {
@@ -628,7 +739,9 @@ async function reconcileMotion($: EngineInterface, repaint = false,
       due(Math.min(...resets))
     }
     const shown = tasksOf(motionJobs, motionAgents).slice(0, CAPSULES_SHOWN)
-    const spinning = shown.some(taskRunning) || chatsRunning || isReadingAccounts
+    // A running job spins in İşler or on its starter chat's row.
+    const spinning = shown.some(taskRunning) || motionJobs.list.some(job => job.status === 'running') ||
+      chatsRunning || isReadingAccounts
     // Each frame lands where every spinner's glyph changes.
     if (spinning) due((Math.floor(now / FRAME_MS) + 1) * FRAME_MS)
     if (chatsWaiting) {
@@ -728,6 +841,8 @@ async function dismissPane($: EngineInterface): Promise<void> {
 
 type Seg = { text: string; color?: Color; dim?: boolean; weight?: TextProps['weight'] }
 type Line = Seg[]
+// A one-line Button drawn under a capsule's own lines.
+type CapsuleRow = { key: string; line: Line; label: string; press: () => void }
 type Gauge = { kind: string; label: string; used: number; reset: string; resetsAtMs: number | null; countdown: string }
 
 const plain = (text: string): Seg => ({ text })
@@ -738,16 +853,18 @@ const chatMarker = (chat: ChatSession, now: number): Seg => chat.status === 'run
   : chat.status === 'waiting' ? { text: '●', color: Math.floor(now / WAITING_BLINK_MS) % 2 === 0 ? 'error' : 'subtle' }
     : { text: '○', color: 'text' }
 
-function delegateBadges(chat: ChatSession, chats: ChatSession[], listed: JobsSnapshot, now: number): Line[] {
-  const groups = new Map<string, number>()
-  const running = listed.list.filter(job => job.status === 'running' && job.account !== '' &&
-    parentChat(job, chats)?.id === chat.id).sort((a, b) => a.startedMs - b.startedMs)
-  for (const job of running) groups.set(job.account, (groups.get(job.account) ?? 0) + 1)
-  const colors: Record<string, Color> = { codex: 'success', aras: 'suggestion', yusa: 'remember', kadir: CURRENT_COLOR }
-  return [...groups].map(([account, count]) => [
-    { text: `${spinner(now)} `, color: colors[account] ?? 'text' },
-    { text: `${account}${count > 1 ? ` ×${count}` : ''}`, color: colors[account] ?? 'text' },
-  ])
+// The running jobs a chat started, oldest first, each a row under the chat:
+// `└ ⠋ <account>  <step>`, the spinner and account in the account's color.
+function delegateRows(chat: ChatSession, chats: ChatSession[], listed: JobsSnapshot, list: Account[],
+  now: number): { job: Job; line: Line }[] {
+  return listed.list.filter(job => job.status === 'running' && parentChat(job, chats)?.id === chat.id)
+    .sort((a, b) => a.startedMs - b.startedMs)
+    .map(job => {
+      const color = ACCOUNT_COLORS[job.account] ?? 'text'
+      return { job, line: [faint('└ '), { text: `${spinner(now)} `, color },
+        { text: job.account === '' ? 'ajan' : displayName(job.account, list), color }, plain('  '),
+        faint(job.step ?? 'çalışıyor')] }
+    })
 }
 
 // Measure display cells, so wide names and emoji do not displace the right
@@ -893,15 +1010,20 @@ function gaugeColumns(gauges: Gauge[], room: number): Line[] {
 }
 
 const listedAccounts = (snapshot: AccountsSnapshot, limits: CodexSnapshot): Account[] =>
-  [...snapshot.list.filter(account => account.name !== 'codex'), { name: 'codex', dir: '',
+  [...snapshot.list.filter(account => account.name !== 'codex'), { name: 'codex', display: null, dir: '',
     limits: limits.limits, err: limits.error }]
+
+// What the pane draws for an account it knows by name: its display name when
+// shiftover sets one. Codex keeps its own.
+const displayName = (name: string, list: Account[]): string =>
+  name === 'codex' ? name : list.find(account => account.name === name)?.display || name
 
 function accountSummary(snapshot: AccountsSnapshot, limits: CodexSnapshot, room: number, now: number): Line {
   const parts = listedAccounts(snapshot, limits).map((account): Line => {
     const current = account.name === snapshot.current
     const used = account.limits.length === 0 ? null : Math.max(...account.limits.map(limit => usedNow(limit, now)))
     return [account.name === 'codex' ? faint('◎ ') : current ? { text: '● ', color: CURRENT_COLOR } : faint('○ '),
-      { text: `${account.name} `, ...(current ? { color: 'text', weight: 'bold' } as const : {}) },
+      { text: `${displayName(account.name, snapshot.list)} `, ...(current ? { color: 'text', weight: 'bold' } as const : {}) },
       { text: used === null ? '?' : `${Math.round(clamp(used, 0, 100))}%`,
         color: used === null ? 'warning' : severity(used), weight: 'bold' }]
   })
@@ -917,7 +1039,8 @@ function accountSummary(snapshot: AccountsSnapshot, limits: CodexSnapshot, room:
 function accountLines(snapshot: AccountsSnapshot, limits: CodexSnapshot, now: number, room: number) {
   const listed = listedAccounts(snapshot, limits)
   const sets = listed.map(account => gaugesOf(account, now))
-  const nameWidth = Math.max(...listed.map(account => textCells(account.name))) + 2
+  const names = listed.map(account => displayName(account.name, snapshot.list))
+  const nameWidth = Math.max(...names.map(textCells)) + 2
   const cellWidth = Math.floor((room - 2 - nameWidth - 4) / 3)
   const labelOf = (gauge: Gauge, arrow: boolean): string => gauge.countdown === ''
     ? gauge.label === '5 saat' ? '5s' : gauge.label : `${arrow ? '↻ ' : ''}${gauge.countdown}`
@@ -934,7 +1057,8 @@ function accountLines(snapshot: AccountsSnapshot, limits: CodexSnapshot, now: nu
     const current = account.name === snapshot.current
     const marker = account.name === 'codex' ? faint('◎ ')
       : current ? { text: '● ', color: CURRENT_COLOR } : faint('○ ')
-    let first: Line = [marker, { text: account.name, ...(current ? { color: 'text', weight: 'bold' } as const : {}) }]
+    const name = names[at] ?? account.name
+    let first: Line = [marker, { text: name, ...(current ? { color: 'text', weight: 'bold' } as const : {}) }]
     const gauges = sets[at] ?? []
     const unreadable = gauges.length === 0
     let body: Line[] = unreadable ? [[{ text: shortError(account.err || 'şu an okunamıyor'), color: 'warning' }]]
@@ -949,7 +1073,7 @@ function accountLines(snapshot: AccountsSnapshot, limits: CodexSnapshot, now: nu
           faint(` ${reset === '' ? 'açılış -' : `${reset} sonra açılır`}`)]
       })
     if (inline) {
-      first.push(plain(' '.repeat(nameWidth - textCells(account.name))))
+      first.push(plain(' '.repeat(nameWidth - textCells(name))))
       if (unreadable) first.push(...body[0]!)
       else first.push(...['session', 'weekly_all', 'weekly_scoped'].flatMap((kind, index) => {
         const gauge = gauges.find(gauge => gauge.kind === kind)
@@ -1016,7 +1140,7 @@ function duration(ms: number): string {
   return minutes < 60 ? `${minutes} dk` : `${Math.floor(minutes / 60)} sa ${minutes % 60} dk`
 }
 
-function taskLines(task: Task, now: number, width: number): [Line, Line] {
+function taskLines(task: Task, now: number, width: number, list: Account[]): [Line, Line] {
   const isJob = task.kind === 'job'
   const id = taskId(task)
   const status = isJob ? task.job.status : agentIsRunning(task.agent) ? 'running'
@@ -1026,7 +1150,7 @@ function taskLines(task: Task, now: number, width: number): [Line, Line] {
   const start = finishedMotion.get(id)
   const title: Seg = { text: label, ...(start !== undefined && now - start < FINISH_MS
     ? { color: status === 'failed' ? 'error' : 'success' } : { color: 'text' }) }
-  const who = isJob ? task.job.account || 'ajan' : 'ajan'
+  const who = isJob && task.job.account !== '' ? displayName(task.job.account, list) : 'ajan'
   const elapsed = isJob
     ? task.job.durationMs ?? ((task.job.finishedMs ?? now) - task.job.startedMs)
     : (task.agent.finishedAt ?? now) - task.agent.observedAt
@@ -1179,14 +1303,16 @@ export const register: Register = on => {
     // Markdown link would lose the runs' colors, take no focus ring and open
     // its URL on a modified click. The pointer still inverts the Button: hover
     // mutes every run, the padding columns included, to one grey block, and
-    // the keyed Box lights the border.
+    // the keyed Box lights the border. Rows below it are Buttons of their own.
     const capsule = (key: string, first: Line, second: Line | undefined, press?: () => void,
-      notes: Line[] = [], capsulePadding = 1, fixedColor?: Color, borderParts: Line[] = []) => {
+      notes: Line[] = [], capsulePadding = 1, fixedColor?: Color, borderParts: Line[] = [], rows: CapsuleRow[] = []) => {
       const room = Math.max(1, capsuleWidth - 2 - 2 * capsulePadding)
       const lines = [first, ...(second === undefined ? [] : [second]), ...notes]
-      // The ring rests on the capsule's one Button, keyed as the capsule.
-      const isFocused = press !== undefined && e.props.isFocused && focusedCapsule === key
-      const borderColor = fixedColor ?? (isFocused ? 'text' : 'subtle')
+      // The ring rests on the capsule's Button, keyed as the capsule, or on a
+      // row's; either lights the border.
+      const isFocused = (target: string): boolean => e.props.isFocused && focusedCapsule === target
+      const isRinged = (press !== undefined && isFocused(key)) || rows.some(row => isFocused(row.key))
+      const borderColor = fixedColor ?? (isRinged ? 'text' : 'subtle')
       const parts = [...borderParts]
       const borderLine = (): Line => [faint(' '), ...parts.flatMap((part, index) =>
         [...(index === 0 ? [] : [faint(' · ')]), ...part]), faint(' ')]
@@ -1195,20 +1321,36 @@ export const register: Register = on => {
       const detail = parts.length === 0 ? [] : borderLine()
       const compact = key.startsWith('account:') ? { gap: 0, paddingY: 0, marginY: 0 } : {}
       const label = first.map(seg => seg.text).join('').replace(/\s+/g, ' ').trim()
-      // Each line padded across, between padding columns of its own Text.
-      const edge = (): RenderChildren[] => capsulePadding === 0 ? []
-        : [<Text {...(isFocused ? { color: MUTED } : {})} hover={muteHover}>{' '.repeat(capsulePadding)}</Text>]
-      const block = lines.flatMap((line, index): RenderChildren[] => {
+      // With a Button inside, every line runs across the padding columns too.
+      const isFlush = press !== undefined || rows.length > 0
+      const side = ' '.repeat(capsulePadding)
+      const across = (line: Line): Line => {
         const fitted = fitLine(line, room)
-        const row = [...fitted, plain(' '.repeat(Math.max(0, room - lineCells(fitted))))]
-        return [...(index === 0 ? [] : ['\n']), ...edge(), draw(isFocused ? muted(row) : row, room, muteHover), ...edge()]
+        return [...fitted, plain(' '.repeat(Math.max(0, room - lineCells(fitted))))]
+      }
+      // A Button's lines sit between padding columns of their own Text.
+      const block = (content: Line[], isMuted: boolean): RenderChildren[] => content.flatMap((line, index) => {
+        const edge = capsulePadding === 0 ? []
+          : [<Text {...(isMuted ? { color: MUTED } : {})} hover={muteHover}>{side}</Text>]
+        const row = across(line)
+        return [...(index === 0 ? [] : ['\n']), ...edge, draw(isMuted ? muted(row) : row, room, muteHover), ...edge]
       })
+      // Each Button has a keyed Box of its own: the pointer inverts and mutes
+      // the one target under it, never its neighbours.
+      const target = (buttonKey: string, buttonLabel: string, onPress: () => void, content: Line[]) => (
+        <Box key={`target:${buttonKey}`} flexDirection="column">
+          <Button key={buttonKey} plain label={buttonLabel} hover={muteHover} onPress={onPress}>
+            {block(content, isFocused(buttonKey))}
+          </Button>
+        </Box>
+      )
       return <Box key={`capsule:${key}`} width={capsuleWidth} flexShrink={0} flexDirection="column" position="relative" {...compact}>
         <Box width={capsuleWidth} flexShrink={0} flexDirection="column" borderStyle="round" borderColor={borderColor}
-          hover={press !== undefined && fixedColor === undefined ? { borderColor: 'text' } : undefined}
-          paddingX={press === undefined ? capsulePadding : 0} {...compact}>
-          {press === undefined ? lines.map(line => draw(fitLine(line, room), room))
-            : <Button key={key} plain label={label} hover={muteHover} onPress={press}>{block}</Button>}
+          hover={isFlush && fixedColor === undefined ? { borderColor: 'text' } : undefined}
+          paddingX={isFlush ? 0 : capsulePadding} {...compact}>
+          {press !== undefined ? target(key, label, press, lines) : lines.map(line => isFlush
+            ? draw([plain(side), ...across(line), plain(side)], capsuleWidth - 2) : draw(fitLine(line, room), room))}
+          {rows.map(row => target(row.key, row.label, row.press, [row.line]))}
         </Box>
         {detail.length === 0 ? null : <Box position="absolute" top={0}
           left={capsuleWidth - 2 - lineCells(detail)} width={lineCells(detail)}>
@@ -1238,7 +1380,8 @@ export const register: Register = on => {
       const tasks = tasksOf(listed, roster)
       // Every account shares the capsule's padded inner width.
       const accountRows = accountLines(held, limits, now, capsuleRoom)
-      const conversationList = chatsOf(conversations)
+      // A refresh orders the chats; drawing keeps that order.
+      const conversationList = conversations.list
       // Pane.scroll is an engine-owned window over this entire tree.
       const chatRows = conversationList.map(chat => {
         const glyph = chatMarker(chat, now)
@@ -1247,15 +1390,24 @@ export const register: Register = on => {
         const line = chat.isCurrent ? fitLine(title, capsuleRoom) : align(title, [faint('›')], capsuleRoom)
         const state = chat.isCurrent ? 'bu sekme' : chat.status === 'waiting' ? 'cevap bekliyor'
           : chat.status === 'running' ? 'çalışıyor' : 'boşta'
-        const metadata = [chat.account, chat.model, chat.effort].filter(part => part && !/^[-–]$/.test(part)).join(' · ')
+        const metadata = [displayName(chat.account, held.list), chat.model, chat.effort]
+          .filter(part => part && !/^[-–]$/.test(part)).join(' · ')
+        // Each running job the chat started opens a tab that follows it live.
+        const delegates = delegateRows(chat, conversationList, listed, held.list, now).map(({ job, line: row }) => ({
+          key: `follow:${job.id}`, line: row, label: row.map(seg => seg.text).join('').replace(/\s+/g, ' ').trim(),
+          press: async () => {
+            const at = await locate($).catch(() => null)
+            if (at !== null) await followJob($, chat, job.id, at.bin)
+          },
+        }))
         return capsule(`chat:${chat.id}`, line, [faint(metadata || ' ')],
           chat.isCurrent ? undefined : () => focusChat($, chat), [[faint(state)]], 1,
           chat.isCurrent ? CURRENT_COLOR : chat.status === 'waiting'
             ? now % WAITING_BORDER_MS < WAITING_BORDER_FLASH_MS ? 'error' : 'subtle' : undefined,
-          delegateBadges(chat, conversationList, listed, now))
+          [], delegates)
       })
       const jobRows = tasks.slice(0, CAPSULES_SHOWN).map(task => {
-        const [title, metadata] = taskLines(task, now, capsuleRoom)
+        const [title, metadata] = taskLines(task, now, capsuleRoom, held.list)
         return capsule(taskId(task), title, metadata, async () => {
           if (!(await isVisible($))) return
           if (task.kind === 'agent') await $.ui.view({ agentId: task.agent.id })

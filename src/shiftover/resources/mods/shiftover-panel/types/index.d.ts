@@ -21,7 +21,10 @@ export type Limit = {
  * plugin may read $.state, so no email is kept: the pane never shows one.
  */
 export type Account = {
+  /** What jobs and chats name the account by; drawn only without a `display`. */
   name: string
+  /** The name shiftover shows for it (`display`); null when unset. */
+  display: string | null
   /** The account's Claude config directory, absolute. */
   dir: string
   limits: Limit[]
@@ -68,6 +71,9 @@ export type Job = {
   finishedMs: number | null
   durationMs: number | null
   costUsd: number | null
+  /** What a running job does now, in Turkish (`register.tsx düzenleniyor`),
+   * from its live transcript or log; absent once it no longer runs. */
+  step?: string
 }
 
 /**
@@ -96,12 +102,19 @@ export type PaneAgent = {
 }
 export type AgentsSnapshot = { list: PaneAgent[]; at: number; error: string | null }
 export type CodexSnapshot = { limits: Limit[]; at: number; error: string | null }
+/**
+ * One open Claude Code tab. The list keeps waiting chats first, then the rest
+ * by their transcript's last change, newest first.
+ */
 export type ChatSession = {
   id: string
   surfaceId: string
   workspaceId: string
   pid: number
+  /** A `/rename` title, else the tab's title unless a shell's, else Claude's
+   * own title for the chat, else the folder's name. */
   title: string
+  /** The account's `name`; its display name is the accounts list's. */
   account: string
   model: string
   effort: string
