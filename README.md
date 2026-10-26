@@ -77,7 +77,7 @@ spare has 80 % room*, and passes it on. The status line always shows the active 
 (`alex 5h 78% wk 41%`). `shiftover status` prints every account.
 
 **Quality of life.** Directory → account rules, `sync-mcp` to copy local MCP servers between accounts, `doctor`, an
-arrow-key picker (`claude --menu`), English or Turkish messages.
+arrow-key picker (`cl` or `claude --menu`), English or Turkish messages.
 
 ## Side panel
 
@@ -149,7 +149,7 @@ sequenceDiagram
 | `shiftover sync-mcp [--from A] [--to B\|all] [--overwrite]` | copy `mcpServers` definitions between accounts |
 | `shiftover jobs [--show ID] [--cancel ID] [--purge]` | delegate jobs |
 | `shiftover jobs follow ID` | a delegate job's steps as they happen (files edited and read, searches, commands, its messages; no tool output), then a one-line summary when it ends |
-| `shiftover shell-init` | prints the `claude()` / `cl()` shell functions (`cl DIR [--menu] [claude args…]` starts in DIR) |
+| `shiftover shell-init` | prints the `claude()` / `cl()` shell functions (`cl [DIR] [claude args…]` opens the picker, starting in DIR) |
 
 ## Config
 

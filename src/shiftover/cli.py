@@ -469,8 +469,8 @@ def cmd_shell_init(ns) -> int:
              '  claude() { shiftover run "$@"; }',
              '  claude-status() { shiftover status "$@"; }']
     if not ns.no_cl:
-        lines.append('  cl() { if [ -n "${1-}" ] && [ -d "${1-}" ]; then local _d="$1"; shift; shiftover run -C "$_d" "$@"; '
-                     'else shiftover run "$@"; fi; }')
+        lines.append('  cl() { if [ -n "${1-}" ] && [ -d "${1-}" ]; then local _d="$1"; shift; shiftover run --menu -C "$_d" "$@"; '
+                     'else shiftover run --menu "$@"; fi; }')
     lines.append("fi")
     print("\n".join(lines))
     return 0

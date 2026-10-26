@@ -23,14 +23,14 @@ def _capture_run(monkeypatch):
     return seen
 
 
-def test_cl_opens_the_main_flow_and_leaves_the_menu_opt_in(capsys):
+def test_cl_opens_the_picker_and_claude_does_not(capsys):
     cli.cmd_shell_init(argparse.Namespace(no_cl=False))
     init = capsys.readouterr().out
-    assert "--menu" not in init
+    assert 'claude() { shiftover run "$@"; }' in init
     script = ('shiftover() { printf "%s|" "$@"; echo; }\n' + init +
-              '\ncl "$1" --dangerously-skip-permissions\ncl "$1" --menu -x\ncl --menu\ncl -p hi\n')
+              '\ncl "$1" --dangerously-skip-permissions\ncl\ncl -p hi\n')
     out = subprocess.run(["bash", "-c", script, "bash", "/"], capture_output=True, text=True, check=True).stdout
-    assert out.splitlines() == ["run|-C|/|--dangerously-skip-permissions|", "run|-C|/|--menu|-x|", "run|--menu|", "run|-p|hi|"]
+    assert out.splitlines() == ["run|--menu|-C|/|--dangerously-skip-permissions|", "run|--menu|", "run|--menu|-p|hi|"]
 
 
 def test_run_takes_menu_on_either_side_of_chdir(home, tmp_path, monkeypatch):
