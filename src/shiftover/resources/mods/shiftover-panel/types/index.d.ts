@@ -1,13 +1,15 @@
 // The values the shiftover-panel mod keeps in $.state: what the pane draws.
 
 /**
- * One usage window of an account, as `shiftover status --json` reports it.
+ * One usage window from `shiftover status --json` or a Codex rate limit.
  */
 export type Limit = {
-  /** `session` (the 5-hour window), `weekly_all`, or `weekly_scoped`. */
+  /** `session` (5 hours), `weekly_all`, `weekly_scoped`, or Codex `rate_window`. */
   kind: string
   /** The model a `weekly_scoped` window counts (`Fable`); empty otherwise. */
   model: string
+  /** Codex's actual window length, in minutes; absent for Claude windows. */
+  windowMinutes?: number
   /** Percent used, 0 to 100. */
   used: number
   /** When the window resets, in ms since the epoch; null when unknown. */
@@ -23,6 +25,9 @@ export type Account = {
   /** The account's Claude config directory, absolute. */
   dir: string
   limits: Limit[]
+  /** The server's next usage read and last fetch, in ms; absent on older shiftover. */
+  nextRefreshAtMs?: number | null
+  fetchedAtMs?: number | null
   /** Why shiftover could not read the limits; null when it could. */
   err: string | null
 }
@@ -51,11 +56,15 @@ export type Job = {
   model: string
   label: string
   /** `running`, `done`, `failed`, `cancelled`, or `stale`: still `running`
-   * in its file while its process is gone. */
+   * in its file while its process is gone. `done` or `failed` also when its
+   * `.out` ended before its file says so. */
   status: string
   pid: number
+  /** The starter's session and Claude pid; absent in older job files. */
+  parentSessionId?: string
+  parentPid?: number
   startedMs: number
-  /** Null while the job runs. */
+  /** Null while the job runs; the `.out`'s time when only it shows the end. */
   finishedMs: number | null
   durationMs: number | null
   costUsd: number | null
@@ -70,33 +79,6 @@ export type JobsSnapshot = {
   at: number
   /** Why the last read failed; null when it succeeded. */
   error: string | null
-}
-
-/** Only the summary figures the pane draws, without engine-only metadata. */
-export type SessionSnapshot = {
-  usage: {
-    startedAt: number
-    context: { tokens?: number; window: number; percent?: number; breakdown?: { totalTokens: number } }
-    cost?: { usd: number }
-  } | null
-  mcpServers: number | null
-  at: number
-  error: string | null
-}
-
-/** Per-response accounting; turn aggregates must never be counted twice. */
-export type UsageTotals = {
-  startedAt: number | null
-  input: number
-  output: number
-  cacheRead: number
-  cacheWrite: number
-  responses: number
-  usageResponses: number
-  responseIds: string[]
-  activeMs: number
-  turns: number
-  turnIds: string[]
 }
 
 export type PaneAgent = {
@@ -120,6 +102,8 @@ export type ChatSession = {
   pid: number
   title: string
   account: string
+  model: string
+  effort: string
   status: 'waiting' | 'running' | 'idle'
   isCurrent: boolean
   transcriptPath: string
@@ -132,8 +116,7 @@ declare module 'claude-code' {
       accounts: Shaped<AccountsSnapshot>
       jobs: Shaped<JobsSnapshot>
       isDismissed: boolean
-      session: Shaped<SessionSnapshot>
-      totals: Shaped<UsageTotals>
+      isAccountsOpen: boolean
       agents: Shaped<AgentsSnapshot>
       codex: Shaped<CodexSnapshot>
       chats: Shaped<ChatsSnapshot>

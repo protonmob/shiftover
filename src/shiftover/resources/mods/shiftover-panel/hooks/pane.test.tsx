@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
-import type { AgentInfo, On, SessionUsage, TurnUsage } from 'claude-code'
-import { chatStatus, parsePanels, parseSessions, parseWorkspaces } from './sessions'
+import type { AgentInfo, On } from 'claude-code'
+import { chatStatus, formatModelId, parsePanels, parseSessions, parseTranscriptTail, parseWorkspaces } from './sessions'
 
 const PANE = {
   plugin: 'shiftover-panel', component: 'Pane', requestId: 'shiftover-panel',
@@ -27,10 +27,12 @@ const iso = (ms: number): string => new Date(ms).toISOString()
 const spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 type RawLimit = { kind: string; model: string; used: number; resets_at: string | null }
-type RawAccount = { name: string; email: string; dir: string; err?: string; limits?: RawLimit[] }
+type RawAccount = { name: string; email: string; dir: string; err?: string; limits?: RawLimit[];
+  next_refresh_at?: number | string | null; fetched_at?: number | string | null }
 type RawJob = {
   id: string; account: string; model: string | null; label: string; cwd?: string; status: string;
   pid: number; started: number; finished: number; cost_usd: number | null; duration_ms: number | null;
+  parent_session_id?: string; parent_pid?: number; backend?: string;
 }
 const STATUS: RawAccount[] = [
   { name: 'kadir', email: '', dir: `${HOME}/.claude`, err: 'HTTP 401 (token expired)' },
@@ -49,10 +51,6 @@ const DONE: RawJob = {
   status: 'done', pid: 79123, started: (NOW - 3_600_000) / 1000, finished: (NOW - 3_590_000) / 1000,
   cost_usd: 0.0052, duration_ms: 454_686,
 }
-const USAGE: SessionUsage = { startedAt: NOW - 3_600_000, context: { window: 1_000_000, tokens: 40_300, percent: 4 },
-  rateLimits: [], cost: { usd: 0.32 } }
-const TOKENS: TurnUsage = { model: 'claude-fable', input_tokens: 4_000, output_tokens: 300,
-  cache_read_input_tokens: 34_000, cache_creation_input_tokens: 2_000 }
 const CONFIG_TEXT = 'main = "kadir"\n[accounts.kadir]\ndir = "~/.claude"\n[accounts.aras]\ndir = "~/.claude-aras"\n'
 const rawSession = (surfaceId: string, pid: number, extra: Record<string, unknown> = {}) => ({
   surfaceId, workspaceId: WS, pid, agentLifecycle: 'idle', runtimeStatus: 'idle', hookEventName: 'Stop',
@@ -68,13 +66,18 @@ const ran = (exitCode: number, stdout: string, stderr = '') => ({
 type ProcessCall = { argv: readonly string[]; timeoutMs?: number }
 type World = {
   isOpen: boolean; isPlaced: boolean; jobsRevision: number; sessionsRevision: number;
-  accountsGate: Promise<void> | null; isShiftoverDown: boolean; isJobsDown: boolean; isJobGone: boolean;
+  accountsGate: Promise<void> | null; isShiftoverDown: boolean; isJobsDown: boolean;
   jobPsFailure: 'deny' | 'exit' | 'stderr' | null;
   isFocusDown: boolean; hasCmux: boolean; accounts: RawAccount[]; jobs: RawJob[]; agents: AgentInfo[];
   sessions: Record<string, unknown>; panels: { id: string; title: string }[]; alivePids: Set<number>;
-  codexFiles: Map<string, { mtimeMs: number; text: string }>; grepMatches: string[];
+  codexFiles: Map<string, { mtimeMs: number; text: string }>;
+  chatFiles: Map<string, { mtimeMs: number; text: string; size?: number }>; openColumns: number[];
+  // Job processes as `ps` reports them, job .out files by job id, and the
+  // transcript text grep searches.
+  processes: Map<number, { stat: string; command: string }>;
+  outs: Map<string, { mtimeMs: number; text: string; size?: number }>; transcripts: Map<string, string>;
   calls: ProcessCall[]; reads: string[]; usageCalls: unknown[]; agentCalls: number; toasts: string[]; views: unknown[];
-  usage: SessionUsage; stepUsage: TurnUsage | null; stepStopped: boolean; snapshots: Map<string, unknown>;
+  snapshots: Map<string, unknown>; store: Map<string, unknown>; storeReads: string[];
 }
 
 // Every external operation is answered here, including click commands. No test
@@ -82,7 +85,7 @@ type World = {
 function world(on: On, env: Record<string, string> = {}, isPlaced = true): World {
   const state: World = {
     isOpen: false, isPlaced, jobsRevision: 1, sessionsRevision: 1, accountsGate: null,
-    isShiftoverDown: false, isJobsDown: false, isJobGone: false, isFocusDown: false, hasCmux: true,
+    isShiftoverDown: false, isJobsDown: false, isFocusDown: false, hasCmux: true,
     jobPsFailure: null,
     accounts: STATUS, jobs: [RUNNING, DONE], agents: [], panels: PANELS,
     sessions: {
@@ -92,10 +95,13 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
       'waiting-session': rawSession(WAITING, 1002, { agentLifecycle: 'needsInput', hookEventName: 'Notification' }),
       'closed-session': rawSession(CLOSED, 1005), 'dead-session': rawSession(DEAD, 1006),
     },
-    alivePids: new Set([1001, 1002, 1003, 1004]), codexFiles: new Map(), grepMatches: [],
-    calls: [], reads: [], usageCalls: [], agentCalls: 0, toasts: [], views: [], usage: USAGE,
-    stepUsage: TOKENS, stepStopped: true, snapshots: new Map(),
+    alivePids: new Set([1001, 1002, 1003, 1004]), codexFiles: new Map(),
+    chatFiles: new Map(), openColumns: [],
+    processes: new Map([[4242, { stat: 'S', command: '/opt/bin/codex exec -' }]]), outs: new Map(), transcripts: new Map(),
+    calls: [], reads: [], usageCalls: [], agentCalls: 0, toasts: [], views: [], snapshots: new Map(), store: new Map(), storeReads: [],
   }
+  on('store.get', (_, e) => { state.storeReads.push(e.key); return { value: state.store.get(e.key) } })
+  on('store.set', (_, e) => { state.store.set(e.key, e.value); return { value: undefined } })
   mock.env(on, { HOME, CMUX_SURFACE_ID: CURRENT, ...env })
   on('state.set', async (_, e, next) => {
     const result = await next(e)
@@ -106,14 +112,8 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
   on('command.run', () => ({ text: 'engine' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'current-session' }))
-  on('turn.complete', (_, e) => ({ text: e.answer }))
-  on('turn.step', async function* (_, e) {
-    const usage = state.stepUsage
-    const stopReason = state.stepStopped ? 'end_turn' as const : null
-    yield { kind: 'stop' as const, stopReason, usage }
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason, usage }
-  })
-  on('ui.open', () => {
+  on('ui.open', (_, e) => {
+    if (e.columns !== undefined) state.openColumns.push(e.columns)
     state.isOpen = true
     return { value: state.isPlaced ? { isPlaced: true } : { isPlaced: false, reason: 'below 144 columns' } }
   })
@@ -122,7 +122,7 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
     isShown: true, isFocused: false, isPlaced: state.isPlaced }] : [] }))
   on('ui.toast', (_, e) => { state.toasts.push(e.text); return { value: undefined } })
   on('ui.view', (_, e) => { state.views.push(e); return { value: {} } })
-  on('session.usage', (_, e) => { state.usageCalls.push(e); return { value: state.usage } })
+  on('session.usage', (_, e) => { state.usageCalls.push(e); return { deny: 'session usage is unused by the pane' } })
   on('agent.list', () => { state.agentCalls += 1; return { value: state.agents } })
   on('fs.exists', (_, e) => {
     state.reads.push(`exists:${e.path}`)
@@ -130,15 +130,20 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
   })
   on('fs.stat', (_, e) => {
     state.reads.push(`stat:${e.path}`)
+    const file = state.chatFiles.get(e.path)
+    if (file) return { value: { kind: 'file', size: file.size ?? file.text.length, mtimeMs: file.mtimeMs, isLink: false } }
+    if (e.path.startsWith('/transcripts/')) return { deny: 'transcript unavailable' }
     return { value: { kind: 'file', size: 100, mtimeMs: state.sessionsRevision, isLink: false } }
   })
   on('fs.list', (_, e) => {
     state.reads.push(`list:${e.path}`)
     if (e.path === JOBS) {
       if (state.isJobsDown) return { deny: 'jobs unavailable' }
-      return { value: [...state.jobs.map(job => `${job.id}.json`), 'ignored.out'].map(name => ({
+      return { value: [...[...state.jobs.map(job => `${job.id}.json`), 'ignored.out'].map(name => ({
         name, kind: 'file' as const, size: 100, mtimeMs: state.jobsRevision, isLink: false,
-      })) }
+      })), ...[...state.outs].map(([id, out]) => ({
+        name: `${id}.out`, kind: 'file' as const, size: out.size ?? out.text.length, mtimeMs: out.mtimeMs, isLink: false,
+      }))] }
     }
     return { value: [...state.codexFiles.entries()].filter(([path]) => path.slice(0, path.lastIndexOf('/')) === e.path)
       .map(([path, file]) => ({ name: path.slice(path.lastIndexOf('/') + 1), kind: 'file' as const,
@@ -148,6 +153,8 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
     state.reads.push(`read:${e.path}`)
     if (e.path === CONFIG) return { value: CONFIG_TEXT }
     if (e.path === SESSIONS) return { value: JSON.stringify({ sessions: state.sessions }) }
+    const chat = state.chatFiles.get(e.path)
+    if (chat) return { value: chat.text }
     const codex = state.codexFiles.get(e.path)
     if (codex) return { value: codex.text }
     const job = state.jobs.find(candidate => e.path === `${JOBS}/${candidate.id}.json`)
@@ -159,9 +166,33 @@ function world(on: On, env: Record<string, string> = {}, isPlaced = true): World
       if (e.argv.includes('pid=')) return ran(0, [...state.alivePids].join('\n'))
       if (state.jobPsFailure === 'deny') return { deny: 'ps not permitted' }
       if (state.jobPsFailure !== null) return ran(state.jobPsFailure === 'exit' ? 2 : 1, '', 'ps: operation not permitted\n')
-      return state.isJobGone ? ran(1, '') : ran(0, '4242 /opt/bin/codex exec -\n')
+      // `ps -o pid=,stat=,command=` prints one padded row per live pid and exits 1 with none.
+      const rows = [...new Set((e.argv[e.argv.indexOf('-p') + 1] ?? '').split(','))].flatMap(pid => {
+        const entry = state.processes.get(Number(pid))
+        return entry ? [`${pid.padStart(5)} ${entry.stat.padEnd(4)} ${entry.command}\n`] : []
+      })
+      return ran(rows.length > 0 ? 0 : 1, rows.join(''))
     }
-    if (e.argv[0] === 'grep') return ran(state.grepMatches.length > 0 ? 0 : 1, state.grepMatches.join('\n'))
+    if (e.argv[0] === 'grep') {
+      // `grep -o -H -F -s -e <id>... -- <paths>` prints `path:id` per occurrence;
+      // exit 2 when a file is unreadable, whatever it printed.
+      const end = e.argv.indexOf('--')
+      const patterns = e.argv.slice(1, end).filter((_, index, args) => args[index - 1] === '-e')
+      let isMissing = false
+      const found: string[] = []
+      for (const path of e.argv.slice(end + 1)) {
+        const text = state.transcripts.get(path)
+        if (text === undefined) { isMissing = true; continue }
+        for (const pattern of patterns) found.push(...Array.from({ length: text.split(pattern).length - 1 }, () => `${path}:${pattern}\n`))
+      }
+      return ran(isMissing ? 2 : found.length > 0 ? 0 : 1, found.join(''))
+    }
+    if (e.argv[0] === 'tail') {
+      const path = e.argv[e.argv.length - 1]!
+      const out = path.startsWith(`${JOBS}/`) && path.endsWith('.out') ? state.outs.get(path.slice(JOBS.length + 1, -4)) : undefined
+      const file = out ?? state.chatFiles.get(path)
+      return file ? ran(0, file.text.slice(-Number(e.argv[2]))) : ran(1, '', 'transcript unavailable')
+    }
     if (e.argv[1] === 'list-workspaces') return ran(0, `* workspace:1 ${WS} Main\n`)
     if (e.argv[1] === 'list-panels') return ran(0, state.panels.map((panel, index) =>
       `surface:${index + 1} ${panel.id} terminal ${index === 0 ? '[focused] ' : ''}${JSON.stringify(panel.title)}`).join('\n'))
@@ -177,7 +208,7 @@ const paneRows = async (ui: Pick<Mounted, 'drawn'>): Promise<string[]> => {
   const rows = (node: unknown): string[] => {
     if (typeof node !== 'object' || node === null) return []
     const current = node as { type?: string; children?: unknown[] }
-    if (current.type === 'Text') return [shownText(node)]
+    if (current.type === 'Text' || current.type === 'Button') return contentRows(node)
     return (current.children ?? []).flatMap(rows)
   }
   return rows(await ui.drawn())
@@ -196,7 +227,7 @@ const cells = (text: string): number => [...graphemes.segment(text)].reduce((sum
   return sum + (/\p{Emoji_Presentation}|\uFE0F|[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff01-\uff60\uffe0-\uffe6]/u.test(part.segment) ? 2 : 1)
 }, 0)
 const padRow = (text: string, width: number): string => text + ' '.repeat(Math.max(0, width - cells(text)))
-type DrawnNode = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+type DrawnNode = { type?: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
 const drawnNodes = (value: unknown): DrawnNode[] => {
   if (typeof value !== 'object' || value === null) return []
   const node = value as DrawnNode
@@ -208,6 +239,7 @@ function laidOutRows(value: unknown, available: number): string[] {
   const props = node.props ?? {}
   if (props.display === 'none') return []
   if (node.type === 'Text') return [shownText(node)]
+  if (node.type === 'Button') return shownText(node).split('\n')
   const width = typeof props.width === 'number' ? props.width : available
   const border = typeof props.borderStyle === 'string' ? 1 : 0
   const left = Number(props.paddingLeft ?? props.paddingX ?? props.padding ?? 0)
@@ -252,19 +284,124 @@ function laidOutRows(value: unknown, available: number): string[] {
   }
   return padded
 }
+// Cell rectangles in document order, under laidOutRows's model: absolute
+// children sit at their parent's origin plus top and left.
+type Rect = { node: DrawnNode; x: number; y: number; w: number; h: number }
+function layoutRects(value: unknown, available: number, x = 0, y = 0): Rect[] {
+  if (typeof value !== 'object' || value === null) return []
+  const node = value as DrawnNode
+  const props = node.props ?? {}
+  if (props.display === 'none') return []
+  if (node.type === 'Text' || node.type === 'Button') {
+    const lines = shownText(node).split('\n')
+    return [{ node, x, y, w: Math.max(...lines.map(cells)), h: lines.length }]
+  }
+  const width = typeof props.width === 'number' ? props.width : available
+  const border = typeof props.borderStyle === 'string' ? 1 : 0
+  const left = Number(props.paddingLeft ?? props.paddingX ?? props.padding ?? 0)
+  const right = Number(props.paddingRight ?? props.paddingX ?? props.padding ?? 0)
+  const top = Number(props.paddingTop ?? props.paddingY ?? props.padding ?? 0)
+  const inside = Math.max(0, width - 2 * border - left - right)
+  const children = (node.children ?? []) as (DrawnNode | null)[]
+  const isAbsolute = (child: DrawnNode | null): boolean => child?.props?.position === 'absolute'
+  const fixedWidth = (child: DrawnNode | null): number | undefined =>
+    typeof child?.props?.width === 'number' ? child.props.width : undefined
+  const flow = children.filter(child => !isAbsolute(child))
+  const isRow = props.flexDirection === 'row'
+  const gap = Number(props.columnGap ?? props.gap ?? 0)
+  const share = Math.max(0, Math.floor((inside - flow.reduce((sum, child) => sum + (fixedWidth(child) ?? 0), 0) -
+    gap * Math.max(0, flow.length - 1)) / Math.max(1, flow.filter(child => fixedWidth(child) === undefined).length)))
+  let cursor = isRow ? x + border + left : y + border + top
+  const nested = children.flatMap(child => {
+    if (isAbsolute(child)) {
+      const at = Number(child?.props?.left ?? 0)
+      return layoutRects(child, Math.max(0, width - at), x + at, y + Number(child?.props?.top ?? 0))
+    }
+    const placed = isRow ? layoutRects(child, share, cursor, y + border + top)
+      : layoutRects(child, inside, x + border + left, cursor)
+    cursor += isRow ? (fixedWidth(child) ?? share) + gap : laidOutRows(child, inside).length
+    return placed
+  })
+  return [{ node, x, y, w: width, h: laidOutRows(node, available).length }, ...nested]
+}
+// An absolute Box paints over what precedes it and takes the pointer there:
+// it must never cover a Button drawn before it.
+function coveredButtons(tree: unknown, width: number): string[] {
+  const rects = layoutRects(tree, width)
+  return rects.flatMap((button, index) => button.node.type !== 'Button' ? [] : rects.slice(index + 1)
+    .filter(box => box.node.type === 'Box' && box.node.props?.position === 'absolute' &&
+      !drawnNodes(box.node).includes(button.node) && box.x < button.x + button.w && button.x < box.x + box.w &&
+      box.y < button.y + button.h && button.y < box.y + box.h)
+    .map(box => `${String(button.node.props?.key)} under ${shownText(box.node)}`))
+}
+const absoluteParents = (tree: unknown): DrawnNode[] => drawnNodes(tree).filter(node =>
+  (node.children ?? []).some(child => (child as DrawnNode | null)?.props?.position === 'absolute'))
+const isUnpadded = (node: DrawnNode): boolean => ['padding', 'paddingX', 'paddingY', 'paddingTop', 'paddingBottom',
+  'paddingLeft', 'paddingRight'].every(name => Number(node.props?.[name] ?? 0) === 0)
 const capsules = (tree: unknown): DrawnNode[] => drawnNodes(tree).filter(node =>
-  node.type === 'Box' && node.props?.borderStyle === 'round' &&
-  laidOutRows(node, Number(node.props.width ?? 0)).length === 4)
+  node.type === 'Box' && /^capsule:(chat|job|agent):/.test(String(node.props?.key)))
 const capsuleFor = (tree: unknown, title: string): DrawnNode | undefined =>
   capsules(tree).find(node => shownText(node).includes(title))
 const accountCapsule = (tree: unknown, name: string): DrawnNode | undefined => drawnNodes(tree).find(node =>
   node.type === 'Box' && node.props?.borderStyle === 'round' && node.props?.borderColor === 'subtle' &&
-  ['●', '○', '◎'].some(marker => contentRows(node)[0] === `${marker} ${name}`))
+  ['●', '○', '◎'].some(marker => contentRows(node)[0] === `${marker} ${name}` ||
+    contentRows(node)[0]?.startsWith(`${marker} ${name} `)))
+const accountsCard = (tree: unknown): DrawnNode | undefined => drawnNodes(tree).find(node =>
+  node.type === 'Box' && node.props?.position === 'relative' && shownText(node).includes('Hesaplar'))
+const accountFrame = (tree: unknown, name: string): DrawnNode | undefined => drawnNodes(tree).find(node =>
+  node.type === 'Box' && node.props?.key === `capsule:account:${name}`)
+const resetOverlay = (tree: unknown, name: string): DrawnNode | undefined =>
+  (accountFrame(tree, name)?.children as DrawnNode[] | undefined)?.find(node => node.props?.position === 'absolute')
+const capsuleBorder = (tree: unknown, title: string): DrawnNode | undefined =>
+  drawnNodes(capsuleFor(tree, title)).find(node => node.type === 'Box' && node.props?.borderStyle === 'round')
+const borderOverlay = (frame: DrawnNode | undefined): DrawnNode | undefined =>
+  (frame?.children as DrawnNode[] | undefined)?.find(node =>
+    node.type === 'Box' && node.props?.position === 'absolute' && node.props.borderStyle === undefined)
+const delegateOverlay = (tree: unknown, title: string): DrawnNode | undefined => borderOverlay(capsuleFor(tree, title))
 const contentRows = (tree: unknown): string[] => {
   if (typeof tree !== 'object' || tree === null) return []
   const node = tree as DrawnNode
-  return node.type === 'Text' ? [shownText(node)] : (node.children ?? []).flatMap(contentRows)
+  // A line Button pads its row to the capsule's width; the content is what
+  // precedes that padding, including intentionally aligned spaces.
+  if (node.type === 'Button') return [shownText(node).trimEnd()]
+  if (node.type === 'Text') return [shownText(node)]
+  return (node.children ?? []).flatMap(contentRows)
 }
+const accountRoom = (capsule: DrawnNode): number => Number(capsule.props?.width) - 2 - 2 * Number(capsule.props?.paddingX ?? 0)
+function expectLimitColumns(capsule: DrawnNode, limits: readonly { label: string; percent: number }[]): void {
+  const rows = contentRows(capsule)
+  const room = accountRoom(capsule)
+  const width = Math.floor((room - limits.length + 1) / limits.length)
+  const bars = [...(rows[3] ?? '').matchAll(/━+/g)]
+  expect(bars.map(bar => cells(bar[0]))).toEqual(limits.map(() => width))
+  for (const [index, entry] of limits.entries()) {
+    const start = bars[index]!.index
+    if (index > 0) expect(start - bars[index - 1]!.index).toBe(width + 1)
+    const label = rows[1]!.slice(start, start + width)
+    const percent = rows[2]!.slice(start, start + width)
+    expect(label.trim()).toBe(entry.label === '5 saat' && width < 6 ? '5s' : entry.label)
+    expect(percent.trim()).toBe(`${entry.percent}%`)
+    for (const value of [label, percent]) {
+      const before = value.length - value.trimStart().length
+      const after = value.length - value.trimEnd().length
+      expect(Math.abs(before - after)).toBeLessThanOrEqual(1)
+    }
+  }
+  expect(rows.slice(1, 4).every(row => cells(row) <= room)).toBe(true)
+}
+const lineButtons = (tree: unknown): DrawnNode[] => drawnNodes(tree).filter(node => node.type === 'Button')
+const grepCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'grep')
+const jobPsCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'ps' && !call.argv.includes('pid='))
+const tailCalls = (state: World) => state.calls.filter(call => call.argv[0] === 'tail')
+// A transcript the starter search finds: one row naming each delegate id.
+const mention = (state: World, path: string, ...ids: string[]): void => {
+  state.transcripts.set(path, ids.map(id => JSON.stringify({ type: 'user', message: { content: `delegate ${id} started` } })).join('\n'))
+}
+const OPEN_TRANSCRIPTS = ['/transcripts/1002.jsonl', '/transcripts/1003.jsonl', '/transcripts/1001.jsonl', '/transcripts/1004.jsonl']
+const starterSearch = (...ids: string[]): string[] =>
+  ['grep', '-o', '-H', '-F', '-s', ...ids.flatMap(id => ['-e', id]), '--', ...OPEN_TRANSCRIPTS]
+const badge = (name: string): RegExp => new RegExp(`^ [${spinner}] ${name} $`)
+const codexLine = (type: string): string => JSON.stringify({ type })
 const start = async ($: Engine, clock: { settle: () => Promise<void>; advance: (ms: number) => Promise<void> }) => {
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await clock.settle()
@@ -298,17 +435,17 @@ function observedClock(on: On) {
   return { ...clock, waits: () => [...waits] }
 }
 
-test('four compact cards and their round capsules render on every surface without wrapped rows', async ($, on) => {
+test('three compact cards and their round capsules render on every surface without wrapped rows', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); world(on)
   await start($, clock)
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    for (const title of ['Oturum', 'Hesaplar', 'Sohbetler', 'İşler']) {
+    for (const title of ['Hesaplar ▾', 'Sohbetler', 'İşler']) {
       expect(await rowText(ui, new RegExp(title))).toBeDefined()
       expect((await ui.findAll({ type: 'Text', text: new RegExp(`^ ${title} $`) })).some(node => node.props.weight === 'bold' && node.props.color === 'text')).toBe(true)
     }
     const cards = (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round' && box.props.width === 42)
-    expect(cards).toHaveLength(4)
+    expect(cards).toHaveLength(3)
     expect(cards.every(card => card.props.paddingX === 1)).toBe(true)
     expect(await rowText(ui, /^yeniden giriş gerekli$/)).toBeDefined()
     expect(await rowText(ui, /ads review/)).toMatch(/ads review.*›$/)
@@ -323,158 +460,58 @@ test('four compact cards and their round capsules render on every surface withou
   }
 })
 
-test('the session card uses local summary usage, API value, memory bar, and unavailable totals', async ($, on) => {
+test('the pane starts with Hesaplar, has no Oturum card, and never reads session usage', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(state.usageCalls).toEqual([{ breakdown: 'summary' }])
-  expect(await rowText(ui, /^API değeri$/)).toBeDefined()
-  expect(await rowText(ui, /^sohbet boyu$/)).toBeDefined()
-  expect(await rowText(ui, /önbellek/)).toBeDefined()
-  expect(await rowText(ui, /\$0\.32/)).toBeDefined()
-  expect(await rowText(ui, /hafıza %4/)).toBeDefined()
-  expect((await ui.findAll({ type: 'Text', text: /^-$/ })).length).toBeGreaterThanOrEqual(2)
+  for (const elapsed of [0, 60_000]) {
+    await clock.advance(elapsed)
+    expect((await paneRows(ui)).join('')).not.toMatch(/Oturum/)
+    expect(laidOutRows(await ui.drawn(), 42)[0]).toMatch(/Hesaplar/)
+    expect(state.usageCalls).toHaveLength(0)
+  }
   await ui.unmount()
 })
 
-test('session stats preserve full labels and values in three, two plus one, or single capsule rows', async ($, on) => {
+test('every account and Codex bar uses fixed whole heavy-line cells with severity and subtle colors', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  state.usage = { ...USAGE, cost: { usd: 123456789.12 } }
-  await start($, clock)
-  for await (const _chunk of $.turn.step({ turnId: 'stats', index: 0, model: 'claude-fable', messageCount: 1 })) { /* exact totals */ }
-  for (const [width, grouping] of [[42, [2, 1]], [32, [1, 1, 1]], [60, [3]]] as const) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
-    const tree = await ui.drawn()
-    const stats = ['sohbet boyu', 'API değeri', 'önbellek'].map(label => capsuleFor(tree, label)!)
-    expect(stats).toHaveLength(3)
-    for (const [index, stat] of stats.entries()) {
-      expect(stat).toBeDefined()
-      expect(stat.props).toMatchObject({ borderColor: 'subtle', paddingX: 1, flexShrink: 0 })
-      const rows = contentRows(stat)
-      expect(rows).toEqual([['40.3k', '$123456789.12', '%85'][index], ['sohbet boyu', 'API değeri', 'önbellek'][index]])
-      const room = Number(stat.props?.width) - 4
-      expect(rows.every(row => cells(row) <= room && !row.includes('…'))).toBe(true)
-      const texts = drawnNodes(stat).filter(node => node.type === 'Text')
-      expect(texts.some(node => node.props?.weight === 'bold')).toBe(true)
-      expect(texts.some(node => node.props?.dimColor === true)).toBe(true)
-    }
-    const rows = laidOutRows(tree, width)
-    const labelRows = rows.filter(row => /sohbet boyu|API değeri|önbellek/.test(row))
-    expect(labelRows.map(row => ['sohbet boyu', 'API değeri', 'önbellek'].filter(label => row.includes(label)).length)).toEqual([...grouping])
-    expect(rows.filter(row => cells(row) > width)).toEqual([])
-    const memoryAt = rows.findIndex(row => /hafıza %4/.test(row))
-    expect(memoryAt).toBeGreaterThan(rows.findIndex(row => /önbellek/.test(row)))
-    await ui.unmount()
-  }
-})
-
-test('every account, Codex and memory bar uses fixed whole heavy-line cells with severity and subtle colors', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  state.accounts = oneAccount([limit(5), limit(73, 'weekly_all'), limit(96, 'weekly_scoped', 'Fable')])
+  state.accounts = oneAccount([limit(5), limit(75, 'weekly_all'), limit(96, 'weekly_scoped', 'Fable')])
   state.jobs = []; state.sessions = {}
   state.codexFiles.set(`${CODEX}/rates.jsonl`, { mtimeMs: 1, text: rateLine(
     { used_percent: 50, window_minutes: 300, resets_at: NOW / 1000 + 3600 },
     { used_percent: 90, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
   await start($, clock)
-  for (const width of [42, 32, 60]) {
+  for (const width of [32, 42, 58]) {
     const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const rows = await paneRows(ui)
     expect(rows.join('')).not.toMatch(/[▏▎▍▌▋▊▉█░▁▇]/)
     const tree = await ui.drawn()
-    const account = contentRows(accountCapsule(tree, 'kadir'))[1]!
-    const codex = contentRows(accountCapsule(tree, 'codex'))[1]!
+    const account = contentRows(accountCapsule(tree, 'kadir'))[3]!
     const accountBox = accountCapsule(tree, 'kadir')!
-    const accountRoom = Number(accountBox.props?.width) - 2 - 2 * Number(accountBox.props?.paddingX ?? 0)
-    const miniCells = Math.floor((accountRoom - 2) / 3) - 5
-    expect(account.match(/━+/g)?.map(bar => bar.length)).toEqual([miniCells, miniCells, miniCells])
-    expect(codex.match(/━+/g)?.map(bar => bar.length)).toEqual([miniCells, miniCells])
+    expectLimitColumns(accountBox, [{ label: '5 saat', percent: 5 }, { label: 'hafta', percent: 75 }, { label: 'Fable', percent: 96 }])
+    // Codex's 5-hour window resets in an hour: its label is that countdown.
+    expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: '↻ 1sa 0dk', percent: 50 }, { label: 'hafta', percent: 90 }])
     const bars = await ui.findAll({ type: 'Text', text: /^━+$/ })
     expect(bars.length).toBeGreaterThan(5)
     expect(bars.every(bar => ['success', 'warning', 'error', 'subtle'].includes(String(bar.props.color)))).toBe(true)
-    expect(bars.some(bar => bar.props.color === 'subtle')).toBe(true)
-    const lines = await ui.findAll({ type: 'Text', text: /^━+$/ })
-    expect(lines.some(line => line.text.length === Math.round((width - 4 - 'hafıza %100'.length - 1) * .04) && line.props.color === 'success')).toBe(true)
+    for (const color of ['success', 'warning', 'error', 'subtle']) expect(bars.some(bar => bar.props.color === color)).toBe(true)
     await clock.advance(2000)
-    expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]).toBe(account)
+    expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[3]).toBe(account)
     await ui.unmount()
   }
 })
 
-test('context bars keep the same cell count across percent digit boundaries and missing usage', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
-  state.usage = { ...USAGE, context: { ...USAGE.context, percent: 9 } }
-  await start($, clock)
-  for (const width of [42, 32]) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
-    for (const percent of [9, 10, 100, null]) {
-      state.usage = percent === null ? { ...USAGE, context: { window: USAGE.context.window } } : { ...USAGE, context: { ...USAGE.context, percent } }
-      await clock.advance(10_000)
-      const row = (await paneRows(ui)).find(line => /hafıza/.test(line))!
-      expect(row.match(/━/g)).toHaveLength(width - 4 - 12)
-      expect(cells(row)).toBe(width - 4)
-      expect(row).toMatch(percent === null ? /hafıza -$/ : new RegExp(`hafıza %${percent}$`))
-      expect(laidOutRows(await ui.drawn(), width).filter(line => cells(line) > width)).toEqual([])
-    }
-    await ui.unmount()
-  }
-})
-
-test('session usage and agents refresh every ten seconds only while placed', async ($, on) => {
+test('agents refresh every ten seconds only while placed', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
   await clock.advance(9000)
-  expect(state.usageCalls).toHaveLength(2)
   expect(state.agentCalls).toBe(2)
   state.isPlaced = false
   await clock.advance(30_000)
-  expect(state.usageCalls).toHaveLength(2)
   expect(state.agentCalls).toBe(2)
-  expect(state.usageCalls.every(call => (call as { breakdown: string }).breakdown === 'summary')).toBe(true)
 })
 
-test('per-response token and cache totals deduplicate stop/result, repeated steps, and turn aggregates', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  state.usage = { ...USAGE, context: { ...USAGE.context, tokens: 12_345 } }
-  await start($, clock)
-  const step = { turnId: 'turn-1', index: 0, model: 'claude-fable', messageCount: 2 }
-  for await (const _chunk of $.turn.step(step)) { /* Drain the response, including its stop chunk. */ }
-  for await (const _chunk of $.turn.step(step)) { /* A replay must not add usage again. */ }
-  await $.turn.complete({ turnId: 'turn-1', answer: '', durationMs: 500, isAborted: false, reason: 'answer', usage: TOKENS })
-  const total = state.snapshots.get('totals')
-  expect(total).toMatchObject({ shape: 'totals-1', value: { input: 4000, output: 300, cacheRead: 34000,
-    cacheWrite: 2000, responses: 1, usageResponses: 1, turns: 1, activeMs: 500 } })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await rowText(ui, /40\.3k/)).toBeDefined()
-  expect(await rowText(ui, /12\.3k/)).toBeUndefined()
-  expect(await rowText(ui, /%85/)).toBeDefined()
-  expect(state.usageCalls).toHaveLength(2)
-  await ui.unmount()
-})
-
-test('main and agent responses have distinct identities and missing usage keeps totals unavailable', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  await start($, clock)
-  const step = { turnId: 'same-turn', index: 0, model: 'claude-fable', messageCount: 2 }
-  for await (const _chunk of $.turn.step(step)) { /* main response */ }
-  for await (const _chunk of $.turn.step({ ...step, agentId: 'agent-1' })) { /* agent response */ }
-  state.stepUsage = null
-  for await (const _chunk of $.turn.step({ ...step, index: 1 })) { /* unreported response */ }
-  const total = state.snapshots.get('totals')
-  expect(total).toMatchObject({ shape: 'totals-1', value: { responses: 3, usageResponses: 2, input: 8000, cacheRead: 68000 } })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.findAll({ type: 'Text', text: /^-$/ })).length).toBeGreaterThanOrEqual(2)
-  await ui.unmount()
-})
-
-test('an interrupted request with neither response nor usage adds no response', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  await start($, clock); state.stepUsage = null; state.stepStopped = false
-  for await (const _chunk of $.turn.step({ turnId: 'interrupted', index: 0, model: 'claude-fable', messageCount: 1 })) { /* no response */ }
-  const total = state.snapshots.get('totals')
-  expect(total).toMatchObject({ shape: 'totals-1', value: { responses: 0, usageResponses: 0 } })
-})
-
-test('every account has its own round capsule with a name, ordered cells, and only critical reset notes', async ($, on) => {
+test('every account has its own round capsule with a name, ordered mini columns, and only critical reset notes', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.accounts = [
     ...oneAccount([
@@ -493,25 +530,25 @@ test('every account has its own round capsule with a name, ordered cells, and on
     expect(capsule.props).toMatchObject({ borderStyle: 'round', borderColor: 'subtle', paddingX: 1, width: 38 })
     const rows = contentRows(capsule)
     expect(rows[0]).toMatch(new RegExp(`[●○◎] ${name}$`))
-    expect(rows).toHaveLength(name === 'kadir' ? 3 : 2)
-    expect(laidOutRows(capsule, 38)).toHaveLength(name === 'kadir' ? 5 : 4)
+    const height = name === 'kadir' ? 5 : name === 'aras' ? 4 : 2
+    expect(rows).toHaveLength(height)
+    expect(laidOutRows(capsule, 38)).toHaveLength(height + 2)
   }
   const kadir = accountCapsule(tree, 'kadir')!
   const rows = contentRows(kadir)
-  expect(rows[1]).toMatch(/5%.*73%.*96%/)
-  expect(rows[1]?.match(/━{5}/g)).toHaveLength(3)
-  expect(rows[2]).toBe('Fable 2g 18sa sonra açılır')
+  expectLimitColumns(kadir, [{ label: '5 saat', percent: 5 }, { label: 'hafta', percent: 73 }, { label: 'Fable', percent: 96 }])
+  expect(rows[4]).toBe('Fable 2g 18sa sonra açılır')
   expect((await paneRows(ui)).filter(row => /sonra açılır$/.test(row))).toEqual(['Fable 2g 18sa sonra açılır'])
   const name = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === 'kadir')
   expect(name?.props).toMatchObject({ color: 'text', weight: 'bold' })
-  const limitName = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === 'Fable')
-  expect(limitName?.props).toMatchObject({ color: 'error', dimColor: true })
+  const limitName = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === 'Fable' && node.props?.color === 'error')
+  expect(limitName?.props).toMatchObject({ color: 'error', weight: 'bold' })
   const note = drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === ' 2g 18sa sonra açılır')
   expect(note?.props?.dimColor).toBe(true)
   await ui.unmount()
 })
 
-test('critical notes remain complete at 32 columns and compact reset time only when the row needs it', async ($, on) => {
+test('critical notes compact reset time before truncating and never overflow narrow capsules', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.accounts = [
     ...oneAccount([{ ...limit(95), resets_at: iso(NOW + 300 * 60_000) }]),
@@ -523,29 +560,29 @@ test('critical notes remain complete at 32 columns and compact reset time only w
     ] },
   ]; state.jobs = []; state.sessions = {}
   await start($, clock)
-  for (const width of [32, 42, 60]) {
+  for (const width of [32, 42, 58]) {
     const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     for (const [name, note] of [
       ['kadir', width === 32 ? '5 saat 4sa sonra açılır' : '5 saat 4sa 59dk sonra açılır'],
-      ['aras', width === 32 ? '5 saat 2g18sa sonra açılır' : '5 saat 2g 18sa sonra açılır'],
-      ['yusa', 'Fable 2g 18sa sonra açılır'],
+      ['aras', width === 32 ? '5 saat 2g18sa sonra açı…' : '5 saat 2g 18sa sonra açılır'],
+      ['yusa', width === 32 ? 'Fable 2g18sa sonra açıl…' : 'Fable 2g 18sa sonra açılır'],
     ] as const) {
       const capsule = accountCapsule(tree, name)!
       const rows = contentRows(capsule)
-      expect(rows).toHaveLength(3)
-      expect(rows[2]).toBe(note)
-      expect(rows[2]).not.toMatch(/…|[\r\n—]/)
+      expect(rows).toHaveLength(5)
+      expect(rows[4]).toBe(note)
+      expect(rows[4]).not.toMatch(/[\r\n—]/)
       const room = Number(capsule.props?.width) - 2 - 2 * Number(capsule.props?.paddingX ?? 0)
       expect(cells(note)).toBeLessThanOrEqual(room)
-      expect(laidOutRows(capsule, width - 4)).toHaveLength(5)
+      expect(laidOutRows(capsule, width - 4)).toHaveLength(7)
     }
     expect(laidOutRows(tree, width).filter(row => cells(row) > width)).toEqual([])
     await ui.unmount()
   }
 })
 
-test('several critical limits still use only one third capsule line for the highest usage', async ($, on) => {
+test('several critical limits use one note after the bars for the highest usage', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.accounts = oneAccount(['session', 'weekly_all', 'weekly_scoped'].map((kind, index) => ({
     ...limit(90 + index, kind, kind === 'weekly_scoped' ? 'Fable' : ''), resets_at: iso(NOW + 67 * 3_600_000 + 60_000),
@@ -554,12 +591,12 @@ test('several critical limits still use only one third capsule line for the high
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const capsule = accountCapsule(await ui.drawn(), 'kadir')!
   const rows = contentRows(capsule)
-  expect(rows).toHaveLength(3)
-  expect(rows[2]).toBe('Fable 2g 19sa sonra açılır')
+  expect(rows).toHaveLength(5)
+  expect(rows[4]).toBe('Fable 2g 19sa sonra açılır')
   expect((await paneRows(ui)).filter(row => /sonra açılır$/.test(row))).toHaveLength(1)
   expect((await ui.findAll({ type: 'Text', text: /^Fable$/ }))
-    .some(name => name.props.color === 'error' && name.props.dimColor === true)).toBe(true)
-  expect(laidOutRows(capsule, 38)).toHaveLength(5)
+    .some(name => name.props.color === 'error' && name.props.weight === 'bold')).toBe(true)
+  expect(laidOutRows(capsule, 38)).toHaveLength(7)
   await ui.unmount()
 })
 
@@ -571,7 +608,7 @@ test('percent severity uses success below 75, warning through 89, and bold error
   for (const [percent, color] of [[74, 'success'], [89, 'warning'], [90, 'error']] as const) {
     const node = await ui.find({ type: 'Text', text: new RegExp(`^ *${percent}%$`) })
     expect(node?.props.color).toBe(color)
-    expect(node?.props.weight).toBe(percent >= 90 ? 'bold' : undefined)
+    expect(node?.props.weight).toBe('bold')
   }
   expect((await ui.findAll({ type: 'Text', text: /^━+$/ })).some(node => node.props.color === 'subtle')).toBe(true)
   await ui.unmount()
@@ -594,45 +631,256 @@ test('current account follows CLAUDE_CONFIG_DIR and warning errors replace only 
   await ui.unmount()
 })
 
-test('missing account windows display dim dashes under fixed Turkish table headers', async ($, on) => {
+test('Hesaplar shows only existing limits with their model names and never uses dash placeholders', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  state.accounts = oneAccount([limit(12, 'weekly_scoped', 'Sonnet')]); state.jobs = []
+  state.accounts = [
+    ...oneAccount([limit(12, 'weekly_scoped', 'Sonnet')]),
+    { name: 'aras', email: '', dir: `${HOME}/.claude-aras`, err: 'HTTP 401 (token expired)', limits: [limit(0), limit(43, 'weekly_scoped', 'Fable')] },
+    { name: 'yusa', email: '', dir: `${HOME}/.claude-yusa`, err: 'şu an okunamıyor' },
+  ]; state.jobs = []; state.sessions = {}
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await rowText(ui, /5 saat.*hafta.*Fable/)).toBeDefined()
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]).toMatch(/–.*–.*12%/)
-  expect((await ui.findAll({ type: 'Text', text: /^ *– *$/ })).every(node => node.props.dimColor === true)).toBe(true)
+  const tree = await ui.drawn()
+  expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: 'Sonnet', percent: 12 }])
+  expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 0 }, { label: 'Fable', percent: 43 }])
+  const yusa = accountCapsule(tree, 'yusa')!
+  expect(contentRows(yusa)).toEqual(['○ yusa', 'şu an okunamıyor'])
+  expect(drawnNodes(yusa).some(node => node.type === 'Text' && shownText(node) === 'şu an okunamıyor' && node.props?.color === 'warning')).toBe(true)
+  const card = accountsCard(tree)!
+  expect(card).toBeDefined()
+  expect(shownText(card)).not.toContain('–')
+  expect(shownText(accountCapsule(tree, 'kadir'))).not.toMatch(/5 saat|hafta|Fable/)
   await ui.unmount()
 })
 
-test('account headers end at fixed percent columns across differently sized values', async ($, on) => {
+test('each capsule centers labels and complete percentages over equal columns at 32, 42, and 58 cells', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.accounts = [
     ...oneAccount([limit(5), limit(73, 'weekly_all'), limit(100, 'weekly_scoped', 'Fable')]),
-    { name: 'aras', email: '', dir: `${HOME}/.claude-aras`, limits: [limit(100), limit(8, 'weekly_all'), limit(40, 'weekly_scoped', 'Fable')] },
-  ]
+    { name: 'aras', email: '', dir: `${HOME}/.claude-aras`, limits: [limit(100), limit(40, 'weekly_scoped', 'Fable')] },
+  ]; state.jobs = []; state.sessions = {}
   await start($, clock)
-  for (const width of [42, 32, 60]) {
+  for (const width of [32, 42, 58]) {
     const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
     const tree = await ui.drawn()
     const rows = laidOutRows(tree, width)
     expect(rows.filter(row => /5 saat.*hafta.*Fable/.test(row))).toHaveLength(1)
-    for (const label of ['5 saat', 'hafta', 'Fable']) {
-      expect(drawnNodes(tree).filter(node => node.type === 'Text' && shownText(node) === label && node.props?.dimColor === true && node.props?.color !== 'error')).toHaveLength(1)
+    const kadir = accountCapsule(tree, 'kadir')!
+    const aras = accountCapsule(tree, 'aras')!
+    expectLimitColumns(kadir, [{ label: '5 saat', percent: 5 }, { label: 'hafta', percent: 73 }, { label: 'Fable', percent: 100 }])
+    expectLimitColumns(aras, [{ label: '5 saat', percent: 100 }, { label: 'Fable', percent: 40 }])
+    for (const capsule of [kadir, aras]) {
+      const labels = drawnNodes(capsule).filter(node => node.type === 'Text' && /^(5 saat|5s|hafta|Fable)$/.test(shownText(node)) && node.props?.color !== 'error')
+      expect(labels.every(node => node.props?.dimColor === true)).toBe(true)
+      expect(capsule.props?.paddingX).toBe(1)
     }
-    const header = rows.find(row => /5 saat.*hafta.*Fable/.test(row))!
-    const ends = ['5 saat', 'hafta', 'Fable'].map(label => header.indexOf(label) + label.length)
-    for (const account of ['kadir', 'aras']) {
-      const accountRows = laidOutRows(accountCapsule(tree, account), width - 4)
-      const row = '│ ' + accountRows[2]!
-      expect([...row.matchAll(/\d+%/g)].map(match => match.index + match[0].length)).toEqual(ends)
-    }
+    expect(rows.filter(row => cells(row) > width)).toEqual([])
+    expect(rows.every(row => !/[\r\n—]/.test(row))).toBe(true)
     await ui.unmount()
   }
 })
 
+test('the approved 58-column account fixture has the critical Fable note and no shared header', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.accounts = [
+    ...oneAccount([limit(0), limit(74, 'weekly_all'), {
+      ...limit(96, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + 54 * 3_600_000 + 60_000),
+    }]),
+    { name: 'aras', email: '', dir: `${HOME}/.claude-aras`, limits: [limit(0), limit(43, 'weekly_scoped', 'Fable')] },
+    { name: 'yusa', email: '', dir: `${HOME}/.claude-yusa`, err: 'HTTP 429' },
+  ]; state.jobs = []; state.sessions = {}
+  state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine({ used_percent: 6, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 58 }, surface: 'terminal' })
+  const tree = await ui.drawn()
+  const card = accountsCard(tree)!
+  expect(card).toBeDefined()
+  expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '5 saat', percent: 0 }, { label: 'hafta', percent: 74 }, { label: 'Fable', percent: 96 }])
+  expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 0 }, { label: 'Fable', percent: 43 }])
+  expect(contentRows(accountCapsule(tree, 'kadir'))[4]).toBe('Fable 2g 6sa sonra açılır')
+  expect(contentRows(accountCapsule(tree, 'yusa'))).toEqual(['○ yusa', 'şu an okunamıyor'])
+  expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: 'hafta', percent: 6 }])
+  const preview = laidOutRows(card, 58)
+  expect(preview.every(row => cells(row) === 58)).toBe(true)
+  expect(preview[1]).toMatch(/╭━*|╭─/)
+  expect(shownText(card)).not.toMatch(/–|—|[\r\n]/)
+  await ui.unmount()
+})
+
+test('wide accounts align three inline cells, leave missing limits blank, and indent the critical note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.accounts = [
+    ...oneAccount([limit(2), limit(75, 'weekly_all'), {
+      ...limit(96, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + 52 * 3_600_000 + 60_000),
+    }]),
+    { name: 'aras', email: '', dir: `${HOME}/.claude-aras`, limits: [limit(10), limit(45, 'weekly_scoped', 'Fable')] },
+    { name: 'yusa', email: '', dir: `${HOME}/.claude-yusa`, err: 'HTTP 429' },
+  ]; state.jobs = []; state.sessions = {}
+  state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine({ used_percent: 1, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
+  await start($, clock)
+  for (const width of [76, 96]) {
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface })
+      const tree = await ui.drawn()
+      const kadir = accountCapsule(tree, 'kadir')!
+      const room = accountRoom(kadir)
+      const cellWidth = Math.floor((room - 9 - 4) / 3)
+      const starts = [9, 9 + cellWidth + 2, 9 + 2 * (cellWidth + 2)]
+      const expected = [
+        ['kadir', '● kadir  ', [['5s', 2], ['hafta', 75], ['Fable', 96]]],
+        ['aras', '○ aras   ', [['5s', 10], null, ['Fable', 45]]],
+        ['codex', '◎ codex  ', [null, ['hafta', 1], null]],
+      ] as const
+      for (const [name, prefix, limits] of expected) {
+        const capsule = accountCapsule(tree, name)!
+        const rows = contentRows(capsule)
+        expect(rows).toHaveLength(name === 'kadir' ? 2 : 1)
+        expect(rows[0]!.slice(0, 9)).toBe(prefix)
+        for (const [index, entry] of limits.entries()) {
+          const cell = rows[0]!.slice(starts[index], starts[index]! + cellWidth)
+          if (entry === null) expect(cell).toBe(' '.repeat(cellWidth))
+          else {
+            const [label, used] = entry
+            const barWidth = cellWidth - label.length - 6
+            expect(barWidth).toBeGreaterThanOrEqual(6)
+            expect(cell).toBe(`${label} ${'━'.repeat(barWidth)} ${`${used}%`.padStart(4)}`)
+          }
+        }
+      }
+      expect(contentRows(kadir)[1]).toBe('  Fable 2g 4sa sonra açılır')
+      const yusa = accountCapsule(tree, 'yusa')!
+      expect(contentRows(yusa)).toEqual(['○ yusa   şu an okunamıyor'])
+      expect(drawnNodes(yusa).some(node => node.type === 'Text' && shownText(node) === 'şu an okunamıyor' && node.props?.color === 'warning')).toBe(true)
+      for (const color of ['success', 'warning', 'error', 'subtle']) expect(
+        drawnNodes(accountsCard(tree)).some(node => node.type === 'Text' && /^━+$/.test(shownText(node)) && node.props?.color === color)).toBe(true)
+      expect(shownText(accountsCard(tree))).not.toMatch(/–|—|[▏▎▍▌▋▊▉█░▁▇]/)
+      expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+      await ui.unmount()
+    }
+  }
+  const narrow = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const tree = await narrow.drawn()
+  expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '5 saat', percent: 2 }, { label: 'hafta', percent: 75 }, { label: 'Fable', percent: 96 }])
+  expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 10 }, { label: 'Fable', percent: 45 }])
+  expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: 'hafta', percent: 1 }])
+  expect(contentRows(accountCapsule(tree, 'kadir'))[4]).toBe('Fable 2g 4sa sonra açılır')
+  expect(contentRows(accountCapsule(tree, 'yusa'))).toEqual(['○ yusa', 'şu an okunamıyor'])
+  await narrow.unmount()
+})
+
 const rateLine = (primary: { used_percent: number; window_minutes: number; resets_at: number }, secondary?: typeof primary): string =>
   JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { primary, secondary } } })
+
+// MARK: - 5-hour countdowns
+
+const countdownAccounts = (sessionAt: number | null): RawAccount[] => [
+  ...oneAccount([{ ...limit(12), resets_at: sessionAt === null ? null : iso(NOW + sessionAt) },
+    limit(40, 'weekly_all'), limit(60, 'weekly_scoped', 'Fable')]),
+  { name: 'aras', email: '', dir: '/aras', limits: [limit(20), limit(30, 'weekly_all'), limit(35, 'weekly_scoped', 'Fable')] },
+  { name: 'yusa', email: '', dir: '/yusa', limits: [{ ...limit(25), resets_at: iso(NOW - 60_000) },
+    limit(45, 'weekly_all'), limit(55, 'weekly_scoped', 'Fable')] },
+]
+
+test('5-hour columns show their reset countdown with an arrow where it fits, else bare, else truncated', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = countdownAccounts(108 * 60_000)
+  state.codexFiles.set(`${CODEX}/rates.jsonl`, { mtimeMs: 1, text: rateLine(
+    { used_percent: 15, window_minutes: 300, resets_at: NOW / 1000 + 35 * 60 },
+    { used_percent: 5, window_minutes: 10080, resets_at: NOW / 1000 + 50 * 3600 }) })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const [width, label] of [[42, '↻ 1sa 48dk'], [38, '1sa 48dk'], [32, '1sa 48…']] as const) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    const kadir = accountCapsule(tree, 'kadir')!
+    expectLimitColumns(kadir, [{ label, percent: 12 }, { label: 'hafta', percent: 40 }, { label: 'Fable', percent: 60 }])
+    expect(drawnNodes(kadir).find(node => node.type === 'Text' && shownText(node) === label)?.props).toMatchObject({ dimColor: true })
+    // A missing or passed reset keeps the window's name.
+    expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 20 }, { label: 'hafta', percent: 30 }, { label: 'Fable', percent: 35 }])
+    expectLimitColumns(accountCapsule(tree, 'yusa')!, [{ label: '5 saat', percent: 25 }, { label: 'hafta', percent: 45 }, { label: 'Fable', percent: 55 }])
+    expectLimitColumns(accountCapsule(tree, 'codex')!, [{ label: '↻ 35dk', percent: 15 }, { label: 'hafta', percent: 5 }])
+    expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+    await ui.unmount()
+  }
+  // Too narrow for the name, a fallback still shortens to 5s.
+  const tiny = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 24 }, surface: 'terminal' })
+  expect(contentRows(accountCapsule(await tiny.drawn(), 'aras'))[1]!.trim()).toMatch(/^5s /)
+  await tiny.unmount()
+})
+
+test('wide inline cells give 5-hour countdowns one shared slot so bars line up, bare when the arrow does not fit', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = [
+    ...oneAccount([{ ...limit(12), resets_at: iso(NOW + 108 * 60_000) }, limit(40, 'weekly_all'), limit(60, 'weekly_scoped', 'Fable')]),
+    { name: 'aras', email: '', dir: '/aras', limits: [{ ...limit(30), resets_at: iso(NOW + 35 * 60_000) }, limit(45, 'weekly_scoped', 'Fable')] },
+    { name: 'yusa', email: '', dir: '/yusa', limits: [{ ...limit(8), resets_at: iso(NOW - 60_000) }, limit(20, 'weekly_all')] },
+  ]
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const [width, labels] of [
+    [96, { kadir: '↻ 1sa 48dk', aras: '↻ 35dk', yusa: '5s' }], [86, { kadir: '1sa 48dk', aras: '35dk', yusa: '5s' }],
+  ] as const) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    const cellWidth = Math.floor((accountRoom(accountCapsule(tree, 'kadir')!) - 9 - 4) / 3)
+    const starts = [9, 9 + cellWidth + 2, 9 + 2 * (cellWidth + 2)]
+    const slot = labels.kadir.length
+    const cell = (label: string, used: number, size = label.length) =>
+      `${label.padEnd(size)} ${'━'.repeat(cellWidth - size - 6)} ${`${used}%`.padStart(4)}`
+    for (const [name, used, rest] of [
+      ['kadir', 12, [cell('hafta', 40), cell('Fable', 60)]], ['aras', 30, [' '.repeat(cellWidth), cell('Fable', 45)]],
+      ['yusa', 8, [cell('hafta', 20), ' '.repeat(cellWidth)]],
+    ] as const) {
+      const rows = contentRows(accountCapsule(tree, name))
+      expect(rows).toHaveLength(1)
+      expect(starts.map(at => rows[0]!.slice(at, at + cellWidth))).toEqual([cell(labels[name], used, slot), ...rest])
+      // Every session bar starts in the same column.
+      expect(rows[0]!.indexOf('━')).toBe(9 + slot + 1)
+    }
+    expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('at 76 columns a 5-hour countdown under an hour stays inline and a longer one falls back to columns', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = countdownAccounts(59 * 60_000 + 30_000).slice(0, 2)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  let tree = await ui.drawn()
+  const room = accountRoom(accountCapsule(tree, 'kadir')!)
+  expect(Math.floor((room - 9 - 4) / 3)).toBe(18)
+  expect(contentRows(accountCapsule(tree, 'kadir'))).toEqual([
+    `● kadir  ↻ 59dk ${'━'.repeat(6)}  12%  hafta ${'━'.repeat(7)}  40%  Fable ${'━'.repeat(7)}  60%`])
+  expect(contentRows(accountCapsule(tree, 'aras'))[0]!.slice(9, 27)).toBe(`5s     ${'━'.repeat(6)}  20%`)
+  state.accounts = countdownAccounts(108 * 60_000 + 60_000).slice(0, 2)
+  await clock.advance(60_000)
+  tree = await ui.drawn()
+  expect(contentRows(accountCapsule(tree, 'kadir'))).toHaveLength(4)
+  expectLimitColumns(accountCapsule(tree, 'kadir')!, [{ label: '↻ 1sa 48dk', percent: 12 }, { label: 'hafta', percent: 40 }, { label: 'Fable', percent: 60 }])
+  expectLimitColumns(accountCapsule(tree, 'aras')!, [{ label: '5 saat', percent: 20 }, { label: 'hafta', percent: 30 }, { label: 'Fable', percent: 35 }])
+  expect(laidOutRows(tree, 76).every(row => cells(row) <= 76)).toBe(true)
+  await ui.unmount()
+})
+
+test('a 5-hour countdown changes on the minute boundary with no timer of its own', async ($, on) => {
+  const clock = observedClock(on); const redraws: number[] = []
+  on('ui.invalidate', { event: 'ui.render' }, async (_, e, next) => { redraws.push(clock.now()); return next(e) })
+  const state = world(on); idle(state)
+  state.accounts = oneAccount([{ ...limit(10), resets_at: iso(NOW + 35 * 60_000) }])
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(67); redraws.length = 0
+  const label = async () => contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]?.trim()
+  expect(await label()).toBe('↻ 35dk')
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 59_933 }])
+  expect(clock.waits().filter(wait => wait.ms < 10_000)).toHaveLength(0)
+  await clock.advance(59_932)
+  expect(redraws).toHaveLength(0)
+  expect(await label()).toBe('↻ 35dk')
+  await clock.advance(101)
+  expect(await label()).toBe('↻ 34dk')
+  expect(clock.waits().filter(wait => wait.ms < 10_000)).toHaveLength(0)
+  await ui.unmount()
+})
 
 test('Codex reads the newest JSONL last rate_limits and maps primary 10080 to the weekly column', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
@@ -647,19 +895,47 @@ test('Codex reads the newest JSONL last rate_limits and maps primary 10080 to th
     { kind: 'weekly_all', used: 77 }, { kind: 'session', used: 16 },
   ] } })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'codex'))[1]).toMatch(/16%.*77%.*–/)
+  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '↻ 1sa 0dk', percent: 16 }, { label: 'hafta', percent: 77 }])
   expect(state.reads.filter(path => path === `read:${CODEX}/older.jsonl`)).toHaveLength(0)
   await ui.unmount()
 })
 
-test('Codex searches at most seven dated folders and shows missing limits when none exists', async ($, on) => {
+test('Codex renders only hafta for a 10080-minute primary window and never adds a model column', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.accounts = []; state.jobs = []; state.sessions = {}
+  state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine({ used_percent: 6, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
+  await start($, clock)
+  for (const width of [32, 42, 58]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const capsule = accountCapsule(await ui.drawn(), 'codex')!
+    expectLimitColumns(capsule, [{ label: 'hafta', percent: 6 }])
+    expect(contentRows(capsule)).toHaveLength(4)
+    expect(shownText(capsule)).not.toMatch(/5 saat|5s|Fable|–/)
+    expect(laidOutRows(await ui.drawn(), width).every(row => cells(row) <= width)).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('Codex labels other readable windows by their rounded day count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.accounts = []; state.jobs = []; state.sessions = {}
+  state.codexFiles.set(`${CODEX}/custom.jsonl`, { mtimeMs: 1, text: rateLine({ used_percent: 24, window_minutes: 2880, resets_at: NOW / 1000 + 3600 }) })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expectLimitColumns(accountCapsule(await ui.drawn(), 'codex')!, [{ label: '2 gün', percent: 24 }])
+  await ui.unmount()
+})
+
+test('Codex searches at most seven dated folders and shows a warning instead of unreadable limits', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   state.accounts = []; state.jobs = []
   await start($, clock)
   const dirs = state.reads.filter(path => path.startsWith(`list:${HOME}/.codex/sessions/`))
   expect(dirs).toHaveLength(7)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'codex'))[1]).toMatch(/–.*–.*–/)
+  const capsule = accountCapsule(await ui.drawn(), 'codex')!
+  expect(contentRows(capsule)).toEqual(['◎ codex', 'şu an okunamıyor'])
+  expect(drawnNodes(capsule).some(node => node.type === 'Text' && shownText(node) === 'şu an okunamıyor' && node.props?.color === 'warning')).toBe(true)
   await ui.unmount()
 })
 
@@ -675,7 +951,9 @@ test('accounts and Codex refresh once a minute and preserve successful data afte
   expect(statusCalls(state)).toHaveLength(2)
   expect(state.reads.filter(path => path.startsWith(`list:${HOME}/.codex/`))).toHaveLength(firstCodexLists * 2)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[1]).toMatch(/10%.*75%.*92%/)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[2]).toMatch(/10%.*75%.*92%/)
+  // The kept 5-hour window still counts down: 202 minutes, one gone.
+  expect(contentRows(accountCapsule(await ui.drawn(), 'aras'))[1]?.trim()).toMatch(/^↻ 3sa 21dk /)
   expect(await rowText(ui, /tvOSBrowser/)).toBeDefined()
   await ui.unmount()
 })
@@ -684,7 +962,7 @@ test('session records are filtered by open panel and alive PID, and use cmux tit
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
   const chats = state.snapshots.get('chats')
-  expect(chats).toMatchObject({ shape: 'chats-1', value: { list: [
+  expect(chats).toMatchObject({ shape: 'chats-2', value: { list: [
     { id: 'waiting-session', title: 'Needs approval', status: 'waiting', account: 'kadir' },
     { id: 'runner-session', title: 'Analysis tab', status: 'running' },
     { id: 'current-session', title: 'Current tab', isCurrent: true },
@@ -693,34 +971,40 @@ test('session records are filtered by open panel and alive PID, and use cmux tit
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /Dead process|Closed tab/)).toBeUndefined()
   expect(await rowText(ui, /Current tab/)).not.toMatch(/›/)
-  expect(await rowText(ui, /kadir · bu sekme/)).toBeDefined()
-  expect(await ui.find({ type: 'Button', key: 'chat:current-session' })).toBeUndefined()
+  expect(await rowText(ui, /^bu sekme$/)).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'chat:current-session:0' })).toBeUndefined()
   expect(cmuxCalls(state, 'list-workspaces')).toHaveLength(1)
   expect(cmuxCalls(state, 'list-panels')).toHaveLength(1)
-  expect(state.calls.filter(call => call.argv[0] === 'grep')).toHaveLength(0)
+  // The parentless running delegate's starter search covers open tabs only.
+  expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
   await ui.unmount()
 })
 
-test('each chat has a self-contained two-line round capsule, with an arrow only when pressable', async ($, on) => {
+test('each chat has a self-contained three-line round capsule, with an arrow only when pressable', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const tree = await ui.drawn()
   const expected = [
-    ['Needs approval', 'kadir · cevap bekliyor', true],
-    ['Analysis tab', 'kadir · çalışıyor', true],
-    ['Current tab', 'kadir · bu sekme', false],
-    ['Idle tab', 'aras · boşta', true],
+    ['Needs approval', 'kadir', 'cevap bekliyor', true],
+    ['Analysis tab', 'kadir', 'çalışıyor', true],
+    ['Current tab', 'kadir', 'bu sekme', false],
+    ['Idle tab', 'aras', 'boşta', true],
   ] as const
-  for (const [title, metadata, pressable] of expected) {
+  for (const [title, metadata, status, pressable] of expected) {
     const capsule = capsuleFor(tree, title)!
     expect(capsule).toBeDefined()
-    expect(capsule.props).toMatchObject({ borderStyle: 'round', borderColor: 'subtle', paddingX: 1 })
+    expect(capsule.props).toMatchObject({ width: 38, flexDirection: 'column' })
     const rows = laidOutRows(capsule, 38)
-    expect(rows).toHaveLength(4)
+    expect(rows).toHaveLength(5)
     expect(rows[1]).toMatch(new RegExp(title))
     expect(rows[1]?.includes('›')).toBe(pressable)
     expect(rows[2]).toMatch(new RegExp(metadata))
+    expect(rows[3]).toMatch(new RegExp(status))
+    expect(rows[0]).toBe(`╭${'─'.repeat(36)}╮`)
+    expect(rows[4]).toBe(`╰${'─'.repeat(36)}╯`)
+    for (const text of [metadata, status]) expect(drawnNodes(capsule).some(node =>
+      node.type === 'Text' && shownText(node) === text && node.props?.dimColor === true)).toBe(true)
     const titleNode = await ui.find({ type: 'Text', text: new RegExp(`^${title}$`) })
     expect(titleNode?.props.color).toBe('text')
     expect(titleNode?.props.weight).toBe(title === 'Needs approval' ? 'bold' : undefined)
@@ -729,10 +1013,217 @@ test('each chat has a self-contained two-line round capsule, with an arrow only 
   const first = rows.findIndex(row => /Needs approval/.test(row))
   const second = rows.findIndex(row => /Analysis tab/.test(row))
   const third = rows.findIndex(row => /Current tab/.test(row))
-  expect(second - first).toBe(4)
-  expect(third - second).toBe(4)
+  expect(second - first).toBe(5)
+  expect(third - second).toBe(5)
   expect(await rowText(ui, /sohbet daha/)).toBeUndefined()
   expect(await rowText(ui, /Idle tab/)).toBeDefined()
+  await ui.unmount()
+})
+
+test('model IDs format families, version digits, context suffixes and date stamps', async () => {
+  for (const [id, display] of [
+    ['claude-opus-5-5', 'Opus 5.5'], ['claude-fable-5-1', 'Fable 5.1'],
+    ['claude-sonnet-5-5[1m]', 'Sonnet 5.5'], ['claude-haiku-5-5-20261001', 'Haiku 5.5'],
+    ['claude-unknown-6-2-20261001[1m]', 'Unknown 6.2'], ['claude-opus-5-5[1m]-20261001', 'Opus 5.5'],
+    ['claude-newfamily-7', 'Newfamily 7'], ['', ''],
+  ]) expect(formatModelId(id!)).toBe(display)
+})
+
+const assistantLine = (model: string, effort?: string): string => JSON.stringify({ type: 'assistant', message: { model }, effort })
+
+test('transcript tails scan backwards, ignore partial lines and take model and effort from the last assistant', async () => {
+  const earlier = assistantLine('claude-fable-5-1', 'low')
+  const last = assistantLine('claude-opus-5-5', 'xhigh')
+  expect(parseTranscriptTail([earlier, '{broken', last, JSON.stringify({ type: 'user' }), '{partial'].join('\n')))
+    .toEqual({ model: 'claude-opus-5-5', effort: 'xhigh' })
+  expect(parseTranscriptTail([last, assistantLine('claude-haiku-5-5')].join('\n')))
+    .toEqual({ model: 'claude-haiku-5-5', effort: '' })
+  expect(parseTranscriptTail(`truncated first line\n${earlier}\n${last}\n`, true))
+    .toEqual({ model: 'claude-opus-5-5', effort: 'xhigh' })
+  expect(parseTranscriptTail(last, true)).toEqual({ model: '', effort: '' })
+  expect(parseTranscriptTail('not JSON\n{"type":"user"}\n')).toEqual({ model: '', effort: '' })
+})
+
+for (const [account, model, effort, expected] of [
+  ['kadir', 'claude-opus-5-5', 'xhigh', 'kadir · Opus 5.5 · xhigh'],
+  ['kadir', 'claude-fable-5-1', '', 'kadir · Fable 5.1'],
+  ['kadir', '', 'max', 'kadir · max'],
+  ['', 'claude-sonnet-5-5', 'high', 'Sonnet 5.5 · high'],
+  ['', 'claude-haiku-5-5', '', 'Haiku 5.5'], ['', '', 'medium', 'medium'], ['', '', '', ''],
+] as const) {
+  test(`chat metadata omits missing parts cleanly: ${expected || 'all unknown'}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+    state.sessions = { metadata: rawSession(IDLE, 1004, { launchCommand: { environment: {
+      CLAUDE_CONFIG_DIR: account ? `${HOME}/.claude` : `${HOME}/.unmapped`,
+    } } }) }
+    state.chatFiles.set('/transcripts/1004.jsonl', { mtimeMs: 1, text: assistantLine(model, effort) })
+    await start($, clock)
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+    const capsule = capsuleFor(await ui.drawn(), 'Idle tab')!
+    const rows = laidOutRows(capsule, 72)
+    expect(rows).toHaveLength(5)
+    expect(rows[2]!.slice(2, -2).trimEnd()).toBe(expected)
+    expect(rows[2]).not.toMatch(/–| ·  · | · +│/)
+    expect(drawnNodes(capsule).some(node => node.type === 'Text' && shownText(node) === (expected || ' ') && node.props?.dimColor === true)).toBe(true)
+    await ui.unmount()
+  })
+}
+
+test('chat metadata reads only transcript tails, caches size and mtime, and sees model switches without a cmux refresh', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.sessions = { metadata: rawSession(IDLE, 1004) }
+  const path = '/transcripts/1004.jsonl'
+  const cachePath = `${HOME}/.cache/shiftover/sessions/metadata.json`
+  const file = { mtimeMs: 1, text: `${'x'.repeat(300_000)}\n${assistantLine('claude-opus-5-5', 'xhigh')}\n` }
+  state.chatFiles.set(path, file)
+  state.chatFiles.set(cachePath, { mtimeMs: 1, text: JSON.stringify({ model: { id: 'claude-fable-5-1', display_name: 'Fable 5.1' } }) })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  expect(await rowText(ui, /^kadir · Fable 5.1 · xhigh$/)).toBeDefined()
+  const tails = () => state.calls.filter(call => call.argv[0] === 'tail')
+  expect(tails().map(call => call.argv)).toEqual([['tail', '-c', '262144', '--', path]])
+  expect(state.reads).not.toContain(`read:${path}`)
+  state.chatFiles.set(cachePath, { mtimeMs: 2, text: JSON.stringify({ model: { id: 'claude-opus-5-5', display_name: 'Opus switched' } }) })
+  await clock.advance(9000)
+  expect(await rowText(ui, /^kadir · Opus switched · xhigh$/)).toBeDefined()
+  expect(tails()).toHaveLength(1)
+  expect(cmuxCalls(state, 'list-workspaces')).toHaveLength(1)
+  file.text = file.text.replace('"xhigh"', '"high"') + ' '
+  file.mtimeMs += 1
+  await clock.advance(10_000)
+  expect(await rowText(ui, /^kadir · Opus switched · high$/)).toBeDefined()
+  expect(tails()).toHaveLength(2)
+  file.text += `\n${assistantLine('claude-haiku-5-5', 'low')}`
+  state.chatFiles.delete(cachePath)
+  await clock.advance(10_000)
+  expect(await rowText(ui, /^kadir · Haiku 5.5 · low$/)).toBeDefined()
+  expect(tails()).toHaveLength(3)
+  state.chatFiles.delete(path)
+  await clock.advance(10_000)
+  expect(contentRows(capsuleFor(await ui.drawn(), 'Idle tab')).includes('kadir')).toBe(true)
+  expect(tails()).toHaveLength(3)
+  await ui.unmount()
+})
+
+test('every line of a clickable capsule is its own full-width Button inside the flowing frame on every surface', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  mention(state, '/transcripts/1003.jsonl', RUNNING.id)
+  await start($, clock)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    for (const [key, title, height] of [
+      ['chat:waiting-session', 'Needs approval', 5], [`job:${RUNNING.id}`, 'ads review', 4],
+    ] as const) {
+      const capsule = capsuleFor(await ui.drawn(), title)!
+      const buttons = lineButtons(capsule)
+      expect(buttons.map(button => button.props?.key)).toEqual(Array.from({ length: height - 2 }, (_, line) => `${key}:${line}`))
+      for (const button of buttons) {
+        expect(button.props).toMatchObject({ plain: true })
+        expect(String(button.props?.label)).toContain(title)
+        // One row, padded across the 34 content cells, all of it pressable.
+        expect(shownText(button).split('\n')).toHaveLength(1)
+        expect(cells(shownText(button))).toBe(34)
+      }
+      const frame = capsuleBorder(capsule, title)!
+      expect(frame.props?.position).toBeUndefined()
+      expect((capsule.children ?? [])[0]).toBe(frame)
+      const rows = laidOutRows(capsule, 38)
+      expect(rows).toHaveLength(height)
+      expect(rows[0]).toBe(`╭${'─'.repeat(36)}╮`)
+      expect(rows[height - 1]).toBe(`╰${'─'.repeat(36)}╯`)
+      expect(rows.every(row => cells(row) === 38)).toBe(true)
+      expect(rows[1]).toContain(title)
+      expect(coveredButtons(await ui.drawn(), 42)).toEqual([])
+      const before = actionCalls(state).length
+      await ui.press({ key: `${key}:0` })
+      expect(actionCalls(state)).toHaveLength(before + 2)
+    }
+    expect(drawnNodes(capsuleFor(await ui.drawn(), 'Current tab')).some(node => node.type === 'Button')).toBe(false)
+    await ui.unmount()
+  }
+})
+
+test('no absolute Box covers a Button, and every overlay hangs from a borderless, unpadded frame', async ($, on) => {
+  // The check itself catches the old pattern: a blank Button, then a Box painted over it.
+  const old = { type: 'Box', props: { width: 12, flexDirection: 'column', position: 'relative' }, children: [
+    { type: 'Button', props: { key: 'blank', label: 'blank', plain: true }, children: [`${' '.repeat(12)}\n${' '.repeat(12)}`] },
+    { type: 'Box', props: { position: 'absolute', top: 0, left: 0, width: 12 }, children: [
+      { type: 'Text', props: {}, children: ['painted over'] }] },
+  ] }
+  expect(coveredButtons(old, 12)).toEqual(['blank under painted over'])
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [RUNNING, DONE, { ...RUNNING, id: 'waiting-badge', parent_session_id: 'waiting-session' },
+    { ...RUNNING, id: 'idle-badge', account: 'aras', parent_pid: 1004 }]
+  state.accounts = [...STATUS, { name: 'yusa', email: '', dir: '/yusa', limits: [
+    { ...limit(40, 'weekly_all'), resets_at: iso(NOW + 26 * 3_600_000) },
+    { ...limit(95, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + 50 * 3_600_000) },
+  ] }]
+  await start($, clock)
+  // Hold the next account read open, so the title carries its spinner.
+  let release!: () => void
+  state.accountsGate = new Promise<void>(resolve => { release = resolve })
+  await clock.advance(59_000)
+  expect(statusCalls(state)).toHaveLength(2)
+  for (const surface of SURFACES) {
+    for (const width of [76, 42, 32]) {
+      const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface })
+      for (const isOpen of [true, false]) {
+        const tree = await ui.drawn()
+        expect(await rowText(ui, /Hesaplar/)).toMatch(new RegExp(`^ Hesaplar ${isOpen ? '▾' : '▸'} [${spinner}] $`))
+        if (isOpen) for (const name of ['aras', 'yusa']) expect(resetOverlay(tree, name)).toBeDefined()
+        expect(shownText(delegateOverlay(tree, 'Needs approval'))).toMatch(badge('codex'))
+        expect(shownText(delegateOverlay(tree, 'Idle tab'))).toMatch(badge('aras'))
+        expect(capsuleBorder(tree, 'Current tab')?.props?.borderColor).toBe('claude')
+        expect(lineButtons(tree).length).toBeGreaterThan(10)
+        expect(coveredButtons(tree, width)).toEqual([])
+        expect(absoluteParents(tree).length).toBeGreaterThan(4)
+        for (const parent of absoluteParents(tree)) {
+          expect(parent.props?.borderStyle).toBeUndefined()
+          expect(isUnpadded(parent)).toBe(true)
+        }
+        await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+      }
+      await ui.unmount()
+    }
+  }
+  release(); await clock.settle()
+})
+
+test('every line of a chat, job and agent capsule presses its action, and the title toggles accounts', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.agents = [{ id: 'agent-live', description: 'Inspect tests', type: 'Explore', status: 'running' }]
+  mention(state, '/transcripts/1003.jsonl', RUNNING.id)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const keys = async (capsule: string) => (await ui.findAll({ type: 'Button' }))
+    .map(node => node.key ?? '').filter(key => key.startsWith(`${capsule}:`))
+  const focusCalls = (panel: string) => [
+    [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', panel, '--workspace', WS]]
+  expect(await keys('chat:waiting-session')).toEqual(['chat:waiting-session:0', 'chat:waiting-session:1', 'chat:waiting-session:2'])
+  for (const key of await keys('chat:waiting-session')) {
+    const before = actionCalls(state).length
+    await ui.press({ key })
+    expect(actionCalls(state).slice(before).map(call => call.argv)).toEqual(focusCalls(WAITING))
+  }
+  expect(await keys(`job:${RUNNING.id}`)).toEqual([`job:${RUNNING.id}:0`, `job:${RUNNING.id}:1`])
+  for (const key of await keys(`job:${RUNNING.id}`)) {
+    const before = actionCalls(state).length
+    await ui.press({ key })
+    expect(actionCalls(state).slice(before).map(call => call.argv)).toEqual(focusCalls(RUNNER))
+  }
+  expect(grepCalls(state)).toHaveLength(1)
+  expect(await keys('agent:agent-live')).toEqual(['agent:agent-live:0', 'agent:agent-live:1'])
+  for (const key of await keys('agent:agent-live')) await ui.press({ key })
+  expect(state.views).toEqual([{ agentId: 'agent-live' }, { agentId: 'agent-live' }])
+  expect(state.toasts).toEqual([])
+  await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+  expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▸ ')
+  expect(accountFrame(await ui.drawn(), 'aras')).toBeUndefined()
+  expect(state.store.get('isAccountsOpen')).toBe(false)
+  await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+  expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
+  expect(accountFrame(await ui.drawn(), 'aras')).toBeDefined()
+  expect(state.store.get('isAccountsOpen')).toBe(true)
   await ui.unmount()
 })
 
@@ -769,7 +1260,9 @@ test('all open chats render in full beyond the pane window, retaining waiting an
   }
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows: 5 } }, surface: 'terminal' })
-  expect((await ui.findAll({ type: 'Button' })).filter(node => /^chat:/.test(node.key ?? ''))).toHaveLength(10)
+  const chatButtons = (await ui.findAll({ type: 'Button' })).filter(node => /^chat:/.test(node.key ?? ''))
+  expect(new Set(chatButtons.map(node => node.key?.replace(/:\d+$/, ''))).size).toBe(10)
+  expect(chatButtons).toHaveLength(30)
   const tree = await ui.drawn()
   expect(capsules(tree).filter(node => /Needs approval|Analysis tab|Current tab|Idle tab|Extra tab \d/.test(shownText(node)))).toHaveLength(11)
   for (let index = 0; index < 7; index += 1) expect(await rowText(ui, new RegExp(`Extra tab ${index}`))).toBeDefined()
@@ -802,7 +1295,7 @@ test('pressing a tab selects its workspace then focuses its panel, using only mo
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'chat:waiting-session' })
+  await ui.press({ key: 'chat:waiting-session:0' })
   expect(actionCalls(state).map(call => call.argv)).toEqual([
     [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', WAITING, '--workspace', WS],
   ])
@@ -814,22 +1307,22 @@ test('tab focus failures show the Turkish toast and cmux falls back to PATH if t
   state.hasCmux = false; state.isFocusDown = true
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'chat:runner-session' })
+  await ui.press({ key: 'chat:runner-session:0' })
   expect(actionCalls(state).map(call => call.argv)).toEqual([['cmux', 'select-workspace', '--workspace', WS]])
   expect(state.toasts).toEqual(['sekme açılamadı'])
   await ui.unmount()
 })
 
-test('pressing a delegate searches only open transcripts once then focuses the starter, caching the answer', async ($, on) => {
+test('a delegate without parent fields searches only open transcripts once, then presses focus the cached starter', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  state.grepMatches = ['/transcripts/1003.jsonl']
+  mention(state, '/transcripts/1003.jsonl', RUNNING.id)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: `job:${RUNNING.id}` })
-  await ui.press({ key: `job:${RUNNING.id}` })
-  const grep = state.calls.filter(call => call.argv[0] === 'grep')
+  await ui.press({ key: `job:${RUNNING.id}:0` })
+  await ui.press({ key: `job:${RUNNING.id}:1` })
+  const grep = grepCalls(state)
   expect(grep).toHaveLength(1)
-  expect(grep[0]?.argv).toEqual(['grep', '-l', '-F', '--', RUNNING.id,
+  expect(grep[0]?.argv).toEqual(['grep', '-o', '-H', '-F', '-s', '-e', RUNNING.id, '--',
     '/transcripts/1002.jsonl', '/transcripts/1003.jsonl', '/transcripts/1001.jsonl', '/transcripts/1004.jsonl'])
   expect(grep[0]?.timeoutMs).toBe(5000)
   expect(actionCalls(state).map(call => call.argv)).toEqual([
@@ -839,12 +1332,48 @@ test('pressing a delegate searches only open transcripts once then focuses the s
   await ui.unmount()
 })
 
-test('a delegate started in this session shows bu sohbette without focus commands', async ($, on) => {
+for (const [name, parent] of [
+  ['session before pid', { parent_session_id: 'runner-session', parent_pid: 1004 }],
+  ['pid only', { parent_pid: 1003 }],
+  ['pid after a closed session', { parent_session_id: 'closed-session', parent_pid: 1003 }],
+] as const) {
+  test(`pressing a delegate focuses its parent by ${name} without transcript grep`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on)
+    state.jobs = [{ ...RUNNING, ...parent }]
+    mention(state, '/transcripts/1004.jsonl', RUNNING.id)
+    await start($, clock)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.press({ key: `job:${RUNNING.id}:0` }); await ui.press({ key: `job:${RUNNING.id}:1` })
+    expect(grepCalls(state)).toHaveLength(0)
+    expect(actionCalls(state).map(call => call.argv)).toEqual([
+      [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', RUNNER, '--workspace', WS],
+      [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', RUNNER, '--workspace', WS],
+    ])
+    await ui.unmount()
+  })
+}
+
+test('parent fields added after a cached missing grep take priority on the next delegate click', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  state.grepMatches = ['/transcripts/1001.jsonl']
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: `job:${RUNNING.id}` })
+  await ui.press({ key: `job:${RUNNING.id}:0` })
+  expect(state.toasts).toEqual(['başlatan sekme kapalı'])
+  state.jobs = [{ ...RUNNING, parent_session_id: 'current-session' }]; state.jobsRevision += 1
+  await clock.advance(10_000)
+  await ui.press({ key: `job:${RUNNING.id}:0` })
+  expect(state.toasts).toEqual(['başlatan sekme kapalı', 'bu sohbette'])
+  expect(grepCalls(state)).toHaveLength(1)
+  expect(actionCalls(state)).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('a delegate started in this session shows bu sohbette without focus commands', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  mention(state, '/transcripts/1001.jsonl', RUNNING.id)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: `job:${RUNNING.id}:0` })
   expect(state.toasts).toEqual(['bu sohbette'])
   expect(actionCalls(state)).toHaveLength(0)
   await ui.unmount()
@@ -854,9 +1383,9 @@ test('a delegate with no open starter shows başlatan sekme kapalı and caches t
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: `job:${RUNNING.id}` }); await ui.press({ key: `job:${RUNNING.id}` })
+  await ui.press({ key: `job:${RUNNING.id}:0` }); await ui.press({ key: `job:${RUNNING.id}:1` })
   expect(state.toasts).toEqual(['başlatan sekme kapalı', 'başlatan sekme kapalı'])
-  expect(state.calls.filter(call => call.argv[0] === 'grep')).toHaveLength(1)
+  expect(grepCalls(state)).toHaveLength(1)
   expect(actionCalls(state)).toHaveLength(0)
   await ui.unmount()
 })
@@ -869,17 +1398,18 @@ test('jobs show three two-line round capsules, running first, and agents still o
     label: `Old job ${index}`, finished: NOW / 1000 - 100 - index }))]
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'agent:agent-live' })
+  await ui.press({ key: 'agent:agent-live:0' })
   expect(state.views).toEqual([{ agentId: 'agent-live' }])
   const tasks = (await ui.findAll({ type: 'Button' })).filter(node => /^(agent|job):/.test(node.key ?? ''))
-  expect(tasks).toHaveLength(3)
-  expect(tasks.slice(0, 2).every(node => /Inspect tests|ads review/.test(node.text))).toBe(true)
-  expect(tasks[2]?.text).toMatch(/Recent agent/)
+  expect(tasks).toHaveLength(6)
+  expect(new Set(tasks.map(node => node.key?.replace(/:\d+$/, ''))).size).toBe(3)
+  expect(tasks.slice(0, 4).every(node => /Inspect tests|ads review/.test(String(node.props.label)))).toBe(true)
+  expect(tasks.slice(4).every(node => /Recent agent/.test(String(node.props.label)))).toBe(true)
   const tree = await ui.drawn()
   for (const title of ['Inspect tests', 'ads review', 'Recent agent']) {
     const capsule = capsuleFor(tree, title)!
     expect(capsule).toBeDefined()
-    expect(capsule.props).toMatchObject({ borderStyle: 'round', borderColor: 'subtle', paddingX: 1 })
+    expect(capsule.props).toMatchObject({ width: 38, flexDirection: 'column' })
     const rows = laidOutRows(capsule, 38)
     expect(rows).toHaveLength(4)
     expect(rows[1]).toMatch(/› │$/)
@@ -934,7 +1464,7 @@ test('job capsules show success and error glyphs with concise second-line durati
 
 test('a delegate whose process disappeared shows a warning question mark and no running header', async ($, on) => {
   const clock = mock.clock(on, { now: NOW }); const state = world(on)
-  idle(state); state.jobs = [RUNNING]; state.isJobGone = true
+  idle(state); state.jobs = [RUNNING]; state.processes.clear()
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await rowText(ui, /ads review/)).toMatch(/^\? .*ads review/)
@@ -944,7 +1474,7 @@ test('a delegate whose process disappeared shows a warning question mark and no 
   for (const row of await paneRows(ui)) expect(row).not.toMatch(/[✗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|1 (?:aktif|çalışan|koşuyor)/)
   const ps = state.calls.filter(call => call.argv[0] === 'ps')
   expect(ps).toHaveLength(1)
-  expect(ps[0]?.argv).toEqual(['ps', '-ww', '-o', 'pid=,command=', '-p', '4242'])
+  expect(ps[0]?.argv).toEqual(['ps', '-ww', '-o', 'pid=,stat=,command=', '-p', '4242'])
   await ui.unmount()
 })
 
@@ -966,9 +1496,11 @@ for (const failure of ['deny', 'exit', 'stderr'] as const) {
     const snapshot = state.snapshots.get('jobs') as { value: { list: { id: string; status: string }[] } }
     for (const job of cases) expect(snapshot.value.list.find(row => row.id === job.id)?.status).toBe(job.status)
     const visible = (await ui.findAll({ type: 'Button' })).filter(node => /^job:/.test(node.key ?? ''))
-    expect(visible).toHaveLength(3)
-    expect(visible[0]?.text).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] /)
-    expect(visible.slice(1).every(node => /^\? /.test(node.text))).toBe(true)
+    expect(new Set(visible.map(node => node.key?.replace(/:\d+$/, ''))).size).toBe(3)
+    expect(visible).toHaveLength(6)
+    const rows = capsules(await ui.drawn()).filter(node => /^capsule:job:/.test(String(node.props?.key)))
+    expect(laidOutRows(rows[0], 38)[1]).toMatch(/^│ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] /)
+    expect(rows.slice(1).every(node => /^│ \? /.test(laidOutRows(node, 38)[1]!))).toBe(true)
     expect((await paneRows(ui)).filter(row => /· durdu$/.test(row))).toHaveLength(2)
     expect(visible.every(node => !/✗/.test(node.text))).toBe(true)
     const questions = await ui.findAll({ type: 'Text', text: /^\?$/ })
@@ -987,7 +1519,7 @@ test('narrow cards truncate long rows with an ellipsis and never wrap or contain
   await start($, clock)
   for (const width of [60, 42, 32, 24, 18]) {
     const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
-    expect((await ui.find({ key: `job:${RUNNING.id}` }))?.text).toMatch(/…/)
+    expect(laidOutRows(capsules(await ui.drawn()).find(node => node.props?.key === `capsule:job:${RUNNING.id}`), width - 4)[1]).toMatch(/…/)
     expect(laidOutRows(await ui.drawn(), width).filter(row => cells(row) > width)).toEqual([])
     for (const node of await ui.findAll({ type: 'Text' })) {
       expect(node.text.length).toBeLessThanOrEqual(width)
@@ -1022,6 +1554,7 @@ test('the command closes and reopens the pane and resumes polling when it become
   expect(state.reads).toHaveLength(reads)
   expect((await $.command.run(TYPED)).text).toBe('Shiftover paneli açıldı.')
   expect(state.isOpen).toBe(true)
+  expect(state.openColumns).toEqual([76, 76])
   await clock.settle()
   expect(state.reads.length).toBeGreaterThan(reads)
 })
@@ -1063,15 +1596,15 @@ test('gauge values appear immediately and refresh instantly without any idle ani
   state.accounts = oneAccount([limit(40), limit(92, 'weekly_scoped', 'Fable')])
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]).toMatch(/40%.*92%/)
-  const initial = contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/40%.*92%/)
+  const initial = contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]
   await clock.advance(2000)
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]).toBe(initial)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toBe(initial)
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
   expect(clock.waits().filter(wait => wait.ms < 10_000)).toHaveLength(0)
   state.accounts = oneAccount([limit(70), limit(96, 'weekly_scoped', 'Fable')])
   await clock.advance(58_000)
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]).toMatch(/70%.*96%/)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/70%.*96%/)
   await clock.advance(100)
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
   expect((await ui.findAll({ type: 'Text', text: /^━+$/ })).some(node => node.props.color === 'text')).toBe(false)
@@ -1100,10 +1633,10 @@ test('waiting dots blink error and subtle at 600 ms edges using one quiet after 
   await clock.advance(1)
   expect(await marker()).toBe(initial === 'error' ? 'subtle' : 'error')
   expect(redraws).toHaveLength(1)
-  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 600 }])
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 400 }])
   await clock.advance(600)
   expect(await marker()).toBe(initial)
-  expect(redraws).toHaveLength(2)
+  expect(redraws).toHaveLength(3)
   state.sessions = {}; state.sessionsRevision += 1
   await clock.advance(10_000)
   expect(await rowText(ui, /Needs approval/)).toBeUndefined()
@@ -1112,34 +1645,28 @@ test('waiting dots blink error and subtle at 600 ms edges using one quiet after 
   await ui.unmount()
 })
 
-test('idle dots blink inactive and subtle at 1500 ms edges without spinner frames', async ($, on) => {
+test('idle chats show a steady text-colored open circle without an animation timer', async ($, on) => {
   const clock = observedClock(on); const redraws: number[] = []
   on('ui.invalidate', { event: 'ui.render' }, async (_, e, next) => { redraws.push(clock.now()); return next(e) })
   const state = world(on); idle(state)
   state.sessions = { idle: rawSession(IDLE, 1004) }
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  // Let the one deferred refresh repaint settle before measuring blink-only work.
+  // Let the one deferred refresh repaint settle before measuring idle work.
   await clock.advance(67)
-  const marker = async () => (await ui.find({ type: 'Text', text: /^●$/ }))?.props.color
-  const initial = await marker()
-  expect(initial).toBe(Math.floor(clock.now() / 1500) % 2 === 0 ? 'inactive' : 'subtle')
-  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 1500 - clock.now() % 1500 }])
   redraws.length = 0
-  await clock.advance(1500 - clock.now() % 1500 - 1)
-  expect(await marker()).toBe(initial)
-  expect(redraws).toHaveLength(0)
-  await clock.advance(1)
-  expect(await marker()).toBe(initial === 'inactive' ? 'subtle' : 'inactive')
-  expect(redraws).toHaveLength(1)
-  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 1500 }])
-  await clock.advance(1500)
-  expect(await marker()).toBe(initial)
-  expect(redraws).toHaveLength(2)
+  for (const elapsed of [0, 1432, 1, 1500, 1500]) {
+    await clock.advance(elapsed)
+    expect((await ui.find({ type: 'Text', text: /^○$/ }))?.props.color).toBe('text')
+    expect(await ui.find({ type: 'Text', text: /^●$/ })).toBeUndefined()
+    expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
+    expect(clock.waits().filter(wait => wait.ms < 10_000)).toHaveLength(0)
+    expect(redraws).toHaveLength(0)
+  }
   await ui.unmount()
 })
 
-test('mixed blink-only chats share one timer that always schedules the next waiting or idle edge', async ($, on) => {
+test('waiting and idle chats schedule only dot and border edges while the idle marker stays steady', async ($, on) => {
   const clock = observedClock(on); const redraws: number[] = []
   on('ui.invalidate', { event: 'ui.render' }, async (_, e, next) => { redraws.push(clock.now()); return next(e) })
   const state = world(on); idle(state)
@@ -1151,19 +1678,21 @@ test('mixed blink-only chats share one timer that always schedules the next wait
   // Let the one deferred refresh repaint settle before measuring blink-only work.
   await clock.advance(67)
   for (let edge = 0; edge < 6; edge += 1) {
-    const next = Math.min(600 - clock.now() % 600, 1500 - clock.now() % 1500)
+    const phase = clock.now() % 10_000
+    const next = Math.min(600 - clock.now() % 600, (phase < 1000 ? 1000 : 10_000) - phase)
     expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: next }])
-    expect(clock.waits().filter(wait => wait.ms < 300)).toHaveLength(0)
+    expect(clock.waits().filter(wait => wait.ms < 100)).toHaveLength(0)
     redraws.length = 0
     await clock.advance(next - 1)
     expect(redraws).toHaveLength(0)
     await clock.advance(1)
     expect(redraws).toHaveLength(1)
     const tree = await ui.drawn()
-    for (const [title, period, color] of [['Needs approval', 600, 'error'], ['Idle tab', 1500, 'inactive']] as const) {
+    for (const title of ['Needs approval', 'Idle tab']) {
       const capsule = capsuleFor(tree, title)!
-      const dot = drawnNodes(capsule).find(node => node.type === 'Text' && shownText(node) === '●')
-      expect(dot?.props?.color).toBe(Math.floor(clock.now() / period) % 2 === 0 ? color : 'subtle')
+      const waiting = title === 'Needs approval'
+      const dot = drawnNodes(capsule).find(node => node.type === 'Text' && shownText(node) === (waiting ? '●' : '○'))
+      expect(dot?.props?.color).toBe(waiting ? Math.floor(clock.now() / 600) % 2 === 0 ? 'error' : 'subtle' : 'text')
     }
   }
   await ui.unmount()
@@ -1181,6 +1710,114 @@ test('a recent completion pops to its final glyph and then stops its animation',
   expect(await rowText(ui, /just completed/)).toMatch(/^✓/)
   await clock.advance(1800)
   expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('accounts draw no refresh countdown and schedule the earliest finite server target directly', async ($, on) => {
+  const clock = observedClock(on); const state = world(on); idle(state)
+  state.accounts = [
+    { ...STATUS[0]!, next_refresh_at: null, fetched_at: null },
+    { ...STATUS[0]!, name: 'later', next_refresh_at: iso(NOW + 300_000) },
+    { ...STATUS[0]!, name: 'older' },
+    { ...STATUS[0]!, name: 'first', next_refresh_at: (NOW + 42_250) / 1000, fetched_at: (NOW - 500) / 1000 },
+  ]
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(67)
+  expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
+  expect(shownText(accountsCard(await ui.drawn()))).not.toMatch(/↻|\d+sn/)
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 42_183 }])
+  const snapshot = state.snapshots.get('accounts') as { value: { list: { nextRefreshAtMs: number | null; fetchedAtMs: number | null }[] } }
+  expect(snapshot.value.list[0]).toMatchObject({ nextRefreshAtMs: null, fetchedAtMs: null })
+  expect(snapshot.value.list[2]).toMatchObject({ nextRefreshAtMs: null, fetchedAtMs: null })
+  expect(snapshot.value.list[3]).toMatchObject({ nextRefreshAtMs: NOW + 42_250, fetchedAtMs: NOW - 500 })
+  await clock.advance(42_182)
+  expect(statusCalls(state)).toHaveLength(1)
+  await clock.advance(1)
+  expect(statusCalls(state)).toHaveLength(2)
+  expect(clock.waits().some(wait => wait.ms === 1000)).toBe(false)
+  await ui.unmount()
+})
+
+test('older shiftover without reset times has no countdown or additional clock waits', async ($, on) => {
+  const clock = observedClock(on); const state = world(on); idle(state)
+  state.accounts = oneAccount([limit(10)])
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await rowText(ui, /Hesaplar/)).not.toMatch(/↻/)
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('the single refresh deadline stops when the pane loses placement', async ($, on) => {
+  const clock = observedClock(on); const state = world(on); idle(state)
+  state.accounts = [{ ...STATUS[0]!, next_refresh_at: (NOW + 42_000) / 1000 }]
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 41_933 }])
+  state.isPlaced = false
+  await clock.advance(9000)
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
+  await clock.advance(60_000)
+  expect(statusCalls(state)).toHaveLength(1)
+  await ui.unmount()
+})
+
+for (const failed of [false, true]) {
+  test(`expiry refreshes immediately and backs off 30 seconds after a ${failed ? 'failed' : 'stale'} read`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+    state.accounts = [{ ...STATUS[0]!, next_refresh_at: (NOW + 2000) / 1000 }]
+    await start($, clock)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    let release!: () => void
+    state.accountsGate = new Promise<void>(resolve => { release = resolve })
+    state.isShiftoverDown = failed
+    await clock.advance(999)
+    expect(statusCalls(state)).toHaveLength(1)
+    await clock.advance(1)
+    expect(statusCalls(state)).toHaveLength(2)
+    const border = await rowText(ui, /Hesaplar/)
+    expect(border).toMatch(/^ Hesaplar ▾ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] $/)
+    expect(border).not.toMatch(/↻/)
+    expect((border?.match(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g) ?? [])).toHaveLength(1)
+    await clock.advance(1000)
+    expect(statusCalls(state)).toHaveLength(2)
+    release(); await clock.settle(); await clock.advance(100)
+    expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
+    await clock.advance(29_899)
+    expect(statusCalls(state)).toHaveLength(2)
+    state.isShiftoverDown = false
+    state.accounts = [{ ...STATUS[0]!, next_refresh_at: (clock.now() + 42_001) / 1000 }]
+    await clock.advance(1)
+    expect(statusCalls(state)).toHaveLength(3)
+    await clock.advance(100)
+    expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
+    await ui.unmount()
+  })
+}
+
+test('the accounts border contains just its title at 76 and 42 columns', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = [{ ...STATUS[0]!, next_refresh_at: (NOW + 11_000) / 1000 }]
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const width of [76, 42]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const before = laidOutRows(await ui.drawn(), width)[0]!
+    expect(before).toMatch(/^╭─ Hesaplar ▾ ─+╮$/)
+    expect(cells(before)).toBe(width)
+    await clock.advance(2000)
+    const after = laidOutRows(await ui.drawn(), width)[0]!
+    expect(after).toMatch(/^╭─ Hesaplar ▾ ─+╮$/)
+    expect(cells(after)).toBe(width)
+    expect(after.indexOf('Hesaplar')).toBe(before.indexOf('Hesaplar'))
+    expect(laidOutRows(await ui.drawn(), width).every(row => cells(row) <= width)).toBe(true)
+    await ui.unmount()
+  }
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 20 }, surface: 'terminal' })
+  const border = laidOutRows(await ui.drawn(), 20)[0]!
+  expect(border).toMatch(/^╭─ Hesaplar /)
+  expect(border).not.toMatch(/↻/)
+  expect(cells(border)).toBe(20)
   await ui.unmount()
 })
 
@@ -1236,7 +1873,7 @@ test('cached snapshots after reload form a steady baseline without entrance or c
       status: 'done', pid: 1, startedMs: NOW - 1000, finishedMs: NOW, durationMs: 1000, costUsd: null }], at: NOW, error: null },
   }, version: 1 } }))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[1]).toMatch(/70%/)
+  expect(contentRows(accountCapsule(await ui.drawn(), 'kadir'))[2]).toMatch(/70%/)
   expect(await rowText(ui, /cached completion/)).toMatch(/^✓/)
   expect(clock.waits()).toHaveLength(0)
   await clock.advance(300)
@@ -1273,5 +1910,853 @@ test('external text stays on one line and long names truncate inside their own c
     expect(row).not.toMatch(/[\r\n—]/)
     expect(cells(row)).toBeLessThanOrEqual(38)
   }
+  await ui.unmount()
+})
+
+test('hovering a clickable capsule lights its border and mutes every line while rest styles stay as they were', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); world(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const tree = await ui.drawn()
+  // The kit has no pointer driver: a hover is checked as the data drawn.
+  for (const title of ['Analysis tab', 'Idle tab', 'ads review', 'Needs approval']) {
+    const capsule = capsuleFor(tree, title)!
+    const border = capsuleBorder(tree, title)!
+    const isWaiting = title === 'Needs approval'
+    expect(border.props?.position).toBeUndefined()
+    expect(border.props?.backgroundColor).toBeUndefined()
+    // A waiting border keeps its own flash: no border hover.
+    expect(border.hover).toEqual(isWaiting ? undefined : { borderColor: 'text' })
+    if (!isWaiting) expect(border.props?.borderColor).toBe('subtle')
+    const buttons = lineButtons(capsule)
+    expect(buttons).toHaveLength(isWaiting || /tab/.test(title) ? 3 : 2)
+    for (const button of buttons) {
+      expect(button.hover).toEqual({ color: 'inactive' })
+      const texts = drawnNodes(button).filter(node => node.type === 'Text')
+      expect(texts.length).toBeGreaterThan(1)
+      for (const text of texts) expect(text.hover).toEqual({ color: 'inactive' })
+      expect(texts.some(node => node.props?.color === 'inactive')).toBe(false)
+    }
+    const name = drawnNodes(buttons[0]).find(node => node.type === 'Text' && shownText(node) === title)
+    expect(name?.props).toMatchObject({ color: 'text' })
+    expect(name?.props?.weight).toBe(isWaiting ? 'bold' : undefined)
+    expect(drawnNodes(buttons[1]).filter(node => node.type === 'Text' && node.props?.dimColor === true)).toHaveLength(1)
+    expect(drawnNodes(buttons[0]).find(node => node.type === 'Text' && shownText(node) === '›')?.props?.dimColor).toBe(true)
+  }
+  const glyph = drawnNodes(capsuleFor(tree, 'Analysis tab')).find(node =>
+    node.type === 'Text' && shownText(node).length === 1 && spinner.includes(shownText(node)))
+  expect(glyph?.props?.color).toBe('suggestion')
+  // Account capsules and the current chat press nothing and change nothing on hover.
+  for (const frame of [accountFrame(tree, 'kadir'), accountFrame(tree, 'aras'), accountFrame(tree, 'codex'), capsuleFor(tree, 'Current tab')]) {
+    expect(frame).toBeDefined()
+    expect(drawnNodes(frame).filter(node => node.hover !== undefined || node.type === 'Button')).toEqual([])
+  }
+  // The title is the Button: muted on hover, bold text color at rest.
+  const title = lineButtons(accountsCard(tree)).find(node => node.props?.key === 'accounts:toggle')!
+  expect(title.hover).toEqual({ color: 'inactive' })
+  const titleTexts = drawnNodes(title).filter(node => node.type === 'Text')
+  expect(titleTexts.length).toBeGreaterThan(1)
+  for (const text of titleTexts) expect(text.hover).toEqual({ color: 'inactive' })
+  expect(titleTexts.find(node => shownText(node) === ' Hesaplar ▾ ' && node.props?.weight === 'bold')?.props?.color).toBe('text')
+  await ui.unmount()
+})
+
+test('keyboard focus on any capsule line lights its border and mutes its text at rest; a denied move keeps it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); world(on)
+  let denied = false
+  on('ui.focus', () => denied ? { deny: 'test refusal' } : {})
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'terminal' })
+  const focus = (element?: string, plugin = 'shiftover-panel') => $.ui.focus({
+    component: 'Pane', requestId: 'shiftover-panel', plugin, element, origin: { kind: 'person' },
+  })
+  // Focus inverts a Button: with every run muted that is a grey bar, never white.
+  const isMuted = async (title: string) => lineButtons(capsuleFor(await ui.drawn(), title)).every(button =>
+    drawnNodes(button).filter(node => node.type === 'Text' && node.props?.color === 'inactive').map(shownText).join('') === shownText(button))
+  const before = contentRows(capsuleBorder(await ui.drawn(), 'Idle tab'))
+  expect(await isMuted('Idle tab')).toBe(false)
+  for (const line of [0, 1, 2]) {
+    await focus(`chat:idle-session:${line}`); await clock.advance(100)
+    expect(capsuleBorder(await ui.drawn(), 'Idle tab')?.props?.borderColor).toBe('text')
+    expect(contentRows(capsuleBorder(await ui.drawn(), 'Idle tab'))).toEqual(before)
+    expect(await isMuted('Idle tab')).toBe(true)
+    expect(capsuleBorder(await ui.drawn(), 'Analysis tab')?.props?.borderColor).toBe('subtle')
+    expect(await isMuted('Analysis tab')).toBe(false)
+  }
+  const heading = async () => drawnNodes(accountsCard(await ui.drawn())).find(node =>
+    node.type === 'Text' && shownText(node) === ' Hesaplar ▾ ' && node.props?.weight === 'bold')?.props?.color
+  expect(await heading()).toBe('text')
+  denied = true
+  await focus('chat:runner-session:0'); await clock.advance(100)
+  expect(capsuleBorder(await ui.drawn(), 'Idle tab')?.props?.borderColor).toBe('text')
+  expect(await isMuted('Analysis tab')).toBe(false)
+  denied = false
+  await focus('accounts:toggle'); await clock.advance(100)
+  expect(await heading()).toBe('inactive')
+  expect(capsuleBorder(await ui.drawn(), 'Idle tab')?.props?.borderColor).toBe('subtle')
+  expect(await isMuted('Idle tab')).toBe(false)
+  await focus(); await clock.advance(100)
+  expect(await heading()).toBe('text')
+  await ui.unmount()
+})
+
+test('waiting borders share a one-second flash every ten seconds while dots keep their 600 ms phase', async ($, on) => {
+  const clock = observedClock(on); const state = world(on); idle(state)
+  state.sessions = {
+    'waiting-session': rawSession(WAITING, 1002, { agentLifecycle: 'needsInput' }),
+    'idle-session': rawSession(IDLE, 1004, { agentLifecycle: 'needsInput' }),
+    'current-session': rawSession(CURRENT, 1001, { agentLifecycle: 'needsInput' }),
+  }
+  on('ui.focus', () => ({}))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: true }, surface: 'terminal' })
+  await $.ui.focus({ component: 'Pane', requestId: 'shiftover-panel', plugin: 'shiftover-panel',
+    element: 'chat:waiting-session:1', origin: { kind: 'person' } })
+  for (const elapsed of [67, 599, 600, 999, 1000, 1200, 9900, 9999, 10_000, 10_999, 11_000, 19_999, 20_000]) {
+    await clock.set(NOW + elapsed)
+    const tree = await ui.drawn()
+    const color = Math.floor(clock.now() / 600) % 2 === 0 ? 'error' : 'subtle'
+    for (const title of ['Needs approval', 'Idle tab', 'Current tab']) {
+      const capsule = capsuleFor(tree, title)!
+      const dot = drawnNodes(capsule).find(node => node.type === 'Text' && shownText(node) === '●')
+      // The focused capsule's text is muted at rest; its border still flashes.
+      expect(dot?.props?.color).toBe(title === 'Needs approval' ? 'inactive' : color)
+      expect(capsuleBorder(tree, title)?.props?.borderColor).toBe(title === 'Current tab'
+        ? 'claude' : elapsed % 10_000 < 1000 ? 'error' : 'subtle')
+      expect(capsuleBorder(tree, title)?.hover).toBeUndefined()
+    }
+    expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(1)
+  }
+  state.isPlaced = false
+  await clock.advance(600)
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
+  const reads = state.reads.length
+  await clock.advance(20_000)
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toHaveLength(0)
+  expect(state.reads).toHaveLength(reads)
+  await ui.unmount()
+})
+
+for (const status of ['idle', 'running'] as const) {
+  test(`the current ${status} chat has the account marker's steady orange border and no hit target`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on)
+    state.sessions['current-session'] = rawSession(CURRENT, 1001, { agentLifecycle: status })
+    await start($, clock)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    for (const elapsed of [0, 600, 9400]) {
+      await clock.advance(elapsed)
+      const tree = await ui.drawn()
+      const marker = drawnNodes(accountFrame(tree, 'kadir')).find(node => shownText(node) === '● ')
+      expect(marker?.props?.color).toBe('claude')
+      expect(capsuleBorder(tree, 'Current tab')?.props?.borderColor).toBe(marker?.props?.color)
+      expect(drawnNodes(capsuleFor(tree, 'Current tab')).filter(node => node.type === 'Button')).toHaveLength(0)
+    }
+    await ui.unmount()
+  })
+}
+
+test('delegate badges match session ids before pids and ignore old, closed, finished and stale jobs', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [
+    { ...RUNNING, id: 'session', parent_session_id: 'waiting-session', parent_pid: 1004 },
+    { ...RUNNING, id: 'pid', account: 'aras', parent_pid: 1004 },
+    { ...RUNNING, id: 'fallback', account: 'yusa', parent_session_id: 'closed-session', parent_pid: 1002 },
+    { ...RUNNING, id: 'closed', parent_session_id: 'closed-session', parent_pid: 1005 },
+    RUNNING,
+    ...['done', 'failed', 'cancelled', 'stale'].map(status => ({ ...RUNNING, id: status, status,
+      parent_session_id: 'waiting-session' })),
+    { ...RUNNING, id: 'no-process', account: 'kadir', pid: 0, parent_pid: 1002 },
+    { ...RUNNING, id: 'gone', account: 'kadir', pid: 9999, parent_pid: 1002 },
+    { ...RUNNING, id: 'empty', parent_session_id: '', parent_pid: 0 },
+  ]
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const tree = await ui.drawn()
+  const glyph = spinner[Math.floor(clock.now() / 100) % spinner.length]
+  expect(shownText(delegateOverlay(tree, 'Needs approval'))).toBe(` ${glyph} codex · ${glyph} yusa `)
+  expect(shownText(delegateOverlay(tree, 'Idle tab'))).toBe(` ${glyph} aras `)
+  for (const title of ['Current tab', 'Analysis tab']) expect(delegateOverlay(tree, title)).toBeUndefined()
+  // Only the two running jobs without parent fields are searched, in one call.
+  expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id, 'empty')])
+  await ui.unmount()
+})
+
+test('delegate badges count per account, order by earliest start, share spinner phase and fit 76 and 42 columns', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = ['kadir', 'codex', 'yusa', 'aras', 'codex'].map((account, index) => ({
+    ...RUNNING, id: `badge-${index}`, account, parent_session_id: 'idle-session',
+    started: (NOW - (index + 1) * 1000) / 1000,
+  }))
+  await start($, clock)
+  for (const width of [76, 42, 16]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    for (const elapsed of [0, 100]) {
+      await clock.advance(elapsed)
+      await ui.redraw(); await clock.settle()
+      const tree = await ui.drawn()
+      const frame = capsules(tree).find(node => node.props?.key === 'capsule:chat:idle-session')
+      const overlay = borderOverlay(frame)
+      const glyph = spinner[Math.floor(clock.now() / 100) % spinner.length]
+      expect(shownText(overlay)).toBe(width === 16 ? ''
+        : ` ${glyph} codex ×2 · ${glyph} aras · ${glyph} yusa${width === 76 ? ` · ${glyph} kadir` : ''} `)
+      if (overlay) {
+        expect(overlay.props?.top).toBe(0)
+        expect(Number(overlay.props?.left)).toBeGreaterThanOrEqual(2)
+        const spans = drawnNodes(overlay).filter(node => node.type === 'Text')
+        for (const [name, color] of [['codex ×2', 'success'], ['aras', 'suggestion'], ['yusa', 'remember'],
+          ...(width === 76 ? [['kadir', 'claude']] : [])]) {
+          expect(spans.find(node => shownText(node) === name)?.props?.color).toBe(color)
+        }
+        expect(spans.filter(node => shownText(node) === ' · ').every(node => node.props?.dimColor === true)).toBe(true)
+        expect(spans.filter(node => shownText(node) === `${glyph} `)).toHaveLength(width === 76 ? 4 : 3)
+        const marker = drawnNodes(capsuleFor(tree, 'Analysis tab')).find(node =>
+          node.type === 'Text' && shownText(node) === glyph)
+        expect(marker).toBeDefined()
+      }
+      const rows = laidOutRows(frame, width - 4)
+      expect(rows).toHaveLength(5)
+      expect(rows[0]).toMatch(/^╭─.*─╮$/)
+      expect(cells(rows[0]!)).toBe(width - 4)
+      expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+    }
+    await ui.unmount()
+  }
+})
+
+test('delegate badges retain the existing two-hour staleness guard when ps is unavailable', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobPsFailure = 'deny'
+  state.jobs = [
+    { ...RUNNING, parent_pid: 1004 },
+    { ...RUNNING, id: 'old-parent', account: 'aras', parent_pid: 1004, started: (NOW - 2 * 3_600_000) / 1000 },
+  ]
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const glyph = spinner[Math.floor(clock.now() / 100) % spinner.length]
+  expect(shownText(delegateOverlay(await ui.drawn(), 'Idle tab'))).toBe(` ${glyph} codex `)
+  await ui.unmount()
+})
+
+// MARK: - Starters of older jobs
+
+test('parentless running delegates find their starters in one batched grep of open transcripts and keep them', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [RUNNING, { ...RUNNING, id: 'second-job', account: 'aras', started: (NOW - 100_000) / 1000 },
+    { ...RUNNING, id: 'with-parent', account: 'yusa', parent_pid: 1002 }, DONE]
+  mention(state, '/transcripts/1004.jsonl', RUNNING.id)
+  mention(state, '/transcripts/1003.jsonl', 'second-job', DONE.id)
+  // A closed tab's transcript is never searched.
+  mention(state, '/transcripts/1005.jsonl', RUNNING.id, 'second-job')
+  await start($, clock)
+  expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id, 'second-job')])
+  expect(grepCalls(state)[0]?.timeoutMs).toBe(5000)
+  // Many refreshes later the found starters still hold without a search.
+  for (const elapsed of [0, 5 * 60_000]) {
+    await clock.advance(elapsed)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const tree = await ui.drawn()
+    expect(shownText(delegateOverlay(tree, 'Idle tab'))).toMatch(badge('codex'))
+    expect(shownText(delegateOverlay(tree, 'Analysis tab'))).toMatch(badge('aras'))
+    expect(shownText(delegateOverlay(tree, 'Needs approval'))).toMatch(badge('yusa'))
+    expect(delegateOverlay(tree, 'Current tab')).toBeUndefined()
+    expect(grepCalls(state)).toHaveLength(1)
+    await ui.unmount()
+  }
+})
+
+test('an unmatched starter is searched again only after a minute, and presses reuse the cached answer', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  await start($, clock)
+  expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
+  mention(state, '/transcripts/1004.jsonl', RUNNING.id)
+  await clock.advance(58_000)
+  const early = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(delegateOverlay(await early.drawn(), 'Idle tab')).toBeUndefined()
+  await early.press({ key: `job:${RUNNING.id}:0` })
+  expect(state.toasts).toEqual(['başlatan sekme kapalı'])
+  expect(grepCalls(state)).toHaveLength(1)
+  await early.unmount()
+  await clock.advance(1_000)
+  expect(grepCalls(state)).toHaveLength(2)
+  const found = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(shownText(delegateOverlay(await found.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  await found.press({ key: `job:${RUNNING.id}:1` })
+  expect(actionCalls(state).map(call => call.argv)).toEqual([
+    [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', IDLE, '--workspace', WS]])
+  await found.unmount()
+  await clock.advance(3 * 60_000)
+  expect(grepCalls(state)).toHaveLength(2)
+})
+
+test('delegates with parent fields, finished or stale ones are never searched in the background', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, id: 'closed-parent', parent_session_id: 'closed-session', parent_pid: 1005 },
+    { ...RUNNING, id: 'gone', pid: 9999 }, { ...RUNNING, id: 'failed-job', status: 'failed' }, DONE]
+  for (const path of OPEN_TRANSCRIPTS) mention(state, path, 'closed-parent', 'gone', 'failed-job', DONE.id)
+  await start($, clock)
+  await clock.advance(3 * 60_000)
+  expect(grepCalls(state)).toHaveLength(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  for (const title of ['Needs approval', 'Analysis tab', 'Current tab', 'Idle tab']) {
+    expect(delegateOverlay(await ui.drawn(), title)).toBeUndefined()
+  }
+  // A press still searches for a job whose parent tab closed.
+  await ui.press({ key: 'job:closed-parent:0' })
+  expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch('closed-parent')])
+  expect(actionCalls(state).map(call => call.argv)).toEqual([
+    [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', WAITING, '--workspace', WS]])
+  await ui.unmount()
+})
+
+test('starter searches pause while the pane is unplaced and resume once it is placed', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  await start($, clock)
+  expect(grepCalls(state)).toHaveLength(1)
+  state.isPlaced = false
+  await clock.advance(5 * 60_000)
+  expect(grepCalls(state)).toHaveLength(1)
+  state.isPlaced = true
+  await clock.advance(10_000)
+  expect(grepCalls(state)).toHaveLength(2)
+})
+
+test('a starter search waits for an open transcript without spending an attempt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.sessions = {}
+  await start($, clock)
+  await clock.advance(20_000)
+  expect(grepCalls(state)).toHaveLength(0)
+  state.sessions = { 'idle-session': rawSession(IDLE, 1004) }; state.sessionsRevision += 1
+  mention(state, '/transcripts/1004.jsonl', RUNNING.id)
+  await clock.advance(10_000)
+  expect(grepCalls(state).map(call => call.argv)).toEqual([
+    ['grep', '-o', '-H', '-F', '-s', '-e', RUNNING.id, '--', '/transcripts/1004.jsonl']])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(shownText(delegateOverlay(await ui.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  await ui.unmount()
+})
+
+test('a finished delegate keeps its found starter for presses until it leaves the job list', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  mention(state, '/transcripts/1004.jsonl', RUNNING.id)
+  await start($, clock)
+  expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id)])
+  const running = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(shownText(delegateOverlay(await running.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  await running.unmount()
+  state.jobs = [{ ...RUNNING, status: 'done', finished: (NOW + 5_000) / 1000, duration_ms: 60_000 }, DONE]
+  state.jobsRevision += 1
+  await clock.advance(3 * 60_000)
+  const done = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(delegateOverlay(await done.drawn(), 'Idle tab')).toBeUndefined()
+  await done.press({ key: `job:${RUNNING.id}:0` })
+  expect(actionCalls(state).map(call => call.argv)).toEqual([
+    [CMUX, 'select-workspace', '--workspace', WS], [CMUX, 'focus-panel', '--panel', IDLE, '--workspace', WS]])
+  expect(grepCalls(state)).toHaveLength(1)
+  await done.unmount()
+  // Off the list, its answer goes too: running again, it is searched afresh.
+  state.jobs = [DONE]; state.jobsRevision += 1
+  await clock.advance(10_000)
+  state.jobs = [RUNNING, DONE]; state.jobsRevision += 1
+  await clock.advance(10_000)
+  expect(grepCalls(state).map(call => call.argv)).toEqual([starterSearch(RUNNING.id), starterSearch(RUNNING.id)])
+})
+
+// MARK: - Finished jobs
+
+test('a zombie delegate process is not running: its job is stale and loses its badge', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
+  state.processes.set(4242, { stat: 'Z', command: '(codex)' })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'stale' }] } })
+  expect(await rowText(ui, /ads review/)).toMatch(/^\? .*ads review/)
+  expect(delegateOverlay(await ui.drawn(), 'Idle tab')).toBeUndefined()
+  expect(jobPsCalls(state).map(call => call.argv)).toEqual([['ps', '-ww', '-o', 'pid=,stat=,command=', '-p', '4242']])
+  state.processes.set(4242, { stat: 'S+', command: '/opt/bin/codex exec -' })
+  await clock.advance(10_000)
+  expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'running' }] } })
+  expect(shownText(delegateOverlay(await ui.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  await ui.unmount()
+})
+
+for (const [name, job, lines, status, glyph] of [
+  ['codex turn.completed', { account: 'codex' }, [codexLine('thread.started'), codexLine('turn.started'),
+    JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 12 } })], 'done', '✓'],
+  ['codex turn.failed', { account: 'codex' }, [codexLine('turn.started'),
+    JSON.stringify({ type: 'turn.failed', error: { message: 'stream error' } })], 'failed', '✗'],
+  ['claude result line', { account: 'aras' }, [JSON.stringify({ type: 'assistant' }),
+    JSON.stringify({ type: 'result', subtype: 'success', is_error: false })], 'done', '✓'],
+  ['claude error result', { account: 'aras' }, [JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true })], 'failed', '✗'],
+  ['a codex backend named in the file', { account: 'yusa', backend: 'codex' }, [codexLine('turn.completed')], 'done', '✓'],
+] as const) {
+  test(`a running job whose .out ended (${name}) shows ${status} with a fixed duration and no badge`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on)
+    state.jobs = [{ ...RUNNING, ...job, parent_session_id: 'idle-session', started: (NOW - 10 * 60_000) / 1000 }]
+    state.outs.set(RUNNING.id, { mtimeMs: NOW - 2 * 60_000, text: `${lines.join('\n')}\n` })
+    await start($, clock)
+    expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status, finishedMs: NOW - 2 * 60_000 }] } })
+    expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', '262144', '--', `${JOBS}/${RUNNING.id}.out`]])
+    // An ended .out outranks the process check, so no ps runs for it.
+    expect(jobPsCalls(state)).toHaveLength(0)
+    // Its duration stops at the .out's time and the unchanged .out is not read again.
+    for (const elapsed of [0, 60_000]) {
+      await clock.advance(elapsed)
+      const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+      expect(await rowText(ui, /ads review/)).toMatch(new RegExp(`^${glyph} .*ads review`))
+      expect(await rowText(ui, new RegExp(`^${job.account} · 8 dk`))).toBeDefined()
+      expect(delegateOverlay(await ui.drawn(), 'Idle tab')).toBeUndefined()
+      await ui.unmount()
+    }
+    expect(tailCalls(state)).toHaveLength(1)
+    expect(jobPsCalls(state)).toHaveLength(0)
+  })
+}
+
+test('a still-running .out keeps its job running and is tailed again only after it changes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on)
+  state.jobs = [{ ...RUNNING, parent_session_id: 'idle-session' }]
+  const out = { mtimeMs: NOW - 1000, text: `${codexLine('thread.started')}\n${codexLine('turn.started')}\n` }
+  state.outs.set(RUNNING.id, out)
+  await start($, clock)
+  expect(tailCalls(state).map(call => call.argv)).toEqual([['tail', '-c', '262144', '--', `${JOBS}/${RUNNING.id}.out`]])
+  expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'running', finishedMs: null }] } })
+  const running = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(shownText(delegateOverlay(await running.drawn(), 'Idle tab'))).toMatch(badge('codex'))
+  await running.unmount()
+  await clock.advance(30_000)
+  expect(tailCalls(state)).toHaveLength(1)
+  expect(jobPsCalls(state).length).toBeGreaterThan(1)
+  out.text += `${codexLine('turn.completed')}\n`; out.mtimeMs = clock.now()
+  await clock.advance(10_000)
+  expect(tailCalls(state)).toHaveLength(2)
+  expect(state.snapshots.get('jobs')).toMatchObject({ value: { list: [{ id: RUNNING.id, status: 'done' }] } })
+  const done = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(delegateOverlay(await done.drawn(), 'Idle tab')).toBeUndefined()
+  await done.unmount()
+})
+
+test('a truncated .out tail ignores its partial first line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.jobs = [RUNNING, { ...RUNNING, id: 'claude-job', account: 'aras' }]
+  // Cut mid-line, a first line that looks ended is no evidence.
+  state.outs.set(RUNNING.id, { mtimeMs: NOW - 1000, size: 300_000,
+    text: `"type":"turn.failed","error":{}}\n${codexLine('turn.started')}\n` })
+  state.outs.set('claude-job', { mtimeMs: NOW - 1000, size: 300_000, text: '{"type":"result","is_error":false}\n' })
+  await start($, clock)
+  const list = (state.snapshots.get('jobs') as { value: { list: { id: string; status: string }[] } }).value.list
+  expect(list.map(job => [job.id, job.status])).toEqual([[RUNNING.id, 'running'], ['claude-job', 'running']])
+  expect(tailCalls(state)).toHaveLength(2)
+})
+
+test('one batched ps checks every running delegate whose .out has not ended, zombies included', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.jobs = [
+    { ...RUNNING, id: 'live', pid: 4242 },
+    { ...RUNNING, id: 'zombie', pid: 4243, started: (NOW - 60_000) / 1000 },
+    { ...RUNNING, id: 'gone', pid: 4244, started: (NOW - 65_000) / 1000 },
+    { ...RUNNING, id: 'ended', pid: 4245, started: (NOW - 70_000) / 1000 },
+  ]
+  state.processes.set(4243, { stat: 'Z+', command: '(codex)' })
+  state.processes.set(4245, { stat: 'S', command: '/opt/bin/codex exec -' })
+  state.outs.set('ended', { mtimeMs: NOW - 30_000, text: `${codexLine('turn.completed')}\n` })
+  await start($, clock)
+  expect(jobPsCalls(state).map(call => call.argv)).toEqual([['ps', '-ww', '-o', 'pid=,stat=,command=', '-p', '4242,4243,4244']])
+  const list = (state.snapshots.get('jobs') as { value: { list: { id: string; status: string }[] } }).value.list
+  expect(Object.fromEntries(list.map(job => [job.id, job.status]))).toEqual({ live: 'running', zombie: 'stale', gone: 'stale', ended: 'done' })
+})
+
+test('account borders list reset times over an hour apart with faint labels and critical value colors at 76 and 42 cells', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = [
+    ...oneAccount([
+      { ...limit(96, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + 50 * 3_600_000) },
+      { ...limit(75, 'weekly_all'), resets_at: iso(NOW + 26 * 3_600_000) },
+      { ...limit(3), resets_at: iso(NOW + 35 * 60_000) },
+    ]),
+    { name: 'aras', email: '', dir: '/aras', limits: [
+      { ...limit(45, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + 63 * 3_600_000) },
+      { ...limit(16), resets_at: iso(NOW + 35 * 60_000) },
+    ] },
+  ]
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const width of [76, 42]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    const kadir = resetOverlay(tree, 'kadir')!
+    expect(shownText(kadir)).toBe(' hafta 1g 2sa · Fable 2g 2sa ')
+    // The border never carries the 5-hour window.
+    expect(shownText(kadir)).not.toMatch(/5s|5 saat|35dk/)
+    expect(shownText(resetOverlay(tree, 'aras'))).toBe(' ↻ 2g 15sa ')
+    for (const name of ['kadir', 'aras']) {
+      const frame = accountFrame(tree, name)!
+      const border = laidOutRows(frame, width - 4)[0]!
+      expect(border).toMatch(/^╭─+ .* ─╮$/)
+      expect(cells(border)).toBe(width - 4)
+      expect(Number(resetOverlay(tree, name)?.props?.left)).toBeGreaterThanOrEqual(2)
+    }
+    const spans = drawnNodes(kadir).filter(node => node.type === 'Text')
+    for (const label of ['hafta ', 'Fable ']) {
+      expect(spans.find(node => shownText(node) === label)?.props?.dimColor).toBe(true)
+    }
+    const weekly = spans.find(node => shownText(node) === '1g 2sa')
+    expect(weekly?.props?.dimColor).toBe(true)
+    expect(weekly?.props?.color).toBeUndefined()
+    expect(spans.find(node => shownText(node) === '2g 2sa')?.props).toMatchObject({ color: 'error' })
+    expect(contentRows(accountCapsule(tree, 'kadir')).slice(-1)[0]).toBe(
+      `${width === 76 ? '  ' : ''}Fable 2g 2sa sonra açılır`)
+    expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('reset borders omit missing and passed resets, use the cell model name, and omit unreadable accounts', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.codexFiles.set(`${CODEX}/session.jsonl`, { mtimeMs: 1, text: rateLine(
+    { used_percent: 95, window_minutes: 300, resets_at: NOW / 1000 + 35 * 60 }) })
+  state.accounts = [
+    ...oneAccount([
+      { ...limit(90, 'weekly_scoped', 'Sonnet'), resets_at: iso(NOW + 35 * 60_000) },
+      { ...limit(30), resets_at: iso(NOW - 1) }, limit(40, 'weekly_all'),
+    ]),
+    { name: 'named', email: '', dir: '/named', limits: [
+      { ...limit(90, 'weekly_scoped', 'Sonnet'), resets_at: iso(NOW + 35 * 60_000) },
+      { ...limit(40, 'weekly_all'), resets_at: iso(NOW + 50 * 3_600_000) },
+    ] },
+    { name: 'passed', email: '', dir: '/passed', limits: [
+      { ...limit(40, 'weekly_all'), resets_at: iso(NOW - 1) }, limit(20, 'weekly_scoped', 'Fable'),
+    ] },
+    { ...STATUS[0]!, name: 'unreadable' },
+    { name: 'unknown', email: '', dir: '/unknown', limits: [limit(5)] },
+    { name: 'session-only', email: '', dir: '/session-only', limits: [
+      { ...limit(95), resets_at: iso(NOW + 35 * 60_000) },
+    ] },
+  ]
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const width of [76, 42]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    const overlay = resetOverlay(tree, 'kadir')!
+    expect(shownText(overlay)).toBe(' ↻ 35dk ')
+    expect(drawnNodes(overlay).find(node => shownText(node) === '35dk')?.props).toMatchObject({ color: 'error' })
+    const named = resetOverlay(tree, 'named')!
+    expect(shownText(named)).toBe(' hafta 2g 2sa · Sonnet 35dk ')
+    expect(drawnNodes(named).find(node => shownText(node) === '35dk')?.props).toMatchObject({ color: 'error' })
+    for (const name of ['passed', 'unreadable', 'unknown', 'session-only', 'codex']) expect(resetOverlay(tree, name)).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('reset parts are dropped from the end and disappear completely before touching the left corner', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  // Two hours apart, the weekly times stay a labelled list to drop from.
+  state.accounts = oneAccount([
+    { ...limit(5), resets_at: iso(NOW + 108 * 60_000) },
+    { ...limit(80, 'weekly_all'), resets_at: iso(NOW + 50 * 3_600_000) },
+    { ...limit(95, 'weekly_scoped', 'Extremely long model name'), resets_at: iso(NOW + 52 * 3_600_000) },
+  ])
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const [width, expected] of [[42, ' hafta 2g 2sa '], [24, ' hafta 2g 2sa '], [16, '']] as const) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    expect(shownText(resetOverlay(tree, 'kadir'))).toBe(expected)
+    const border = laidOutRows(accountFrame(tree, 'kadir'), width - 4)[0]!
+    expect(border).toMatch(/^╭─.*─╮$/)
+    expect(cells(border)).toBe(width - 4)
+    expect(border).not.toMatch(/…/)
+    await ui.unmount()
+  }
+})
+
+test('Codex reset borders use only its existing windows and their actual reset timestamps', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.codexFiles.set(`${CODEX}/limits.jsonl`, { mtimeMs: 1, text: rateLine(
+    { used_percent: 93, window_minutes: 10080, resets_at: NOW / 1000 + 50 * 3600 },
+    { used_percent: 20, window_minutes: 300, resets_at: NOW / 1000 + 35 * 60 }) })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const width of [76, 42]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const overlay = resetOverlay(await ui.drawn(), 'codex')!
+    expect(shownText(overlay)).toBe(' ↻ 2g 2sa ')
+    expect(shownText(overlay)).not.toMatch(/5s|35dk/)
+    expect(drawnNodes(overlay).find(node => shownText(node) === '2g 2sa')?.props?.color).toBe('error')
+    expect(drawnNodes(overlay).find(node => shownText(node) === '↻ ')?.props?.dimColor).toBe(true)
+    expect(shownText(overlay)).not.toContain('Fable')
+    await ui.unmount()
+  }
+})
+
+test('reset border text changes only on minute boundaries even while another row spins', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.jobs = [RUNNING]
+  state.accounts = oneAccount([{ ...limit(10, 'weekly_all'), resets_at: iso(NOW + 108 * 60_000) }])
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1sa 48dk ')
+  for (const target of [NOW + 1000, NOW + 30_000, NOW + 59_900]) {
+    await clock.set(target)
+    expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1sa 48dk ')
+  }
+  await clock.set(NOW + 60_100)
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 1sa 47dk ')
+  await ui.unmount()
+})
+
+test('quiet reset borders schedule a minute callback with no one-second timer', async ($, on) => {
+  const clock = observedClock(on); const redraws: number[] = []
+  on('ui.invalidate', { event: 'ui.render' }, async (_, e, next) => { redraws.push(clock.now()); return next(e) })
+  const state = world(on); idle(state)
+  state.accounts = oneAccount([{ ...limit(10, 'weekly_all'), resets_at: iso(NOW + 35 * 60_000) }])
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(67); redraws.length = 0
+  expect(clock.waits().filter(wait => wait.kind === 'after')).toEqual([{ kind: 'after', ms: 59_933 }])
+  expect(clock.waits().some(wait => wait.ms === 1000)).toBe(false)
+  await clock.advance(59_932)
+  expect(redraws).toHaveLength(0)
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 35dk ')
+  await clock.advance(101)
+  expect(shownText(resetOverlay(await ui.drawn(), 'kadir'))).toBe(' ↻ 34dk ')
+  await ui.unmount()
+})
+
+test('weekly resets at most an hour apart show one earliest time, colored for the most used window', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  const hour = 3_600_000
+  const weekly = (allAt: number, scopedAt: number, allUsed = 40, scopedUsed = 50): RawLimit[] => [
+    { ...limit(allUsed, 'weekly_all'), resets_at: iso(NOW + allAt) },
+    { ...limit(scopedUsed, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + scopedAt) },
+    { ...limit(10), resets_at: iso(NOW + 35 * 60_000) },
+  ]
+  state.accounts = [
+    { name: 'same', email: '', dir: '/same', limits: weekly(50 * hour, 50 * hour) },
+    { name: 'hour', email: '', dir: '/hour', limits: weekly(51 * hour, 50 * hour) },
+    { name: 'apart', email: '', dir: '/apart', limits: weekly(51 * hour + 60_000, 50 * hour) },
+    { name: 'days', email: '', dir: '/days', limits: weekly(26 * hour, 50 * hour) },
+    { name: 'one', email: '', dir: '/one', limits: [
+      { ...limit(20, 'weekly_scoped', 'Fable'), resets_at: iso(NOW + 35 * 60_000) }, limit(10, 'weekly_all')] },
+    { name: 'hot', email: '', dir: '/hot', limits: weekly(50 * hour, 50 * hour + 30 * 60_000, 75, 96) },
+  ]
+  state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine(
+    { used_percent: 93, window_minutes: 10080, resets_at: NOW / 1000 + 26 * 3600 }) })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  for (const width of [76, 42]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    for (const [name, shown] of [
+      ['same', ' ↻ 2g 2sa '], ['hour', ' ↻ 2g 2sa '], ['apart', ' hafta 2g 3sa · Fable 2g 2sa '],
+      ['days', ' hafta 1g 2sa · Fable 2g 2sa '], ['one', ' ↻ 35dk '], ['hot', ' ↻ 2g 2sa '], ['codex', ' ↻ 1g 2sa '],
+    ] as const) {
+      expect(shownText(resetOverlay(tree, name))).toBe(shown)
+      const border = laidOutRows(accountFrame(tree, name), width - 4)[0]!
+      expect(border).toMatch(/^╭─+ .* ─╮$/)
+      expect(cells(border)).toBe(width - 4)
+    }
+    const span = (name: string, text: string) => drawnNodes(resetOverlay(tree, name)).find(node =>
+      node.type === 'Text' && shownText(node) === text)?.props
+    for (const name of ['same', 'hour', 'one', 'hot', 'codex']) {
+      expect(span(name, '↻ ')).toMatchObject({ dimColor: true })
+      expect(span(name, '↻ ')?.color).toBeUndefined()
+    }
+    for (const [name, value] of [['same', '2g 2sa'], ['hour', '2g 2sa'], ['one', '35dk']] as const) {
+      expect(span(name, value)).toMatchObject({ dimColor: true })
+      expect(span(name, value)?.color).toBeUndefined()
+    }
+    expect(span('hot', '2g 2sa')).toMatchObject({ color: 'error' })
+    expect(span('codex', '1g 2sa')).toMatchObject({ color: 'error' })
+    expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('a server refresh deadline between spinner frames is not delayed by the repaint budget', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const redraws: number[] = []
+  on('ui.invalidate', { event: 'ui.render' }, async (_, e, next) => { redraws.push(clock.now()); return next(e) })
+  const state = world(on); idle(state); state.jobs = [RUNNING]
+  state.accounts = [{ ...STATUS[0]!, next_refresh_at: (NOW + 250) / 1000 }]
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(249)
+  expect(statusCalls(state)).toHaveLength(1)
+  await clock.advance(1)
+  expect(statusCalls(state)).toHaveLength(2)
+  await clock.advance(100)
+  for (let index = 1; index < redraws.length; index += 1) {
+    expect(redraws[index]! - redraws[index - 1]!).toBeGreaterThanOrEqual(67)
+  }
+  await ui.unmount()
+})
+
+// MARK: - Compact accounts
+
+const summaryAccounts = (): RawAccount[] => [
+  ...oneAccount([limit(4), limit(75, 'weekly_all'), limit(96, 'weekly_scoped', 'Fable')]),
+  { name: 'aras', email: '', dir: '/aras', limits: [limit(46), limit(20, 'weekly_all')] },
+  { name: 'yusa', email: '', dir: '/yusa', limits: [limit(64, 'weekly_all')] },
+]
+const summaryRows = (tree: unknown): string[] => contentRows(accountsCard(tree)).filter(row => !row.includes('Hesaplar'))
+
+for (const width of [76, 42]) {
+  test(`Hesaplar has no vertical spacing or blank rows at ${width} columns`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+    state.accounts = summaryAccounts()
+    state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine(
+      { used_percent: 2, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
+    await start($, clock)
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await ui.drawn()
+    const card = accountsCard(tree)!
+    const rows = laidOutRows(card, width)
+    const frames = drawnNodes(card).filter(node => /^capsule:account:/.test(String(node.props?.key)))
+    const expectedHeight = frames.reduce((sum, frame) => sum + laidOutRows(frame, width - 4).length, 2)
+    expect(rows).toHaveLength(expectedHeight)
+    expect(rows).toHaveLength(width === 76 ? 15 : 27)
+    expect(rows.every(row => !/^[│\s]*$/.test(row))).toBe(true)
+    expect(rows[1]).toMatch(/╭─/)
+    expect(rows[rows.length - 2]).toMatch(/╰─/)
+    for (const capsule of frames) {
+      expect(contentRows(capsule).every(row => row.trim() !== '')).toBe(true)
+      for (const node of drawnNodes(capsule).filter(node => node.type === 'Box' && node.props?.position !== 'absolute')) {
+        expect(node.props).toMatchObject({ gap: 0, paddingY: 0, marginY: 0 })
+      }
+    }
+    const otherCards = (tree as DrawnNode).children!.slice(1)
+    expect(otherCards.every(node => (node as DrawnNode).props?.paddingY === undefined)).toBe(true)
+    await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+    const collapsed = laidOutRows(accountsCard(await ui.drawn()), width)
+    expect(collapsed).toHaveLength(3)
+    expect(collapsed.length).toBeLessThan(rows.length)
+    expect(collapsed.every(row => cells(row) === width)).toBe(true)
+    await ui.unmount()
+  })
+}
+
+test('only the accounts title toggles, through a Button that is the visible title itself, on every surface', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = summaryAccounts()
+  await start($, clock)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface })
+    expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
+    const card = accountsCard(await ui.drawn())!
+    expect(drawnNodes(card).filter(node => node.type === 'Button')).toHaveLength(1)
+    const button = drawnNodes(card).find(node => node.type === 'Button')!
+    expect(button.props).toMatchObject({ key: 'accounts:toggle', plain: true, label: 'Hesaplar ▾' })
+    expect(shownText(button)).toBe(' Hesaplar ▾ ')
+    // The keyed title Box holds only the Button, on the border row, painted
+    // over by nothing: it is the card's last child.
+    const title = drawnNodes(card).find(node => (node.children ?? []).includes(button))!
+    expect(title.props).toMatchObject({ key: 'accounts:title', position: 'absolute', top: 0, left: 2,
+      width: cells(' Hesaplar ▾ ') })
+    expect(title.children).toHaveLength(1)
+    expect((card.children ?? []).indexOf(title)).toBe((card.children ?? []).length - 1)
+    expect(coveredButtons(await ui.drawn(), 76)).toEqual([])
+    await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+    expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▸ ')
+    expect(accountFrame(await ui.drawn(), 'kadir')).toBeUndefined()
+    expect(summaryRows(await ui.drawn())).toHaveLength(1)
+    expect(state.store.get('isAccountsOpen')).toBe(false)
+    await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+    expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▾ ')
+    expect(accountFrame(await ui.drawn(), 'kadir')).toBeDefined()
+    expect(state.store.get('isAccountsOpen')).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('collapsed accounts show ordered markers and their maximum usage in the matching value color', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = [...summaryAccounts(), { name: 'lost', email: '', dir: '/lost', err: 'HTTP 401' }]
+  state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine(
+    { used_percent: 2, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+  const card = accountsCard(await ui.drawn())!
+  expect(summaryRows(card)).toEqual(['● kadir 96%  ○ aras 46%  ○ yusa 64%  ○ lost ?  ◎ codex 2%'])
+  for (const [value, color] of [['96%', 'error'], ['46%', 'success'], ['64%', 'success'], ['?', 'warning'], ['2%', 'success']]) {
+    expect(drawnNodes(card).find(node => node.type === 'Text' && shownText(node) === value)?.props?.color).toBe(color)
+  }
+  expect(drawnNodes(card).find(node => node.type === 'Text' && shownText(node) === '● ')?.props?.color).toBe('claude')
+  state.accounts = oneAccount([limit(89)]); await clock.advance(60_000)
+  const warning = drawnNodes(accountsCard(await ui.drawn())).find(node => node.type === 'Text' && shownText(node) === '89%')
+  expect(warning?.props?.color).toBe('warning')
+  await ui.unmount()
+})
+
+test('collapsed summaries drop whole trailing accounts and append an ellipsis within the available cells', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = summaryAccounts()
+  state.codexFiles.set(`${CODEX}/weekly.jsonl`, { mtimeMs: 1, text: rateLine(
+    { used_percent: 2, window_minutes: 10080, resets_at: NOW / 1000 + 3600 }) })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 76 }, surface: 'terminal' })
+  await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+  await ui.unmount()
+  for (const [width, expected] of [
+    [76, '● kadir 96%  ○ aras 46%  ○ yusa 64%  ◎ codex 2%'],
+    [42, '● kadir 96%  ○ aras 46%  ○ yusa 64%  …'],
+    [27, '● kadir 96%  …'], [16, '…'],
+  ] as const) {
+    const narrow = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: width }, surface: 'terminal' })
+    const tree = await narrow.drawn()
+    expect(summaryRows(tree)).toEqual([expected])
+    expect(laidOutRows(tree, width).every(row => cells(row) <= width)).toBe(true)
+    await narrow.unmount()
+  }
+})
+
+for (const stored of [false, true, 'invalid', undefined]) {
+  test(`the persistent accounts preference restores ${String(stored)} with open as the default`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+    state.store.set('isAccountsOpen', stored)
+    await start($, clock)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await rowText(ui, /Hesaplar/)).toBe(stored === false ? ' Hesaplar ▸ ' : ' Hesaplar ▾ ')
+    await ui.unmount()
+  })
+}
+
+test('the accounts choice survives remounts and is reloaded from storage on session start', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+  expect(state.store.get('isAccountsOpen')).toBe(false)
+  await ui.unmount()
+  const reload = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await rowText(reload, /Hesaplar/)).toBe(' Hesaplar ▸ ')
+  await reload.unmount()
+  state.snapshots.delete('isAccountsOpen')
+  const reads = state.storeReads.length
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle()
+  expect(state.storeReads.length).toBeGreaterThan(reads)
+  expect(state.snapshots.get('isAccountsOpen')).toBe(false)
+  const tab = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await rowText(tab, /Hesaplar/)).toBe(' Hesaplar ▸ ')
+  await tab.press({ key: 'accounts:toggle' }); await clock.settle()
+  expect(state.store.get('isAccountsOpen')).toBe(true)
+  await tab.unmount()
+})
+
+test('collapsed accounts keep refreshing data and retain the spinner beside their title', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW }); const state = world(on); idle(state)
+  state.accounts = [{ ...summaryAccounts()[0]!, next_refresh_at: (NOW + 2000) / 1000 }]
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'accounts:toggle' }); await clock.settle()
+  expect(summaryRows(await ui.drawn())).toEqual(['● kadir 96%  ◎ codex ?'])
+  let release!: () => void
+  state.accountsGate = new Promise<void>(resolve => { release = resolve })
+  state.accounts = [{ ...oneAccount([limit(24)])[0]!, next_refresh_at: (NOW + 60_000) / 1000 }]
+  await clock.advance(1000)
+  expect(statusCalls(state)).toHaveLength(2)
+  expect(await rowText(ui, /Hesaplar/)).toMatch(/^ Hesaplar ▸ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] $/)
+  expect(laidOutRows(accountsCard(await ui.drawn()), 42)).toHaveLength(3)
+  release(); await clock.settle(); await clock.advance(100)
+  expect(await rowText(ui, /Hesaplar/)).toBe(' Hesaplar ▸ ')
+  expect(summaryRows(await ui.drawn())).toEqual(['● kadir 24%  ◎ codex ?'])
+  expect(accountFrame(await ui.drawn(), 'kadir')).toBeUndefined()
   await ui.unmount()
 })

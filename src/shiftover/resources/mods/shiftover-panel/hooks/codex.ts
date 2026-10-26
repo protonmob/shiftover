@@ -34,14 +34,17 @@ export function parseCodexLimits(raw: string): Limit[] {
   for (const key of ['primary', 'secondary']) {
     const window = windows[key]
     if (!isRecord(window)) continue
-    const kind = window.window_minutes === 300 ? 'session'
-      : window.window_minutes === 10_080 ? 'weekly_all' : null
+    const minutes = window.window_minutes
     const used = window.used_percent
-    if (kind === null || typeof used !== 'number' || !Number.isFinite(used)) continue
+    if (typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes <= 0
+      || typeof used !== 'number' || !Number.isFinite(used)) continue
+    const kind = minutes === 300 ? 'session'
+      : minutes === 10_080 ? 'weekly_all' : 'rate_window'
     const reset = window.resets_at
     limits.push({
       kind,
       model: '',
+      windowMinutes: minutes,
       used,
       resetsAtMs: typeof reset === 'number' && Number.isFinite(reset) ? reset * 1000 : null,
     })
@@ -64,6 +67,7 @@ export async function readCodexLimits($: EngineInterface, home: string, now: num
     return `${home}/.codex/sessions/${date.join('/')}`
   })
   const batches = await Promise.all(folders.map(async folder => {
+    if (!(await isPlaced($))) return []
     const entries = await $.fs.list(folder).catch(() => [])
     return entries
       .filter(entry => entry.kind === 'file' && entry.name.endsWith('.jsonl'))

@@ -1,11 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { Color, EngineInterface, Register, RenderChildren, TextProps, Timer, TurnStepResult } from 'claude-code'
+import type { Color, EngineInterface, FsEntry, Register, RenderChildren, TextHoverProps, TextProps,
+  Timer } from 'claude-code'
 
-import type { Account, AccountsSnapshot, AgentsSnapshot, ChatSession, Job, JobsSnapshot, Limit, PaneAgent,
-  SessionSnapshot, UsageTotals, CodexSnapshot } from '../types'
+import type { Account, AccountsSnapshot, AgentsSnapshot, ChatSession, CodexSnapshot, Job, JobsSnapshot,
+  Limit, PaneAgent } from '../types'
 
 import { readCodexLimits } from './codex'
-import { refreshChats, focusChat, openDelegate } from './sessions'
+import { refreshChats, refreshStarters, focusChat, openDelegate, parentChat } from './sessions'
 import type { ChatsSnapshot } from './sessions'
 
 // MARK: - Constants
@@ -14,30 +15,32 @@ const PANE = 'shiftover-panel'
 const TITLE = 'Shiftover'
 const JOBS_MS = 10_000
 const ACCOUNTS_MS = 60_000
+const ACCOUNTS_RETRY_MS = 30_000
 const FRAME_MS = 100
 const MIN_FRAME_MS = 67
 const WAITING_BLINK_MS = 600
-const IDLE_BLINK_MS = 1_500
+const WAITING_BORDER_MS = 10_000
+const WAITING_BORDER_FLASH_MS = 1_000
+const CURRENT_COLOR: Color = 'claude'
+// The theme's dim color: a muted row inverts to a soft grey bar.
+const MUTED: Color = 'inactive'
 const POP_MS = 250
 const FINISH_MS = 2_000
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 const CAPSULES_SHOWN = 3
 const UNVERIFIED_RUNNING_MS = 2 * 60 * 60 * 1000
+const RESET_GROUP_MS = 60 * 60_000
+const TAIL_BYTES = 256 * 1024
 // Requested dock width; drawing uses the actual bodyColumns grant.
-const DOCK_COLUMNS = 42
+const DOCK_COLUMNS = 76
 
 // MARK: - State
 
 const NO_ACCOUNTS: AccountsSnapshot = { list: [], current: null, at: 0, error: null }
 const NO_JOBS: JobsSnapshot = { list: [], at: 0, error: null }
-const NO_SESSION: SessionSnapshot = { usage: null, mcpServers: null, at: 0, error: null }
 const NO_CODEX: CodexSnapshot = { limits: [], at: 0, error: null }
 const NO_CHATS: ChatsSnapshot = { list: [], at: 0, error: null }
 const NO_AGENTS: AgentsSnapshot = { list: [], at: 0, error: null }
-const NO_TOTALS: UsageTotals = {
-  startedAt: null, input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
-  responses: 0, usageResponses: 0, responseIds: [], activeMs: 0, turns: 0, turnIds: [],
-}
 
 // Bump a tag when its snapshot's fields change: what an earlier version
 // stored outlives a reload, and the tag is how the new code declines it.
@@ -46,15 +49,17 @@ const accounts = atom({ plugin: 'shiftover-panel', key: 'accounts' } as const, N
 })
 const jobs = atom({ plugin: 'shiftover-panel', key: 'jobs' } as const, NO_JOBS, { shape: 'jobs-1' })
 const isDismissed = atom({ plugin: 'shiftover-panel', key: 'isDismissed' } as const, false)
-const session = atom({ plugin: 'shiftover-panel', key: 'session' } as const, NO_SESSION, { shape: 'session-2' })
-const totals = atom({ plugin: 'shiftover-panel', key: 'totals' } as const, NO_TOTALS, { shape: 'totals-1' })
+const isAccountsOpen = atom({ plugin: 'shiftover-panel', key: 'isAccountsOpen' } as const, true)
 const codex = atom({ plugin: 'shiftover-panel', key: 'codex' } as const, NO_CODEX, { shape: 'codex-1' })
-const chats = atom({ plugin: 'shiftover-panel', key: 'chats' } as const, NO_CHATS, { shape: 'chats-1' })
+const chats = atom({ plugin: 'shiftover-panel', key: 'chats' } as const, NO_CHATS, { shape: 'chats-2' })
 const agents = atom({ plugin: 'shiftover-panel', key: 'agents' } as const, NO_AGENTS, { shape: 'agents-1' })
 
 // What the module keeps between timer ticks; a reload starts it over.
 type Files = { home: string; jobsDir: string; configFile: string; bin: string }
-type CachedJob = { mtimeMs: number; size: number; job: Job | null }
+// The backend stays here, out of the stored Job shape.
+type CachedJob = { mtimeMs: number; size: number; job: Job | null; backend: string }
+type CachedOut = { mtimeMs: number; size: number; verdict: string | null }
+type JobRead = { job: Job; backend: string; out: FsEntry | undefined }
 
 let files: Files | null = null
 let poller: Timer | null = null
@@ -63,9 +68,9 @@ let animationDue = Number.POSITIVE_INFINITY
 let animationGeneration = 0
 let lastFrameAt = Number.NEGATIVE_INFINITY
 let repaintPending = false
+let focusedCapsule: string | undefined
 let chatsRunning = false
 let chatsWaiting = false
-let chatsIdle = false
 let motionJobs = NO_JOBS
 let motionAgents = NO_AGENTS
 let jobsObserved = false
@@ -74,12 +79,14 @@ const jobStatuses = new Map<string, string>()
 const finishedMotion = new Map<string, number>()
 let isReadingJobs = false
 let isReadingAccounts = false
-let isReadingSession = false
+let isReadingAgents = false
 let isReadingChats = false
 let isReadingCodex = false
-let sessionGeneration = 0
+let agentsGeneration = 0
 let accountsTriedAt = Number.NEGATIVE_INFINITY
+let accountsRetryAt = Number.NEGATIVE_INFINITY
 const jobFiles = new Map<string, CachedJob>()
+const jobOuts = new Map<string, CachedOut>()
 
 // MARK: - Parsing
 
@@ -120,42 +127,80 @@ function parseAccounts(stdout: string): Account[] {
       name: asText(row.name),
       email: asText(row.email),
       dir: asText(row.dir),
+      nextRefreshAtMs: toEpochMs(row.next_refresh_at),
+      fetchedAtMs: toEpochMs(row.fetched_at),
       limits: Array.isArray(row.limits) ? row.limits.filter(isRecord).flatMap(parseLimit) : [],
       err: asText(row.err) === '' ? null : asText(row.err),
     }))
     .filter(account => account.name !== '')
 }
 
-function parseJob(raw: string, fileName: string): Job | null {
+function nextAccountRefresh(list: Account[]): number | null {
+  const times = list.flatMap(account => typeof account.nextRefreshAtMs === 'number' &&
+    Number.isFinite(account.nextRefreshAtMs) ? [account.nextRefreshAtMs] : [])
+  return times.length === 0 ? null : Math.min(...times)
+}
+
+function parseJob(raw: string, fileName: string): Pick<CachedJob, 'job' | 'backend'> | null {
   const row: unknown = JSON.parse(raw)
   if (!isRecord(row)) return null
   const finished = asNumber(row.finished)
+  const account = asText(row.account)
   return {
-    id: asText(row.id) || fileName.replace(/\.json$/, ''),
-    account: asText(row.account),
-    model: asText(row.model),
-    // Keep the stored job shape: the directory is only a display fallback.
-    label: asText(row.label).trim() === ''
-      ? asText(row.cwd).replace(/\/+$/, '').split('/').pop() ?? ''
-      : asText(row.label),
-    status: asText(row.status) || 'unknown',
-    pid: asNumber(row.pid) ?? 0,
-    startedMs: (asNumber(row.started) ?? 0) * 1000,
-    finishedMs: finished !== null && finished > 0 ? finished * 1000 : null,
-    durationMs: asNumber(row.duration_ms),
-    costUsd: asNumber(row.cost_usd),
+    job: {
+      id: asText(row.id) || fileName.replace(/\.json$/, ''),
+      account,
+      model: asText(row.model),
+      // Keep the stored job shape: the directory is only a display fallback.
+      label: asText(row.label).trim() === ''
+        ? asText(row.cwd).replace(/\/+$/, '').split('/').pop() ?? ''
+        : asText(row.label),
+      status: asText(row.status) || 'unknown',
+      pid: asNumber(row.pid) ?? 0,
+      parentSessionId: asText(row.parent_session_id) || undefined,
+      parentPid: asNumber(row.parent_pid) ?? undefined,
+      startedMs: (asNumber(row.started) ?? 0) * 1000,
+      finishedMs: finished !== null && finished > 0 ? finished * 1000 : null,
+      durationMs: asNumber(row.duration_ms),
+      costUsd: asNumber(row.cost_usd),
+    },
+    // Older job files name no backend: only the codex account runs Codex.
+    backend: asText(row.backend) || (account === 'codex' ? 'codex' : 'claude'),
   }
+}
+
+// claude -p ends its .out with one result line; codex exec --json ends a turn
+// with turn.completed or turn.failed. Null while neither shows.
+function outcomeOf(tail: string, backend: string, truncated: boolean): string | null {
+  const lines = tail.split('\n').slice(truncated ? 1 : 0)
+  if (backend === 'codex') {
+    const text = lines.join('\n')
+    const done = text.lastIndexOf('"type":"turn.completed"')
+    const failed = text.lastIndexOf('"type":"turn.failed"')
+    return done < 0 && failed < 0 ? null : done > failed ? 'done' : 'failed'
+  }
+  try {
+    const row: unknown = JSON.parse(lines.filter(line => line.trim() !== '').pop() ?? '')
+    if (isRecord(row) && row.type === 'result') return row.is_error === true ? 'failed' : 'done'
+  } catch {
+    // A last line still being written is a job still running.
+  }
+  return null
 }
 
 // MARK: - Reading
 
 async function locate($: EngineInterface): Promise<Files> {
   if (files !== null) return files
+  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
   const home = (await $.env.get('HOME')) ?? ''
   if (home === '') throw new Error('HOME tanımsız')
+  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
   const cache = (await $.env.get('XDG_CACHE_HOME')) || `${home}/.cache`
+  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
   const config = (await $.env.get('XDG_CONFIG_HOME')) || `${home}/.config`
   const local = `${home}/.local/bin/shiftover`
+  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
   const hasLocal = await $.fs.exists(local).catch(() => false)
   files = {
     home,
@@ -187,9 +232,11 @@ async function readMain($: EngineInterface, configFile: string): Promise<string 
 // Claude Code reads CLAUDE_CONFIG_DIR, else ~/.claude: the account on that
 // dir is this session's. Then shiftover's own word, then its main account.
 async function currentAccount($: EngineInterface, list: Account[], at: Files): Promise<string | null> {
+  if (!(await isPlaced($))) return null
   const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${at.home}/.claude`
   const byDir = list.find(account => normalizeDir(account.dir, at.home) === normalizeDir(dir, at.home))
   if (byDir) return byDir.name
+  if (!(await isPlaced($))) return null
   const named = await $.env.get('SHIFTOVER_ACCOUNT')
   if (named && list.some(account => account.name === named)) return named
   const main = await readMain($, at.configFile)
@@ -197,7 +244,8 @@ async function currentAccount($: EngineInterface, list: Account[], at: Files): P
 }
 
 async function refreshAccounts($: EngineInterface): Promise<void> {
-  if (isReadingAccounts || !(await isPlaced($))) return
+  if (isReadingAccounts) return
+  if (!(await isPlaced($)) || isReadingAccounts) return
   isReadingAccounts = true
   try {
     await reconcileMotion($, true)
@@ -212,27 +260,38 @@ async function refreshAccounts($: EngineInterface): Promise<void> {
     if (!(await isPlaced($))) return
     const list = parseAccounts(ran.stdout)
     const current = await currentAccount($, list, at)
+    if (!(await isPlaced($))) return
     const now = await $.clock.now()
     const snapshot = { list, current, at: now, error: null }
     await update($, accounts, () => snapshot)
   } catch (err) {
+    if (!(await isPlaced($))) return
     const error = describe(err)
     await update($, accounts, held => ({ ...held, error })).catch(() => undefined)
   } finally {
-    isReadingAccounts = false
-    await reconcileMotion($, true)
+    try {
+      const now = await $.clock.now()
+      const target = nextAccountRefresh((await read($, accounts)).list)
+      accountsRetryAt = target !== null && target <= now ? now + ACCOUNTS_RETRY_MS : Number.NEGATIVE_INFINITY
+    } finally {
+      isReadingAccounts = false
+      await reconcileMotion($, true)
+    }
   }
 }
 
-// Reads only the job files that changed since the last tick.
-async function readJobs($: EngineInterface, dir: string): Promise<Job[]> {
+// Reads only the job files that changed since the last tick, each with the
+// listing's entry for its .out.
+async function readJobs($: EngineInterface, dir: string): Promise<JobRead[]> {
   if (!(await isPlaced($))) return []
   if (!(await $.fs.exists(dir))) {
     jobFiles.clear()
     return []
   }
   if (!(await isPlaced($))) return []
-  const entries = (await $.fs.list(dir)).filter(f => f.kind === 'file' && f.name.endsWith('.json'))
+  const listing = (await $.fs.list(dir)).filter(f => f.kind === 'file')
+  const entries = listing.filter(f => f.name.endsWith('.json'))
+  const outs = new Map(listing.filter(f => f.name.endsWith('.out')).map(f => [f.name, f]))
   const names = new Set(entries.map(entry => entry.name))
   for (const name of [...jobFiles.keys()]) if (!names.has(name)) jobFiles.delete(name)
   for (const entry of entries) {
@@ -240,31 +299,62 @@ async function readJobs($: EngineInterface, dir: string): Promise<Job[]> {
     if (held && held.mtimeMs === entry.mtimeMs && held.size === entry.size) continue
     try {
       if (!(await isPlaced($))) return []
-      const job = parseJob(await $.fs.read(`${dir}/${entry.name}`), entry.name)
-      jobFiles.set(entry.name, { mtimeMs: entry.mtimeMs, size: entry.size, job })
+      const parsed = parseJob(await $.fs.read(`${dir}/${entry.name}`), entry.name)
+      jobFiles.set(entry.name, { mtimeMs: entry.mtimeMs, size: entry.size, job: parsed?.job ?? null,
+        backend: parsed?.backend ?? 'claude' })
     } catch {
       // Caught mid-write: keep what it held, read it again next tick.
-      jobFiles.set(entry.name, { mtimeMs: -1, size: -1, job: held?.job ?? null })
+      jobFiles.set(entry.name, { mtimeMs: -1, size: -1, job: held?.job ?? null, backend: held?.backend ?? 'claude' })
     }
   }
-  return [...jobFiles.values()].flatMap(held => (held.job ? [held.job] : []))
+  return [...jobFiles.values()].flatMap(held => (held.job
+    ? [{ job: held.job, backend: held.backend, out: outs.get(`${held.job.id}.out`) }] : []))
+}
+
+// A running job's .out can say how it ended before its file does. Its tail
+// is read again only after the listing shows the .out changed.
+async function readOutcomes($: EngineInterface, dir: string, running: JobRead[]): Promise<Map<string, string>> {
+  const ids = new Set(running.map(({ job }) => job.id))
+  for (const id of [...jobOuts.keys()]) if (!ids.has(id)) jobOuts.delete(id)
+  const outcomes = new Map<string, string>()
+  for (const { job, backend, out } of running) {
+    if (out === undefined) continue
+    let held = jobOuts.get(job.id)
+    if (held?.size !== out.size || held.mtimeMs !== out.mtimeMs) {
+      try {
+        if (!(await isPlaced($))) return outcomes
+        const ran = await $.process.run(['tail', '-c', String(TAIL_BYTES), '--', `${dir}/${job.id}.out`], {
+          timeoutMs: 5_000,
+        })
+        if (ran.exitCode !== 0) throw new Error('tail')
+        held = { mtimeMs: out.mtimeMs, size: out.size, verdict: outcomeOf(ran.stdout, backend, out.size > TAIL_BYTES) }
+      } catch {
+        // Keep what it said and read it again next tick.
+        held = { mtimeMs: -1, size: -1, verdict: held?.verdict ?? null }
+      }
+      jobOuts.set(job.id, held)
+    }
+    if (held.verdict !== null) outcomes.set(job.id, held.verdict)
+  }
+  return outcomes
 }
 
 // A job's file says `running` until shiftover collects it; `ps` says whether
-// its process is still there. Null when `ps` gave no answer.
+// its process is still there, a zombie not. Null when `ps` gave no answer.
 async function livePids($: EngineInterface, pids: number[]): Promise<Set<number> | null> {
   if (pids.length === 0) return new Set()
   try {
     if (!(await isPlaced($))) return null
-    const ran = await $.process.run(['ps', '-ww', '-o', 'pid=,command=', '-p', pids.join(',')], {
+    const ran = await $.process.run(['ps', '-ww', '-o', 'pid=,stat=,command=', '-p', pids.join(',')], {
       timeoutMs: 5_000,
     })
     if ((ran.exitCode !== 0 && ran.exitCode !== 1) ||
       (ran.exitCode === 1 && ran.stderr.trim() !== '')) return null
     const live = new Set<number>()
     for (const line of ran.stdout.split('\n')) {
-      const found = /^\s*(\d+)\s+(.*)$/.exec(line)
-      if (found && /claude|codex/i.test(found[2] ?? '')) live.add(Number(found[1]))
+      // macOS names a zombie's command `(codex)`; only its Z state tells.
+      const found = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line)
+      if (found && !(found[2] ?? '').startsWith('Z') && /claude|codex/i.test(found[3] ?? '')) live.add(Number(found[1]))
     }
     return live
   } catch {
@@ -285,9 +375,12 @@ async function refreshJobs($: EngineInterface): Promise<void> {
   if (isReadingJobs || !(await isPlaced($))) return
   isReadingJobs = true
   try {
-    const all = await readJobs($, (await locate($)).jobsDir)
+    const dir = (await locate($)).jobsDir
+    const all = await readJobs($, dir)
     if (!(await isPlaced($))) return
-    const pids = all.filter(job => job.status === 'running' && job.pid > 0).map(job => job.pid)
+    const outcomes = await readOutcomes($, dir, all.filter(({ job }) => job.status === 'running'))
+    const pids = all.filter(({ job }) => job.status === 'running' && !outcomes.has(job.id) && job.pid > 0)
+      .map(({ job }) => job.pid)
     const live = await livePids($, pids)
     const now = await $.clock.now()
     const isStale = (job: Job): boolean => {
@@ -297,7 +390,12 @@ async function refreshJobs($: EngineInterface): Promise<void> {
       const age = now - job.startedMs
       return !(job.startedMs > 0 && age >= 0 && age < UNVERIFIED_RUNNING_MS)
     }
-    const list = pickJobs(all.map(job => (isStale(job) ? { ...job, status: 'stale' } : job)))
+    // An ended .out outranks the process check; its time stops the duration.
+    const list = pickJobs(all.map(({ job, out }) => {
+      const outcome = outcomes.get(job.id)
+      if (outcome !== undefined) return { ...job, status: outcome, finishedMs: job.finishedMs ?? out?.mtimeMs ?? now }
+      return isStale(job) ? { ...job, status: 'stale' } : job
+    }))
     const snapshot = { list, at: now, error: null }
     observeJobs(snapshot, now, await isPlaced($))
     await update($, jobs, () => snapshot)
@@ -313,74 +411,31 @@ async function refreshJobs($: EngineInterface): Promise<void> {
 const agentIsRunning = (agent: Pick<PaneAgent, 'status'>): boolean =>
   agent.status === 'running' || agent.status === 'pending' || agent.status === 'waiting'
 
-async function recordResponse($: EngineInterface, result: TurnStepResult, agentId?: string): Promise<void> {
-  if (result.stopReason === null && result.usage === null) return
-  const id = JSON.stringify([agentId ?? null, result.turnId, result.index])
-  await update($, totals, held => {
-    if (held.responseIds.includes(id)) return held
-    const usage = result.usage
-    return {
-      ...held,
-      input: held.input + (usage?.input_tokens ?? 0),
-      output: held.output + (usage?.output_tokens ?? 0),
-      cacheRead: held.cacheRead + (usage?.cache_read_input_tokens ?? 0),
-      cacheWrite: held.cacheWrite + (usage?.cache_creation_input_tokens ?? 0),
-      responses: held.responses + 1,
-      usageResponses: held.usageResponses + (usage === null ? 0 : 1),
-      responseIds: [...held.responseIds, id],
-    }
-  })
-}
-
-// All three sources are local engine reads. In particular, summary never
-// uses the token-count API. Even a forced tick may not read an unplaced pane.
-async function refreshSession($: EngineInterface): Promise<void> {
-  if (isReadingSession) return
-  isReadingSession = true
-  const generation = sessionGeneration
+// Even a forced tick may not read agents for an unplaced pane.
+async function refreshAgents($: EngineInterface): Promise<void> {
+  if (isReadingAgents || !(await isPlaced($))) return
+  isReadingAgents = true
+  const generation = agentsGeneration
   try {
-    if (!(await isPlaced($))) return
-    const [usageResult, agentsResult] = await Promise.allSettled([
-      $.session.usage({ breakdown: 'summary' }), $.agent.list(),
-    ])
-    if (generation !== sessionGeneration) return
+    const listed = await $.agent.list()
+    if (generation !== agentsGeneration || !(await isPlaced($))) return
     const now = await $.clock.now()
-    if (usageResult.status === 'fulfilled') {
-      const usage = usageResult.value
-      await update($, totals, held => held.startedAt === null || held.startedAt === usage.startedAt
-        ? { ...held, startedAt: usage.startedAt }
-        : { ...NO_TOTALS, startedAt: usage.startedAt })
-      const context = usage.context
-      const summary = { startedAt: usage.startedAt,
-        context: { window: context.window,
-          ...(context.tokens === undefined ? {} : { tokens: context.tokens }),
-          ...(context.percent === undefined ? {} : { percent: context.percent }),
-          ...(context.breakdown === undefined ? {} : { breakdown: { totalTokens: context.breakdown.totalTokens } }) },
-        ...(usage.cost === undefined ? {} : { cost: { usd: usage.cost.usd } }) }
-      await update($, session, () => ({ usage: summary, mcpServers: null, at: now, error: null }))
-    } else {
-      await update($, session, held => ({ ...held, error: 'oturum okunamadı' }))
-    }
-    if (agentsResult.status === 'fulfilled') {
-      const held = await read($, agents)
-      const previous = new Map(held.list.map(agent => [agent.id, agent]))
-      const list = agentsResult.value.map(agent => {
-        const prior = previous.get(agent.id)
-        return {
-          ...agent, observedAt: prior?.observedAt ?? now,
-          finishedAt: agentIsRunning(agent) ? null : prior?.finishedAt ?? now,
-        }
-      })
-      const snapshot = { list, at: now, error: null }
-      observeAgents(snapshot, now, await isPlaced($))
-      await update($, agents, () => snapshot)
-    } else {
-      await update($, agents, held => ({ ...held, error: 'Ajanlar okunamadı' }))
-    }
+    const held = await read($, agents)
+    const previous = new Map(held.list.map(agent => [agent.id, agent]))
+    const list = listed.map(agent => {
+      const prior = previous.get(agent.id)
+      return {
+        ...agent, observedAt: prior?.observedAt ?? now,
+        finishedAt: agentIsRunning(agent) ? null : prior?.finishedAt ?? now,
+      }
+    })
+    const snapshot = { list, at: now, error: null }
+    observeAgents(snapshot, now, await isPlaced($))
+    await update($, agents, () => snapshot)
   } catch {
-    // Keep the last good snapshot if the surface disappears during a read.
+    await update($, agents, held => ({ ...held, error: 'Ajanlar okunamadı' })).catch(() => undefined)
   } finally {
-    isReadingSession = false
+    isReadingAgents = false
     await reconcileMotion($)
   }
 }
@@ -394,7 +449,7 @@ async function refreshCodex($: EngineInterface): Promise<void> {
     const snapshot = { limits, at: now, error: null }
     await update($, codex, () => snapshot)
   } catch {
-    // A missing Codex history is a row of unknown limits.
+    // A missing Codex history is an unreadable-limits row.
     const now = await $.clock.now()
     await update($, codex, () => ({ ...NO_CODEX, at: now }))
   } finally {
@@ -408,6 +463,7 @@ async function refreshConversations($: EngineInterface, force = false): Promise<
   isReadingChats = true
   try {
     const at = await locate($)
+    if (!(await isPlaced($))) return
     const snapshot = await refreshChats($, { home: at.home, configFile: at.configFile,
       accounts: (await read($, accounts)).list, now: await $.clock.now(), force })
     if (snapshot !== null) {
@@ -463,7 +519,6 @@ function chatsOf(snapshot: ChatsSnapshot): ChatSession[] {
 function observeChats(snapshot: ChatsSnapshot): void {
   chatsRunning = snapshot.list.some(chat => chat.status === 'running')
   chatsWaiting = snapshot.list.some(chat => chat.status === 'waiting')
-  chatsIdle = snapshot.list.some(chat => chat.status === 'idle')
 }
 
 function observeTaskMotion(now: number, animate: boolean): void {
@@ -490,12 +545,14 @@ function observeTaskMotion(now: number, animate: boolean): void {
 }
 
 // One adaptive clock serves every row. Its single pending wait is a frame
-// during running work, or the next chat-dot or completion change.
+// during running work, or the next refresh, reset, blink or completion change.
 // Neither rendering nor polling resets an already scheduled earlier frame.
 async function reconcileMotion($: EngineInterface, repaint = false,
   generation = animationGeneration): Promise<void> {
   try {
-    const [placed, now] = await Promise.all([isPlaced($), $.clock.now()])
+    const [placed, now, held, limits] = await Promise.all([
+      isPlaced($), $.clock.now(), read($, accounts), read($, codex),
+    ])
     if (generation !== animationGeneration) return
     if (!placed) {
       settleMotion()
@@ -503,11 +560,30 @@ async function reconcileMotion($: EngineInterface, repaint = false,
     }
     let next = Number.POSITIVE_INFINITY
     const due = (at: number): void => { next = Math.min(next, at) }
+    const target = nextAccountRefresh(held.list)
+    const refreshAt = target === null || isReadingAccounts ? Number.POSITIVE_INFINITY
+      : Math.max(target, accountsRetryAt)
+    if (Number.isFinite(refreshAt)) {
+      if (refreshAt <= now) {
+        void refreshAccounts($)
+        return
+      }
+      // Wake at the server target itself, or once the stale-read back-off ends.
+      due(refreshAt)
+    }
+    const resetLimits = [...held.list.flatMap(account => account.limits),
+      ...limits.limits]
+    if (resetLimits.some(limit => limit.resetsAtMs !== null && limit.resetsAtMs > now)) {
+      due((Math.floor(now / ACCOUNTS_MS) + 1) * ACCOUNTS_MS)
+    }
     const shown = tasksOf(motionJobs, motionAgents).slice(0, CAPSULES_SHOWN)
     const spinning = shown.some(taskRunning) || chatsRunning || isReadingAccounts
     if (spinning) due(now + FRAME_MS)
-    if (chatsWaiting) due((Math.floor(now / WAITING_BLINK_MS) + 1) * WAITING_BLINK_MS)
-    if (chatsIdle) due((Math.floor(now / IDLE_BLINK_MS) + 1) * IDLE_BLINK_MS)
+    if (chatsWaiting) {
+      due((Math.floor(now / WAITING_BLINK_MS) + 1) * WAITING_BLINK_MS)
+      const phase = now % WAITING_BORDER_MS
+      due(now - phase + (phase < WAITING_BORDER_FLASH_MS ? WAITING_BORDER_FLASH_MS : WAITING_BORDER_MS))
+    }
     const visibleIds = new Set(shown.map(taskId))
     for (const [id, start] of finishedMotion) {
       if (now >= start + FINISH_MS) finishedMotion.delete(id)
@@ -528,9 +604,9 @@ async function reconcileMotion($: EngineInterface, repaint = false,
       stopAnimation()
       return
     }
-    // Exact blink/pop boundaries also respect the terminal's frame budget.
-    next = Math.max(next, lastFrameAt + MIN_FRAME_MS)
-    if (animation !== null && animationDue >= lastFrameAt + MIN_FRAME_MS &&
+    // Refreshing may wake sooner; drawing still respects the frame budget.
+    next = Math.min(refreshAt, Math.max(next, lastFrameAt + MIN_FRAME_MS))
+    if (animation !== null && (animationDue >= lastFrameAt + MIN_FRAME_MS || animationDue === refreshAt) &&
       (animationDue === next || (spinning && animationDue <= next))) return
     animation?.cancel()
     animationDue = next
@@ -558,13 +634,15 @@ async function tick($: EngineInterface, force: boolean): Promise<void> {
       return
     }
     const now = await $.clock.now()
-    const isDue = force || now - accountsTriedAt >= ACCOUNTS_MS
+    const isDue = force || (now - accountsTriedAt >= ACCOUNTS_MS && now >= accountsRetryAt)
     await Promise.all([
-      refreshJobs($), refreshSession($),
+      refreshJobs($), refreshAgents($),
       isDue ? refreshAccounts($) : undefined, isDue ? refreshCodex($) : undefined,
       refreshConversations($, force),
     ])
-    await reconcileMotion($)
+    // Starters of parentless jobs are searched once both lists are fresh.
+    const [listed, open] = await Promise.all([read($, jobs), read($, chats)])
+    await reconcileMotion($, await refreshStarters($, listed.list, open.list))
   } catch {
     // Each refresh records its own failure; a timer never sees one.
   }
@@ -586,16 +664,27 @@ async function dismissPane($: EngineInterface): Promise<void> {
 
 type Seg = { text: string; color?: Color; dim?: boolean; weight?: TextProps['weight'] }
 type Line = Seg[]
-type Gauge = { kind: string; label: string; used: number; reset: string }
+type Gauge = { kind: string; label: string; used: number; reset: string; resetsAtMs: number | null; countdown: string }
 
 const plain = (text: string): Seg => ({ text })
 const faint = (text: string): Seg => ({ text, dim: true })
 const spinner = (now: number): string => SPINNER[Math.floor(now / FRAME_MS) % SPINNER.length]!
 const chatMarker = (chat: ChatSession, now: number): Seg => chat.status === 'running'
   ? { text: spinner(now), color: 'suggestion' }
-  : { text: '●', color: chat.status === 'waiting'
-    ? Math.floor(now / WAITING_BLINK_MS) % 2 === 0 ? 'error' : 'subtle'
-    : Math.floor(now / IDLE_BLINK_MS) % 2 === 0 ? 'inactive' : 'subtle' }
+  : chat.status === 'waiting' ? { text: '●', color: Math.floor(now / WAITING_BLINK_MS) % 2 === 0 ? 'error' : 'subtle' }
+    : { text: '○', color: 'text' }
+
+function delegateBadges(chat: ChatSession, chats: ChatSession[], listed: JobsSnapshot, now: number): Line[] {
+  const groups = new Map<string, number>()
+  const running = listed.list.filter(job => job.status === 'running' && job.account !== '' &&
+    parentChat(job, chats)?.id === chat.id).sort((a, b) => a.startedMs - b.startedMs)
+  for (const job of running) groups.set(job.account, (groups.get(job.account) ?? 0) + 1)
+  const colors: Record<string, Color> = { codex: 'success', aras: 'suggestion', yusa: 'remember', kadir: CURRENT_COLOR }
+  return [...groups].map(([account, count]) => [
+    { text: `${spinner(now)} `, color: colors[account] ?? 'text' },
+    { text: `${account}${count > 1 ? ` ×${count}` : ''}`, color: colors[account] ?? 'text' },
+  ])
+}
 
 // Measure display cells, so wide names and emoji do not displace the right
 // column. Controls become spaces before any row is measured or drawn.
@@ -688,58 +777,136 @@ function shortError(err: string): string {
 }
 
 function gaugesOf(account: Account, now: number): Gauge[] {
-  return ['session', 'weekly_all', 'weekly_scoped'].flatMap(kind =>
-    account.limits.filter(limit => limit.kind === kind).map(limit => ({
+  const isCodex = account.name === 'codex'
+  const kinds = isCodex ? ['session', 'weekly_all', 'rate_window'] : ['session', 'weekly_all', 'weekly_scoped']
+  // A 5-hour window counts down on the border times' minute sample.
+  const minute = Math.floor(now / ACCOUNTS_MS) * ACCOUNTS_MS
+  return kinds.flatMap(kind => account.limits.filter(limit => limit.kind === kind).map(limit => {
+    const minutes = limit.windowMinutes ?? (kind === 'session' ? 300 : 10_080)
+    return {
       kind,
-      label: kind === 'session' ? '5 saat' : kind === 'weekly_all' ? 'hafta' : limit.model || 'Fable',
+      label: isCodex ? minutes === 300 ? '5 saat' : minutes === 10_080 ? 'hafta' : `${Math.round(minutes / 1440)} gün`
+        : kind === 'session' ? '5 saat' : kind === 'weekly_all' ? 'hafta' : limit.model || 'Fable',
       used: limit.used,
       reset: untilReset(limit.resetsAtMs, now),
-    })),
-  )
+      resetsAtMs: limit.resetsAtMs,
+      countdown: kind === 'session' && limit.resetsAtMs !== null && limit.resetsAtMs > now
+        ? untilReset(limit.resetsAtMs, minute) : '',
+    }
+  }))
 }
 
-function miniGauge(gauge: Gauge | undefined, columnWidth: number): Line {
-  if (gauge === undefined) return [faint('–'.padStart(columnWidth))]
-  const barCells = Math.max(0, columnWidth - 5)
-  const tone = severity(gauge.used)
-  return fitLine([...bar(gauge.used, barCells, tone),
-    { text: ` ${`${Math.round(clamp(gauge.used, 0, 100))}%`.padStart(4)}`, color: tone,
-      ...(gauge.used >= 90 ? { weight: 'bold' as const } : {}) }], columnWidth)
+function centered(line: Line, width: number): Line {
+  const fitted = fitLine(line, width)
+  const space = Math.max(0, width - lineCells(fitted))
+  return [plain(' '.repeat(Math.floor(space / 2))), ...fitted, plain(' '.repeat(Math.ceil(space / 2)))]
+}
+
+function gaugeColumns(gauges: Gauge[], room: number): Line[] {
+  const width = Math.max(1, Math.floor((room - gauges.length + 1) / gauges.length))
+  const inset = Math.max(0, Math.floor((room - (width + 1) * gauges.length + 1) / 2))
+  const join = (column: (gauge: Gauge) => Line): Line => [plain(' '.repeat(inset)),
+    ...gauges.flatMap((gauge, index) => [...(index === 0 ? [] : [plain(' ')]), ...column(gauge)])]
+  // A countdown keeps its arrow only where the column holds both.
+  const labelOf = (gauge: Gauge): string => gauge.countdown === ''
+    ? gauge.label === '5 saat' && width < 6 ? '5s' : gauge.label
+    : textCells(`↻ ${gauge.countdown}`) <= width ? `↻ ${gauge.countdown}` : gauge.countdown
+  return [
+    join(gauge => centered([faint(labelOf(gauge))], width)),
+    join(gauge => centered([{ text: `${Math.round(clamp(gauge.used, 0, 100))}%`,
+      color: severity(gauge.used), weight: 'bold' }], width)),
+    join(gauge => bar(gauge.used, width, severity(gauge.used))),
+  ]
+}
+
+const listedAccounts = (snapshot: AccountsSnapshot, limits: CodexSnapshot): Account[] =>
+  [...snapshot.list.filter(account => account.name !== 'codex'), { name: 'codex', email: '', dir: '',
+    limits: limits.limits, err: limits.error }]
+
+function accountSummary(snapshot: AccountsSnapshot, limits: CodexSnapshot, room: number): Line {
+  const parts = listedAccounts(snapshot, limits).map((account): Line => {
+    const current = account.name === snapshot.current
+    const used = account.limits.length === 0 ? null : Math.max(...account.limits.map(limit => limit.used))
+    return [account.name === 'codex' ? faint('◎ ') : current ? { text: '● ', color: CURRENT_COLOR } : faint('○ '),
+      { text: `${account.name} `, ...(current ? { color: 'text', weight: 'bold' } as const : {}) },
+      { text: used === null ? '?' : `${Math.round(clamp(used, 0, 100))}%`,
+        color: used === null ? 'warning' : severity(used), weight: 'bold' }]
+  })
+  const joined = (): Line => parts.flatMap((part, index) => [...(index === 0 ? [] : [plain('  ')]), ...part])
+  let omitted = false
+  while (parts.length > 0 && lineCells(joined()) + (omitted ? 3 : 0) > room) {
+    parts.pop()
+    omitted = true
+  }
+  return [...joined(), ...(omitted ? [faint(parts.length === 0 ? '…' : '  …')] : [])]
 }
 
 function accountLines(snapshot: AccountsSnapshot, limits: CodexSnapshot, now: number, room: number) {
-  const columnWidth = Math.max(1, Math.floor((room - 2) / 3))
-  const header: Line = [
-    ...['5 saat', 'hafta', 'Fable'].flatMap((label, index): Line => [
-      ...(index === 0 ? [] : [plain(' ')]),
-      faint(' '.repeat(Math.max(0, columnWidth - Math.min(columnWidth, textCells(label))))),
-      ...fitLine([faint(label)], columnWidth),
-    ])]
-  const listed = [...snapshot.list.filter(account => account.name !== 'codex'), { name: 'codex', email: '', dir: '',
-    limits: limits.limits, err: null }]
-  const rows = listed.map(account => {
+  const listed = listedAccounts(snapshot, limits)
+  const sets = listed.map(account => gaugesOf(account, now))
+  const nameWidth = Math.max(...listed.map(account => textCells(account.name))) + 2
+  const cellWidth = Math.floor((room - 2 - nameWidth - 4) / 3)
+  const labelOf = (gauge: Gauge, arrow: boolean): string => gauge.countdown === ''
+    ? gauge.label === '5 saat' ? '5s' : gauge.label : `${arrow ? '↻ ' : ''}${gauge.countdown}`
+  // Inline keeps a six-cell bar beside the widest label: countdowns try the
+  // arrow, then bare, in one form for every account; else columns.
+  const fits = (arrow: boolean): boolean =>
+    cellWidth >= Math.max(5, ...sets.flat().map(gauge => textCells(labelOf(gauge, arrow)))) + 6 + 6
+  const arrow = fits(true)
+  const inline = (arrow || fits(false)) && sets.every(gauges => gauges.every(gauge => gauge.kind !== 'rate_window'))
+  // Session labels share one slot, so their bars line up across accounts.
+  const slot = Math.max(0, ...sets.flat().filter(gauge => gauge.kind === 'session')
+    .map(gauge => textCells(labelOf(gauge, arrow))))
+  return listed.map((account, at) => {
     const current = account.name === snapshot.current
     const marker = account.name === 'codex' ? faint('◎ ')
-      : current ? { text: '● ', color: 'claude' as const } : faint('○ ')
-    const first: Line = [marker, { text: account.name, ...(current ? { color: 'text', weight: 'bold' } as const : {}) }]
-    const gauges = gaugesOf(account, now)
-    const second: Line = account.err !== null ? [{ text: shortError(account.err), color: 'warning' }]
-      : ['session', 'weekly_all', 'weekly_scoped'].flatMap((kind, index): Line => [
-        ...(index === 0 ? [] : [plain(' ')]),
-        ...miniGauge(gauges.find(gauge => gauge.kind === kind), columnWidth),
-      ])
-    const notes: Line[] = account.err !== null ? [] : gauges.filter(gauge => gauge.used >= 90)
+      : current ? { text: '● ', color: CURRENT_COLOR } : faint('○ ')
+    let first: Line = [marker, { text: account.name, ...(current ? { color: 'text', weight: 'bold' } as const : {}) }]
+    const gauges = sets[at] ?? []
+    const unreadable = gauges.length === 0
+    let body: Line[] = unreadable ? [[{ text: shortError(account.err || 'şu an okunamıyor'), color: 'warning' }]]
+      : gaugeColumns(gauges, room)
+    const notes: Line[] = unreadable ? [] : gauges.filter(gauge => gauge.used >= 90)
       .sort((a, b) => b.used - a.used).slice(0, 1).map(gauge => {
         let reset = gauge.reset
-        if (textCells(`${gauge.label} ${reset} sonra açılır`) > room) {
+        if (textCells(`${gauge.label} ${reset} sonra açılır`) > room - (inline ? 2 : 0)) {
           reset = reset.replace(/(\d+)g (\d+)sa/, '$1g$2sa').replace(/(\d+)sa \d+dk/, '$1sa')
         }
-        return [{ text: gauge.label, color: 'error', dim: true },
+        return [...(inline ? [plain('  ')] : []), { text: gauge.label, color: 'error', weight: 'bold' },
           faint(` ${reset === '' ? 'açılış -' : `${reset} sonra açılır`}`)]
       })
-    return { key: account.name, first, second, notes }
+    if (inline) {
+      first.push(plain(' '.repeat(nameWidth - textCells(account.name))))
+      if (unreadable) first.push(...body[0]!)
+      else first.push(...['session', 'weekly_all', 'weekly_scoped'].flatMap((kind, index) => {
+        const gauge = gauges.find(gauge => gauge.kind === kind)
+        const gap = index === 0 ? [] : [plain('  ')]
+        if (!gauge) return [...gap, plain(' '.repeat(cellWidth))]
+        const label = labelOf(gauge, arrow)
+        const size = kind === 'session' ? slot : textCells(label)
+        const color = severity(gauge.used)
+        return [...gap, faint(`${label}${' '.repeat(size - textCells(label))} `), ...bar(gauge.used, cellWidth - size - 6, color),
+          plain(' '), { text: `${Math.round(clamp(gauge.used, 0, 100))}%`.padStart(4), color, weight: 'bold' as const }]
+      }))
+      body = []
+    }
+    // Border times share a minute sample even when spinners redraw faster.
+    const minute = Math.floor(now / ACCOUNTS_MS) * ACCOUNTS_MS
+    const weekly = unreadable ? [] : gauges.filter(gauge => (gauge.kind === 'weekly_all' ||
+      gauge.kind === 'weekly_scoped') && gauge.resetsAtMs !== null && gauge.resetsAtMs > now)
+    const value = (gauge: Gauge, used: number): Seg => {
+      const reset = untilReset(gauge.resetsAtMs, minute)
+      return used >= 90 ? { text: reset, color: severity(used) } : faint(reset)
+    }
+    const times = weekly.map(gauge => gauge.resetsAtMs ?? now)
+    const earliest = weekly[times.indexOf(Math.min(...times))]
+    // Weekly resets within an hour read as one time: the earliest, colored
+    // for the most used window.
+    const resets: Line[] = earliest !== undefined && Math.max(...times) - Math.min(...times) <= RESET_GROUP_MS
+      ? [[faint('↻ '), value(earliest, Math.max(...weekly.map(gauge => gauge.used)))]]
+      : weekly.map(gauge => [faint(`${gauge.label} `), value(gauge, gauge.used)])
+    return { key: account.name, first, body, notes, resets }
   })
-  return { header, rows }
 }
 
 function glyphOf(job: { id: string; status: string }, now: number): Seg {
@@ -794,9 +961,6 @@ function taskLines(task: Task, now: number, width: number): [Line, Line] {
     fitLine([faint(`${who} · ${status === 'stale' ? 'durdu' : duration(elapsed)}`)], width)]
 }
 
-const compactNumber = (value: number): string => value >= 1_000_000
-  ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(Math.round(value))
-
 const styleOf = (seg: Seg): TextProps => ({
   ...(seg.color === undefined ? {} : { color: seg.color }),
   ...(seg.dim === true ? { dimColor: true } : {}),
@@ -816,6 +980,9 @@ export const register: Register = on => {
       // The pane works without its command.
     }
     if (e.isInteractive) {
+      // The host store belongs to this mod, across reloads and new tabs.
+      const open = await $.store.get('isAccountsOpen')
+      await update($, isAccountsOpen, () => open !== false)
       startPolling($)
       const isClosedByHand = await read($, isDismissed).catch(() => false)
       if (!isClosedByHand) {
@@ -846,23 +1013,11 @@ export const register: Register = on => {
     }
   })
 
-  on('turn.step', async function* ($, e, next) {
-    const generation = sessionGeneration
-    const result = yield* next(e)
-    // The result and stop chunk contain the same usage. Count the result
-    // once; turn.complete's aggregate must never be added a second time.
-    if (generation === sessionGeneration) await recordResponse($, result, e.agentId).catch(() => undefined)
-    return result
-  })
-
   on('session.end', async ($, e, next) => {
     const ended = await next(e)
     if (e.reason === 'clear') {
-      sessionGeneration += 1
-      await Promise.all([
-        update($, totals, () => NO_TOTALS), update($, session, () => NO_SESSION),
-        update($, agents, () => NO_AGENTS),
-      ]).catch(() => undefined)
+      agentsGeneration += 1
+      await update($, agents, () => NO_AGENTS).catch(() => undefined)
       observeAgents(NO_AGENTS, await $.clock.now(), false)
       await reconcileMotion($)
     }
@@ -871,13 +1026,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const completed = await next(e)
-    if (e.agentId === undefined) {
-      await update($, totals, held => held.turnIds.includes(e.turnId) ? held : {
-        ...held, activeMs: held.activeMs + Math.max(0, e.durationMs), turns: held.turns + 1,
-        turnIds: [...held.turnIds, e.turnId],
-      }).catch(() => undefined)
-    }
-    await refreshSession($)
+    await refreshAgents($)
     return completed
   })
 
@@ -898,6 +1047,15 @@ export const register: Register = on => {
     return detached
   })
 
+  on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const focused = await next(e)
+    if (!('deny' in focused)) {
+      focusedCapsule = e.plugin === PANE ? e.element : undefined
+      await reconcileMotion($, true)
+    }
+    return focused
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const width = Math.max(1, Math.floor(e.props.bodyColumns))
@@ -905,46 +1063,81 @@ export const register: Register = on => {
     const padding = width >= 6 ? 1 : 0
     const innerWidth = Math.max(1, width - (bordered ? 2 : 0) - 2 * padding)
     const isPlain = (seg: Seg): boolean => seg.color === undefined && seg.dim !== true && seg.weight === undefined
-    const draw = (line: Line, room = innerWidth) => (
-      <Text wrap="truncate-end" mono>
+    // Hover mutes every run of a pressable row, so the row inverted under the
+    // pointer is one grey bar; focus mutes it at rest for the same reason.
+    const muteHover: TextHoverProps = { color: MUTED }
+    const muted = (line: Line): Line => line.map(seg => ({ ...seg, color: MUTED }))
+    const draw = (line: Line, room = innerWidth, hover?: TextHoverProps) => (
+      <Text wrap="truncate-end" mono hover={hover}>
         {fitLine(line.length === 0 ? [plain(' ')] : line, room)
           .filter(seg => seg.text !== '')
-          .map(seg => (isPlain(seg) ? seg.text : <Text {...styleOf(seg)}>{seg.text}</Text>))}
+          .map(seg => (isPlain(seg) ? seg.text : <Text {...styleOf(seg)} hover={hover}>{seg.text}</Text>))}
       </Text>
     )
     // Box has no title prop. A final absolute sibling paints over its top
     // border, including the surrounding spaces, without adding a content row.
-    const card = (title: string, children: RenderChildren, detail: Line = []) => {
-      // The refresh spinner owns a fixed slot, so its frames never resize
-      // the title overlay or erase the remaining top border.
-      const titleWidth = Math.max(1, Math.min(width - 4,
-        textCells(` ${title} `) + (title === 'Hesaplar' ? 2 : 0)))
-      return <Box width={width} flexShrink={0} flexDirection="column" position="relative">
+    const card = (title: string, children: RenderChildren, detail: Line = [], press?: () => void) => {
+      const titleWidth = Math.max(1, width - 4)
+      const compact = press === undefined ? {} : { gap: 0, paddingY: 0, marginY: 0 }
+      const heading: Line = [{ text: ` ${title} `, color: 'text', weight: 'bold' },
+        ...detail, ...(detail.length === 0 ? [] : [plain(' ')])]
+      // A pressable title is the Button itself; its keyed Box scopes the hover.
+      const scope = press === undefined ? {} : { key: 'accounts:title' }
+      const isFocused = e.props.isFocused && focusedCapsule === 'accounts:toggle'
+      return <Box width={width} flexShrink={0} flexDirection="column" position="relative" {...compact}>
           <Box width={width} flexShrink={0} flexDirection="column" overflow="hidden"
-            paddingX={padding} borderStyle={bordered ? 'round' : undefined} borderColor="inactive" borderDimColor>
+            paddingX={padding} borderStyle={bordered ? 'round' : undefined} borderColor="inactive" borderDimColor {...compact}>
             {children}
           </Box>
-          <Box position="absolute" top={0} left={bordered ? 2 : 0} width={titleWidth}>
-            {draw([{ text: ` ${title} `, color: 'text', weight: 'bold' }, ...detail], titleWidth)}
+          <Box {...scope} position="absolute" top={0} left={bordered ? 2 : 0} width={Math.min(titleWidth, lineCells(heading))} {...compact}>
+            {press === undefined ? draw(heading, titleWidth) : <Button key="accounts:toggle" plain label={title}
+              hover={muteHover} onPress={press}>
+              {draw(isFocused ? muted(heading) : heading, titleWidth, muteHover)}
+            </Button>}
           </Box>
         </Box>
     }
     const capsuleWidth = innerWidth
     const capsuleRoom = Math.max(1, capsuleWidth - 4)
-    const capsule = (key: string, first: Line, second: Line, press?: () => void,
-      notes: Line[] = [], capsulePadding = 1) => (
-      <Box key={`capsule:${key}`} width={capsuleWidth} flexShrink={0} flexDirection="column"
-        borderStyle="round" borderColor="subtle" paddingX={capsulePadding}>
-        {press === undefined ? draw(first, capsuleWidth - 2 - 2 * capsulePadding)
-          : <Button key={key} plain onPress={press}>{draw(first, capsuleRoom)}</Button>}
-        {draw(second, capsuleWidth - 2 - 2 * capsulePadding)}
-        {notes.map(note => draw(note, capsuleWidth - 2 - 2 * capsulePadding))}
+    const capsule = (key: string, first: Line, second: Line | undefined, press?: () => void,
+      notes: Line[] = [], capsulePadding = 1, fixedColor?: Color, borderParts: Line[] = []) => {
+      const room = Math.max(1, capsuleWidth - 2 - 2 * capsulePadding)
+      const lines = [first, ...(second === undefined ? [] : [second]), ...notes]
+      // The ring rests on one of the capsule's line Buttons, `<key>:<line>`.
+      const isFocused = press !== undefined && e.props.isFocused && focusedCapsule?.replace(/:\d+$/, '') === key
+      const borderColor = fixedColor ?? (isFocused ? 'text' : 'subtle')
+      const parts = [...borderParts]
+      const borderLine = (): Line => [faint(' '), ...parts.flatMap((part, index) =>
+        [...(index === 0 ? [] : [faint(' · ')]), ...part]), faint(' ')]
+      // Leave a border cell at either corner; drop complete trailing parts.
+      while (parts.length > 0 && lineCells(borderLine()) > capsuleWidth - 4) parts.pop()
+      const detail = parts.length === 0 ? [] : borderLine()
+      const compact = key.startsWith('account:') ? { gap: 0, paddingY: 0, marginY: 0 } : {}
+      const label = first.map(seg => seg.text).join('')
+      return <Box key={`capsule:${key}`} width={capsuleWidth} flexShrink={0} flexDirection="column" position="relative" {...compact}>
+        <Box width={capsuleWidth} flexShrink={0} flexDirection="column" borderStyle="round" borderColor={borderColor}
+          hover={press !== undefined && fixedColor === undefined ? { borderColor: 'text' } : undefined}
+          paddingX={capsulePadding} {...compact}>
+          {lines.map((line, index) => {
+            const fitted = fitLine(line, room)
+            if (press === undefined) return draw(fitted, room)
+            // Every line is its own Button, padded to press across the capsule.
+            const row = [...fitted, plain(' '.repeat(Math.max(0, room - lineCells(fitted))))]
+            return <Button key={`${key}:${index}`} plain label={label} hover={muteHover} onPress={press}>
+              {draw(isFocused ? muted(row) : row, room, muteHover)}
+            </Button>
+          })}
+        </Box>
+        {detail.length === 0 ? null : <Box position="absolute" top={0}
+          left={capsuleWidth - 2 - lineCells(detail)} width={lineCells(detail)}>
+          {draw(detail, lineCells(detail))}
+        </Box>}
       </Box>
-    )
+    }
     try {
-      const [held, listed, measured, counted, roster, limits, conversations, now] = await Promise.all([
-        read($, accounts), read($, jobs), read($, session), read($, totals), read($, agents),
-        read($, codex), read($, chats), $.clock.now(),
+      const [held, listed, roster, limits, conversations, now, accountsOpen] = await Promise.all([
+        read($, accounts), read($, jobs), read($, agents),
+        read($, codex), read($, chats), $.clock.now(), read($, isAccountsOpen),
       ])
       // Cached tasks after a hot reload are a steady baseline. Fresh reads
       // prepare their completion pop before publishing it above.
@@ -955,46 +1148,8 @@ export const register: Register = on => {
       observeChats(conversations)
       await reconcileMotion($)
       const tasks = tasksOf(listed, roster)
-      const usage = measured.usage
-      const context = usage?.context
-      const exact = counted.responses > 0 && counted.responses === counted.usageResponses
-      const input = counted.input + counted.cacheRead + counted.cacheWrite
-      const hit = exact && input > 0 ? `%${Math.round(counted.cacheRead / input * 100)}` : '-'
-      const cost = usage?.cost?.usd
-      const value = exact ? compactNumber(input + counted.output) : '-'
-      const percent = context?.percent
-      const memory = percent === undefined ? 'hafıza -' : `hafıza %${Math.round(percent)}`
-      const memoryColumn = Math.min(innerWidth, textCells('hafıza %100'))
-      const memoryCells = Math.max(0, innerWidth - memoryColumn - 1)
-      const stats = [value, cost === undefined ? '-' : `$${cost.toFixed(2)}`, hit]
-      const labels = ['sohbet boyu', 'API değeri', 'önbellek']
-      // Pick one column count for the section from the actual labels and
-      // values, then share the remaining room without shortening either.
-      const statNeeds = stats.map((stat, index) => Math.max(textCells(stat), textCells(labels[index]!)) + 4)
-      const statColumns = statNeeds.reduce((sum, need) => sum + need, 2) <= innerWidth ? 3
-        : statNeeds[0]! + statNeeds[1]! + 1 <= innerWidth ? 2 : 1
-      const statRows = []
-      for (let start = 0; start < stats.length; start += statColumns) {
-        const indices = Array.from({ length: Math.min(statColumns, stats.length - start) }, (_, index) => start + index)
-        const spare = Math.max(0, innerWidth - indices.reduce((sum, index) => sum + statNeeds[index]!, 0) - indices.length + 1)
-        statRows.push(<Box width={innerWidth} flexDirection="row" flexWrap="nowrap" gap={1}>
-          {indices.map((index, position) => {
-            const statWidth = Math.min(innerWidth, statNeeds[index]! + Math.floor(spare / indices.length)
-              + (position < spare % indices.length ? 1 : 0))
-            const statPadding = statWidth >= statNeeds[index]! ? 1 : 0
-            const statRoom = Math.max(1, statWidth - 2 - 2 * statPadding)
-            return <Box key={`stat:${index}`} width={statWidth} flexShrink={0}
-              flexDirection="column" borderStyle="round" borderColor="subtle" paddingX={statPadding}>
-              {draw([{ text: stats[index]!, color: 'text', weight: 'bold' }], statRoom)}
-              {draw([faint(labels[index]!)], statRoom)}
-            </Box>
-          })}
-        </Box>)
-      }
-      // At the narrow dock, the note gets all 26 cells inside the border.
-      const accountPadding = capsuleRoom >= 26 ? 1 : 0
-      const accountRoom = Math.max(1, capsuleWidth - 2 - 2 * accountPadding)
-      const accountRows = accountLines(held, limits, now, accountRoom)
+      // Every account shares the capsule's padded inner width.
+      const accountRows = accountLines(held, limits, now, capsuleRoom)
       const conversationList = chatsOf(conversations)
       // Pane.scroll is an engine-owned window over this entire tree.
       const chatRows = conversationList.map(chat => {
@@ -1004,29 +1159,32 @@ export const register: Register = on => {
         const line = chat.isCurrent ? fitLine(title, capsuleRoom) : align(title, [faint('›')], capsuleRoom)
         const state = chat.isCurrent ? 'bu sekme' : chat.status === 'waiting' ? 'cevap bekliyor'
           : chat.status === 'running' ? 'çalışıyor' : 'boşta'
-        return capsule(`chat:${chat.id}`, line, [faint(`${chat.account || held.current || '–'} · ${state}`)],
-          chat.isCurrent ? undefined : () => focusChat($, chat))
+        const metadata = [chat.account, chat.model, chat.effort].filter(part => part && !/^[-–]$/.test(part)).join(' · ')
+        return capsule(`chat:${chat.id}`, line, [faint(metadata || ' ')],
+          chat.isCurrent ? undefined : () => focusChat($, chat), [[faint(state)]], 1,
+          chat.isCurrent ? CURRENT_COLOR : chat.status === 'waiting'
+            ? now % WAITING_BORDER_MS < WAITING_BORDER_FLASH_MS ? 'error' : 'subtle' : undefined,
+          delegateBadges(chat, conversationList, listed, now))
       })
       const jobRows = tasks.slice(0, CAPSULES_SHOWN).map(task => {
         const [title, metadata] = taskLines(task, now, capsuleRoom)
         return capsule(taskId(task), title, metadata, async () => {
           if (!(await isPlaced($))) return
           if (task.kind === 'agent') await $.ui.view({ agentId: task.agent.id })
-          else await openDelegate($, task.job.id, (await read($, chats)).list)
+          else await openDelegate($, task.job, (await read($, chats)).list)
         })
       })
       return (
         <Box width={width} flexDirection="column" overflow="hidden">
-          {card('Oturum', <Box flexDirection="column">
-            {statRows}
-            {draw([...bar(percent ?? 0, memoryCells, severity(percent ?? 0)), plain(' '),
-              faint(' '.repeat(Math.max(0, memoryColumn - textCells(memory)))), faint(memory)])}
-          </Box>)}
-          {card('Hesaplar', <Box flexDirection="column">
-            {draw([plain(' '.repeat(1 + accountPadding)), ...accountRows.header])}
+          {card(`Hesaplar ${accountsOpen ? '▾' : '▸'}`, accountsOpen ? <Box flexDirection="column" gap={0} paddingY={0} marginY={0}>
             {held.list.length === 0 && held.error !== null ? draw([faint('hesaplar okunamadı')]) : null}
-            {accountRows.rows.map(row => capsule(`account:${row.key}`, row.first, row.second, undefined, row.notes, accountPadding))}
-          </Box>, isReadingAccounts ? [{ text: spinner(now), color: 'suggestion' }] : [])}
+            {accountRows.map(row => capsule(`account:${row.key}`, row.first, row.body[0], undefined,
+              [...row.body.slice(1), ...row.notes], 1, undefined, row.resets))}
+          </Box> : draw(accountSummary(held, limits, innerWidth)),
+            isReadingAccounts ? [{ text: spinner(now), color: 'suggestion' }] : [], async () => {
+              const open = await update($, isAccountsOpen, value => !value)
+              await $.store.set('isAccountsOpen', open)
+            })}
           {card('Sohbetler', <Box flexDirection="column">
             {chatRows.length > 0 ? chatRows : draw([faint(conversations.error === null ? 'sohbet yok' : 'sohbetler okunamadı')])}
           </Box>)}
