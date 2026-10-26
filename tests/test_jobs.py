@@ -4,12 +4,13 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 import pytest
 
-from shiftover import paths
+from shiftover import claude, paths
 from shiftover.delegate import jobs
-from tests.conftest import SRC, stop_jobs
+from tests.conftest import SRC, calls, stop_jobs
 
 
 def test_tail_reads_only_the_end(tmp_path):
@@ -84,6 +85,62 @@ def test_old_job_defaults_parent_fields(home):
     jobs.paths.write_json(jobs._p("old", "json"), {"id": "old", "account": "second", "dir": ""})
     job = jobs.load("old")
     assert job.parent_session_id == "" and job.parent_pid == 0
+    assert job.transcript_path == "" and job.log_path == ""
+
+
+def _launched(monkeypatch):
+    """Jobs run but are never finalized: the record stays as written at launch."""
+    monkeypatch.setattr(jobs, "_wait_for_exit", lambda job, proc: proc.wait())
+
+
+def test_a_claude_job_knows_its_session_and_transcript_from_the_start(home, fake_claude, monkeypatch):
+    from shiftover import config
+    _launched(monkeypatch)
+    work = home / "my.app"
+    work.mkdir()
+    acct = config.load().accounts["second"]
+    job = jobs.start(acct, "quick", cwd=str(work))
+    jobs._procs[job.id].wait(10)
+    record = jobs.load(job.id)
+    assert record.status == "running" and uuid.UUID(record.session_id).version == 4
+    assert record.transcript_path == str(claude.project_dir(acct.path, work) / f"{record.session_id}.jsonl")
+    assert record.transcript_path.startswith(str(acct.path / "projects" / "-")) and "-my-app/" in record.transcript_path
+    argv = calls(fake_claude)[-1]["argv"]
+    assert argv[argv.index("--session-id") + 1] == record.session_id and "--resume" not in argv
+
+
+@pytest.mark.parametrize("where", ["elsewhere", "here", "nowhere"])
+def test_a_resumed_job_follows_the_file_its_session_began_in(home, fake_claude, monkeypatch, where):
+    from shiftover import config
+    _launched(monkeypatch)
+    acct = config.load().accounts["second"]
+    folder = {"elsewhere": acct.path / "projects" / "-somewhere-else", "here": claude.project_dir(acct.path, home)}.get(where)
+    if folder:
+        folder.mkdir(parents=True)
+        (folder / "abc-123.jsonl").write_text("")
+    job = jobs.start(acct, "more", cwd=str(home), resume_session_id="abc-123")
+    jobs._procs[job.id].wait(10)
+    record = jobs.load(job.id)
+    expected = (folder or claude.project_dir(acct.path, home)) / "abc-123.jsonl"
+    assert record.session_id == "abc-123" and record.transcript_path == str(expected)
+    argv = calls(fake_claude)[-1]["argv"]
+    assert argv[argv.index("--resume") + 1] == "abc-123" and "--session-id" not in argv
+
+
+def test_a_codex_job_records_its_event_stream(home, fake_codex, monkeypatch):
+    _launched(monkeypatch)
+    job = jobs.start_codex(str(fake_codex), "quick")
+    record = jobs.load(job.id)
+    assert record.log_path == str(jobs._p(job.id, "out")) and record.transcript_path == ""
+
+
+def test_finalize_gives_a_job_from_before_its_transcript(home):
+    acct_dir = home / ".claude-second"
+    job = jobs.Job(id="older", account="second", dir=str(acct_dir), cwd=str(home), started=1.0)
+    jobs.save(job)
+    jobs._p(job.id, "out").write_text(json.dumps({"type": "result", "subtype": "success", "result": "x", "session_id": "s-1"}))
+    done = jobs.finalize(job)
+    assert done.session_id == "s-1" and done.transcript_path == str(claude.project_dir(acct_dir, home) / "s-1.jsonl")
 
 
 @pytest.mark.parametrize("backend", ["claude", "codex"])

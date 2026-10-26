@@ -120,11 +120,11 @@ def _ask_switch(cfg: Config, cur: Account) -> Account | None:
     best = pick.best(cfg, rows, exclude=(cur.name,))
     start = next((i for i, r in enumerate(rows) if best and r["name"] == best["name"]), others[0] if others else 0)
     print(file=sys.stderr)
-    idx = ui.menu(rows, start, t("switch_msg", name=cur.name), t("switch_hint"))
+    idx = ui.menu(rows, start, t("switch_msg", name=cur.label), t("switch_hint"))
     if idx is None or idx < 0:
         return None
     chosen = rows[idx]["account"]
-    print(f"\033[2m→ {chosen.name}\033[0m", file=sys.stderr)
+    print(f"\033[2m→ {chosen.label}\033[0m", file=sys.stderr)
     return chosen
 
 
@@ -156,14 +156,14 @@ def run(cfg: Config, acct: Account, args: list[str], interactive: bool | None = 
                 (rdir / "handoff.json").unlink(missing_ok=True)
                 target = cfg.accounts.get(req.get("target") or "")
                 if target and not transcript_visible(target, sid):
-                    print(t("handoff_invisible", dst=target.name, src=cur.name), file=sys.stderr)
+                    print(t("handoff_invisible", dst=target.label, src=cur.label), file=sys.stderr)
                     paths.write_json(rdir / "notice.json", {"src": cur.name, "dst": "", "reason": req.get("reason", ""),
                                                             "detail": f"{target.name} cannot see the transcript (projects/ is not shared)"})
                     cur_args = resume_args(flags, sid, None, None)
                     continue
                 if target:
                     detail = ", ".join(x for x in (req.get("model"), req.get("effort")) if x)
-                    print(t("handoff_line", src=cur.name, reason=req.get("reason", ""), dst=target.name,
+                    print(t("handoff_line", src=cur.label, reason=req.get("reason", ""), dst=target.label,
                             detail=f" ({detail})" if detail else ""), file=sys.stderr)
                     paths.write_json(rdir / "notice.json", {"src": cur.name, "dst": target.name, "reason": req.get("reason", "")})
                     pretrust(cur, target, os.getcwd())

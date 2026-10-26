@@ -204,3 +204,35 @@ def test_renew_without_a_binary_or_a_start_fails_quietly(home, monkeypatch):
     monkeypatch.setattr(claude, "claude_bin", lambda: "/nonexistent/claude")
     monkeypatch.setattr(claude.subprocess, "Popen", popen)
     assert RENEW(home / ".claude-second") is False
+
+
+@pytest.mark.parametrize("cwd, folder", [
+    # Seen on this machine: ~/.claude/projects/-Users-kadir-Documents-claude-mods-work-shiftover-panel.
+    ("/Users/me/Documents/claude-mods/work/shiftover-panel", "-Users-me-Documents-claude-mods-work-shiftover-panel"),
+    ("/Users/me/pixora/.claude/worktrees/sleepy", "-Users-me-pixora--claude-worktrees-sleepy"),
+    ("/Users/me/my app_v2+x", "-Users-me-my-app-v2-x"),
+    ("/Users/me/çarşı", "-Users-me--ar--"),
+    ("/Users/me/😀x", "-Users-me---x"),
+])
+def test_project_dir_turns_every_other_character_into_a_dash(cwd, folder):
+    assert claude.project_dir("/tmp/acct", cwd) == claude.norm("/tmp/acct") / "projects" / folder
+
+
+def test_project_dir_names_the_real_folder(tmp_path):
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    assert claude.project_dir(tmp_path, tmp_path / "link") == claude.project_dir(tmp_path, tmp_path / "real")
+
+
+def test_transcript_prefers_the_cwd_folder_then_finds_the_session_anywhere(tmp_path):
+    here = claude.project_dir(tmp_path, "/work/app")
+    assert claude.transcript(tmp_path, "/work/app", "s1") == here / "s1.jsonl"
+    other = tmp_path / "projects" / "-elsewhere" / "s1.jsonl"
+    other.parent.mkdir(parents=True)
+    other.write_text("")
+    assert claude.transcript(tmp_path, "/work/app", "s1") == other
+    here.mkdir(parents=True)
+    (here / "s1.jsonl").write_text("")
+    assert claude.transcript(tmp_path, "/work/app", "s1") == here / "s1.jsonl"
+    # An id is matched as it is, never as a pattern.
+    assert claude.find_transcript(tmp_path, "*") is None

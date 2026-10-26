@@ -1,4 +1,5 @@
 """Facts about how Claude Code lays out its files, so every other module agrees on them."""
+import glob
 import hashlib
 import json
 import os
@@ -53,6 +54,28 @@ def config_json(d) -> Path:
 
 def settings_json(d) -> Path:
     return norm(d) / "settings.json"
+
+
+def project_dir(d, cwd) -> Path:
+    """The projects/ folder holding the transcripts of sessions run in cwd: its real path with every character other
+    than an ASCII letter or digit turned into "-", once per UTF-16 unit as JavaScript counts them."""
+    real = os.path.realpath(str(cwd))
+    name = "".join(c if c.isascii() and c.isalnum() else "--" if ord(c) > 0xFFFF else "-" for c in real)
+    return norm(d) / "projects" / name
+
+
+def find_transcript(d, sid: str) -> Path | None:
+    """Session sid's transcript, in whichever of d's project folders holds it."""
+    try:
+        return next((norm(d) / "projects").glob(f"*/{glob.escape(sid)}.jsonl"), None)
+    except OSError:
+        return None
+
+
+def transcript(d, cwd, sid: str) -> Path:
+    """Where session sid run in cwd keeps its transcript; a resumed session keeps the file it began in."""
+    path = project_dir(d, cwd) / f"{sid}.jsonl"
+    return path if path.exists() else (find_transcript(d, sid) or path)
 
 
 def keychain_service(d) -> str:

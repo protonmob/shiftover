@@ -18,7 +18,8 @@ def rows_for(cfg: Config, entries: dict) -> list[dict]:
     now = datetime.datetime.now(datetime.timezone.utc)
     for a in cfg.ordered():
         e = entries.get(str(a.path)) or {}
-        row = {"account": a, "name": a.name, "email": e.get("email") or a.email, "dir": str(a.path)}
+        row = {"account": a, "name": a.name, "display": a.display or None, "email": e.get("email") or a.email,
+               "dir": str(a.path)}
         row["fetched_at"] = e.get("ts")
         nxt = usage.next_refresh(e)
         # Jittered so the tabs polling `status --json` do not all wake in the same second.
@@ -39,6 +40,11 @@ def rows_for(cfg: Config, entries: dict) -> list[dict]:
             row["extra"] = e["extra"]
         rows.append(row)
     return rows
+
+
+def shown(row: dict) -> str:
+    """The account as messages name it: its display name when set."""
+    return row.get("display") or row["name"]
 
 
 def summary(row: dict) -> str:
@@ -65,29 +71,29 @@ def choose(cfg: Config, rows: list[dict], prefer=None, family: str | None = None
     if prefer:
         pinned = next((r for r in order if r["name"] == prefer and not r["account"].pool), None)
         if pinned:
-            return pinned, t("opening", name=pinned["name"], summary=summary(pinned) if "limits" in pinned else t("no_limit_info"))
+            return pinned, t("opening", name=shown(pinned), summary=summary(pinned) if "limits" in pinned else t("no_limit_info"))
         order = [r for r in order if r["name"] == prefer] + [r for r in order if r["name"] != prefer and r["account"].pool]
         head = order[0] if order and order[0]["name"] == prefer else None
         if head and "limits" not in head and eligible(head, family):
-            return head, t("limits_unreadable", err=head.get("err", "?"), name=head["name"])
+            return head, t("limits_unreadable", err=head.get("err", "?"), name=shown(head))
     else:
         order = [r for r in order if r["account"].pool]
     known = [r for r in order if "limits" in r and eligible(r, family)]
     unknown = [r for r in order if r.get("email") and "limits" not in r and eligible(r, family)]
     if not known:
         if unknown:
-            return unknown[0], t("limits_unreadable", err=unknown[0].get("err", "?"), name=unknown[0]["name"])
+            return unknown[0], t("limits_unreadable", err=unknown[0].get("err", "?"), name=shown(unknown[0]))
         return (order[0] if order else None), t("no_login")
     free = [r for r in known if not usage.blocking(r["limits"], family)]
     if free:
         r = free[0]
         skipped = [k for k in known[: known.index(r)]]
         if not skipped:
-            return r, t("opening", name=r["name"], summary=summary(r))
-        reasons = "; ".join(f"{k['name']}: {why_blocked(k, family)}" for k in skipped)
-        return r, t("skipped", reasons=reasons, name=r["name"], summary=summary(r))
+            return r, t("opening", name=shown(r), summary=summary(r))
+        reasons = "; ".join(f"{shown(k)}: {why_blocked(k, family)}" for k in skipped)
+        return r, t("skipped", reasons=reasons, name=shown(r), summary=summary(r))
     if unknown:
-        return unknown[0], t("all_full_unknown", name=unknown[0]["name"], err=unknown[0].get("err", "?"))
+        return unknown[0], t("all_full_unknown", name=shown(unknown[0]), err=unknown[0].get("err", "?"))
 
     def earliest(r):
         ts = [usage.parse_ts(lim.get("resets_at")) for lim in usage.blocking(r["limits"], family)]
@@ -95,7 +101,7 @@ def choose(cfg: Config, rows: list[dict], prefer=None, family: str | None = None
         return min(ts) if ts else datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
 
     r = min(known, key=earliest)
-    return r, t("all_full", name=r["name"], why=why_blocked(r, family))
+    return r, t("all_full", name=shown(r), why=why_blocked(r, family))
 
 
 def best(cfg: Config, rows: list[dict], family: str | None = None, exclude=(), min_headroom: float = 0.0) -> dict | None:

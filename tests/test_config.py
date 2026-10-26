@@ -52,6 +52,26 @@ def test_import_skips_dirs_without_login(home):
     assert "scratch" not in cfg.accounts
 
 
+def test_display_names_round_trip_and_stay_out_of_resolution(home):
+    cfg = config.load()
+    cfg.accounts["second"].display = "İş hesabı"
+    config.save(cfg)
+    cfg = config.load()
+    second = cfg.accounts["second"]
+    assert second.display == "İş hesabı" and second.label == "İş hesabı" and second.name == "second"
+    assert cfg.accounts["main"].display == "" and cfg.accounts["main"].label == "main"
+    # Commands, flags and delegate arguments take the name; the display name is never a key.
+    assert cfg.resolve("second") is second and cfg.resolve("İş hesabı") is None
+
+
+def test_unknown_keys_do_not_break_a_config(home):
+    path = home / ".config" / "shiftover" / "config.toml"
+    path.write_text(path.read_text().replace('[accounts.second]\n', '[accounts.second]\ncolor = "teal"\n')
+                    .replace('lang = "en"\n', 'lang = "en"\nfuture = 1\n'))
+    cfg = config.load()
+    assert cfg.accounts["second"].display == "" and [a.name for a in cfg.ordered()] == ["main", "second", "third"]
+
+
 def test_adopt_emails_fills_blanks_from_live_login(home):
     cfg = config.load()
     acct = cfg.by_dir(home / ".claude-second")

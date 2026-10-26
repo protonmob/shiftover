@@ -44,6 +44,9 @@ class Job:
     usage: dict | None = None
     parent_session_id: str = ""
     parent_pid: int = 0
+    # Known from the start so a running job can be followed: Claude Code's transcript, or codex's event stream.
+    transcript_path: str = ""
+    log_path: str = ""
 
 
 def _p(job_id: str, ext: str):
@@ -91,12 +94,12 @@ def new_id() -> str:
 
 
 def build_args(*, model, effort, permission_mode, allowed_tools, json_schema, max_budget_usd, resume_session_id,
-               label, mcp_file) -> list[str]:
+               label, mcp_file, session_id) -> list[str]:
     args = ["-p", "--output-format", "json", "--name", f"delegate:{label or 'job'}"]
     if resume_session_id:
         args += ["--resume", resume_session_id]
     else:
-        args += ["--session-id", str(uuid.uuid4())]
+        args += ["--session-id", session_id]
     if model:
         args += ["--model", model]
     if effort:
@@ -120,8 +123,12 @@ def start(acct: Account, prompt: str, *, model=None, effort=None, cwd=None, perm
     binary = claude.claude_bin()
     if not binary:
         raise RuntimeError("claude binary not found")
-    job = Job(id=new_id(), account=acct.name, dir=str(acct.path), model=model, effort=effort,
-              cwd=str(cwd or os.getcwd()), label=label or "", started=time.time(), prompt_chars=len(prompt))
+    cwd = str(cwd or os.getcwd())
+    # Chosen here rather than reported at the end, so the transcript can be followed while it grows.
+    sid = resume_session_id or str(uuid.uuid4())
+    job = Job(id=new_id(), account=acct.name, dir=str(acct.path), model=model, effort=effort, cwd=cwd,
+              label=label or "", started=time.time(), prompt_chars=len(prompt), session_id=sid,
+              transcript_path=str(claude.transcript(acct.path, cwd, sid)))
     # An explicit (possibly empty) strict config is the only way to keep user/project servers out.
     f = paths.tmp_dir() / f"mcp-{job.id}.json"
     paths.write_json(f, {"mcpServers": mcp_servers or {}})
@@ -130,7 +137,7 @@ def start(acct: Account, prompt: str, *, model=None, effort=None, cwd=None, perm
                                      "SHIFTOVER_ACCOUNT_DIR": str(acct.path)})
     args = build_args(model=model, effort=effort, permission_mode=permission_mode, allowed_tools=allowed_tools,
                       json_schema=json_schema, max_budget_usd=max_budget_usd, resume_session_id=resume_session_id,
-                      label=label, mcp_file=job.mcp_file)
+                      label=label, mcp_file=job.mcp_file, session_id=sid)
     return _launch(job, [binary, *args], env, prompt)
 
 
@@ -138,6 +145,7 @@ def start_codex(binary: str, prompt: str, *, model=None, effort=None, cwd=None, 
                 resume_session_id=None, label="") -> Job:
     job = Job(id=new_id(), account="codex", dir="", model=model, effort=effort, cwd=str(cwd or os.getcwd()),
               label=label or "", started=time.time(), prompt_chars=len(prompt), backend="codex")
+    job.log_path = str(_p(job.id, "out"))
     paths.ensure_dir(paths.jobs_dir())
     schema_file = None
     if json_schema:
@@ -297,7 +305,11 @@ def _finalize(job: Job) -> Job:
             except ValueError:
                 continue
     if isinstance(data, dict):
-        job.session_id = data.get("session_id") or job.session_id
+        sid = data.get("session_id")
+        if sid and sid != job.session_id and job.dir:
+            # A session that came back under another id (or a job from before ids were chosen up front).
+            job.transcript_path = str(claude.transcript(job.dir, job.cwd, sid))
+        job.session_id = sid or job.session_id
         structured = data.get("structured_output")
         if structured is not None:
             job.result = json.dumps(structured, ensure_ascii=False)

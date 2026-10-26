@@ -189,6 +189,43 @@ def test_raw_usage_429_keeps_the_last_limits(home, monkeypatch, capsys):
     assert all(e["limits"] == lims and e["limits_ts"] == 600 and e["retry_at"] == 1060 for e in usage.load_cache().values())
 
 
+def test_display_names_show_in_text_and_json_while_names_stay_the_keys(home, monkeypatch, capsys):
+    monkeypatch.setattr(i18n, "LANG", "en")
+    seen = _capture_run(monkeypatch)
+    cfg = config.load()
+    cfg.accounts["main"].display = "Kadir"
+    cfg.accounts["second"].display = "İş"
+    config.save(cfg)
+    _seed_limits({"main": [("session", "", 100)], "second": [("session", "", 10)], "third": [("session", "", 10)]})
+    assert cli.main(["status", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["name"], r["display"]) for r in rows] == [("main", "Kadir"), ("second", "İş"), ("third", None)]
+    lines = [p for p, _ in ui.build_lines(cli._rows(config.load(), True), ui.Style(None))]
+    assert any(ln.lstrip().startswith("1  Kadir") for ln in lines) and any("İş" in ln for ln in lines)
+    assert any(ln.lstrip().startswith("3  third") for ln in lines)
+    # The picker's message names accounts by display name; the account itself is chosen and passed by name.
+    assert cli.cmd_run(["-p", "hi"]) == 0
+    assert "Kadir: 5h full" in capsys.readouterr().err and seen[-1][0] == "second"
+    assert cli.cmd_run(["-a", "second", "-p", "hi"]) == 0 and seen[-1][0] == "second"
+    assert cli.cmd_run(["-a", "İş", "-p", "hi"]) == 1
+    assert "unknown account: İş" in capsys.readouterr().err
+
+
+def test_the_status_line_shows_the_display_name(home, monkeypatch, capsys):
+    import io
+    from shiftover import statusline
+    cfg = config.load()
+    cfg.accounts["main"].display = "Kadir"
+    config.save(cfg)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s-display", "model": {"display_name": "Opus"},
+                                                             "rate_limits": {"five_hour": {"used_percentage": 12}}})))
+    assert statusline.main() == 0
+    out = capsys.readouterr().out
+    assert "Kadir" in out and "main" not in out
+    # The session file keeps the name: hooks and the panel look accounts up by it.
+    assert paths.read_json(paths.sessions_dir() / "s-display.json")["account"] == "main"
+
+
 def _expired_tokens(monkeypatch, lang="en"):
     """Every account's token expired after its windows were read; sending or renewing it fails the test."""
     monkeypatch.setattr(i18n, "LANG", "en")

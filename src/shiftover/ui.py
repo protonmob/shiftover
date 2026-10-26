@@ -5,7 +5,7 @@ import sys
 
 from . import usage
 from .i18n import t
-from .pick import label
+from .pick import label, shown
 
 BAR_WIDTH = 10
 GAP = "    "
@@ -50,7 +50,7 @@ def build_lines(rows, st: Style, selected=None, cols=200):
         for lim in r.get("limits") or []:
             labels.setdefault((lim["kind"], lim.get("model") or ""), label(lim))
     kinds = sorted(labels, key=lambda k: (usage.KINDS.index(k[0]), k[1]))
-    name_w = max([len(r["name"]) for r in rows] + [6])
+    name_w = max([len(shown(r)) for r in rows] + [6])
     email_w = max([len(r.get("email") or "") for r in rows] + [len(t("not_logged_in"))])
     cells, widths = {}, {k: len(labels[k]) for k in kinds}
     for i, r in enumerate(rows):
@@ -68,7 +68,7 @@ def build_lines(rows, st: Style, selected=None, cols=200):
         return f"{mark}{i + 1:>2}", f"{st.bold}{st.cyan}{mark}{i + 1:>2}{st.reset}"
 
     def ident(r, on):
-        plain = f"{r['name']:<{name_w}}  {(r.get('email') or t('not_logged_in')):<{email_w}}"
+        plain = f"{shown(r):<{name_w}}  {(r.get('email') or t('not_logged_in')):<{email_w}}"
         return plain, (f"{st.bold}{st.cyan}{plain}{st.reset}" if on else plain)
 
     if kinds and not narrow:

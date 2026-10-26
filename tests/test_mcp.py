@@ -48,12 +48,15 @@ def test_handshake_and_tools(home, fake_claude):
         res = _rpc(p, 4, "tools/call", {"name": "delegate", "arguments": {"prompt": "say hi", "model": "haiku", "effort": "low", "label": "t1"}})
         body = json.loads(res["result"]["content"][0]["text"])
         assert body["status"] == "done" and body["result"] == "echo: say hi" and body["account"] == "third"
+        assert body["resume_hint"] == f'delegate(resume_session_id="{body["session_id"]}", account="third", prompt=...)'
         call = calls(fake_claude)[-1]
         assert call["env"]["CLAUDE_CONFIG_DIR"].endswith(".claude-third") and call["env"]["SHIFTOVER_DEPTH"] == "1"
         assert "--model" in call["argv"] and "haiku" in call["argv"] and "--effort" in call["argv"] and call["prompt"] == "say hi"
         assert "-p" in call["argv"] and "--permission-mode" in call["argv"]
         bg = json.loads(_rpc(p, 5, "tools/call", {"name": "delegate", "arguments": {"prompt": "sleep 1 then answer", "account": "second", "background": True}})["result"]["content"][0]["text"])
         assert bg["status"] == "running" and bg["account"] == "second"
+        # Its session is known at once, but one still running is not offered for resuming.
+        assert bg["session_id"] and "resume_hint" not in bg
         mon = json.loads(_rpc(p, 6, "tools/call", {"name": "monitor", "arguments": {"job_ids": [bg["job_id"]], "wait_seconds": 10}})["result"]["content"][0]["text"])
         assert mon[0]["status"] == "done" and mon[0]["result"].startswith("echo: sleep 1")
         err = _rpc(p, 7, "tools/call", {"name": "delegate", "arguments": {"prompt": "x", "account": "nope"}})["result"]

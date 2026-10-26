@@ -23,6 +23,7 @@ email = "you+3@example.com"
 dir = "~/.claude-work"
 email = "you@work.example"
 pool = false           # kept separate: opened only with `claude -a work` or a [map] rule, never a hand-off/delegate target
+# display = "Work"     # optional: shown instead of the name in status, the picker and the status line; commands keep the name
 
 [handoff]
 mode = "auto"          # auto: switch at the end of the turn | ask: offer after /exit | off

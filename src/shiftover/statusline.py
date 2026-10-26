@@ -70,7 +70,7 @@ def main() -> int:
         ctx = (data.get("context_window") or {}).get("used_percentage")
         base = model + (f"  {ctx:.0f}% ctx" if isinstance(ctx, (int, float)) else "")
     st = Style(None, force=True)
-    seg = segment(acct.name if acct else d.name, rl, st)
+    seg = segment(acct.label if acct else d.name, rl, st)
     lines = base.split("\n")
     lines[0] = f"{lines[0]} · {seg}" if lines[0] else seg
     print("\n".join(lines))

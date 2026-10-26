@@ -96,7 +96,7 @@ def cmd_run(args: list[str]) -> int:
             print(t("cancelled"), file=sys.stderr)
             return 1
         acct = rows[idx]["account"]
-        print((D + f"→ {acct.name}" + R) if color else f"→ {acct.name}", file=sys.stderr)
+        print((D + f"→ {acct.label}" + R) if color else f"→ {acct.label}", file=sys.stderr)
     elif spec:
         acct = cfg.resolve(spec)
         if not acct:
@@ -540,6 +540,12 @@ def cmd_handoff(ns) -> int:
 
 def cmd_jobs(ns) -> int:
     from .delegate import jobs
+    if ns.action == "follow":
+        from .delegate import follow
+        if not jobs.load(ns.job):
+            return _err(f"unknown job {ns.job}")
+        _cfg(required=False)
+        return follow.run(ns.job)
     if ns.purge:
         print(f"purged {jobs.purge()} finished job(s) older than 24h")
         return 0
@@ -661,7 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
     s.add_argument("--now", action="store_true")
 
-    s = sub.add_parser("jobs", help="delegate jobs")
+    s = sub.add_parser("jobs", help="delegate jobs; `jobs follow ID` prints one's steps as they happen")
+    s.add_argument("action", nargs="?", choices=["follow"])
+    s.add_argument("job", nargs="?")
     s.add_argument("--show")
     s.add_argument("--cancel")
     s.add_argument("--purge", action="store_true")
@@ -699,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error("map add DIR ACCOUNT / map remove DIR")
     if ns.cmd == "map" and ns.action == "add" and not ns.account:
         p.error("map add DIR ACCOUNT")
+    if ns.cmd == "jobs" and ns.action == "follow" and not ns.job:
+        p.error("jobs follow ID")
     handlers = {
         "status": cmd_status, "doctor": cmd_doctor, "init": cmd_init, "setup": cmd_setup, "add": cmd_add, "remove": cmd_remove,
         "install": cmd_install, "uninstall": cmd_uninstall, "shell-init": cmd_shell_init, "map": cmd_map,

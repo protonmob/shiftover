@@ -148,6 +148,7 @@ sequenceDiagram
 | `shiftover map add DIR ACCOUNT` / `map remove DIR` / `map` | directory → account rules |
 | `shiftover sync-mcp [--from A] [--to B\|all] [--overwrite]` | copy `mcpServers` definitions between accounts |
 | `shiftover jobs [--show ID] [--cancel ID] [--purge]` | delegate jobs |
+| `shiftover jobs follow ID` | a delegate job's steps as they happen (files edited and read, searches, commands, its messages; no tool output), then a one-line summary when it ends |
 | `shiftover shell-init` | prints the `claude()` / `cl()` shell functions (`cl DIR [--menu] [claude args…]` starts in DIR) |
 
 ## Config
@@ -172,6 +173,7 @@ models = ["opus", "sonnet"]      # optional: this account is skipped when anothe
 dir = "~/.claude-work"
 email = "you@work.example"
 pool = false                     # opened only on request; never a hand-off or delegate target
+display = "Work"                 # optional: shown instead of the name in status, the picker and the status line
 
 [handoff]
 mode = "auto"                    # auto | ask | off
@@ -199,6 +201,9 @@ enabled = true                   # offer the Codex CLI as delegate target "codex
 
 `email` is what `doctor` and the picker compare against: `/login` takes whatever account the browser has open, so a
 directory can silently end up holding the wrong account.
+
+`display` only changes what you read (`status --json` carries it too, `null` when unset); every command, flag and
+`delegate(account=…)` still takes the account's name, `work` above.
 
 ## The delegate tool
 

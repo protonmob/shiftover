@@ -173,7 +173,8 @@ class Server:
             out["ignored"] = f"{', '.join(ignored)} do not apply to the Codex backend"
         if job.status == "running":
             out["note"] = f"still running after {wait_s}s; collect with monitor(job_ids=[\"{job.id}\"])"
-        if job.session_id:
+        # The id is known from the start now, but a session still running cannot be resumed.
+        if job.session_id and job.status != "running":
             out["resume_hint"] = f"delegate(resume_session_id=\"{job.session_id}\", account=\"{acct_name}\", prompt=...)"
         return out
 

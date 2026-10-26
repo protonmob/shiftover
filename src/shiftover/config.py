@@ -19,10 +19,16 @@ class Account:
     models: list[str] | None = None
     enabled: bool = True
     pool: bool = True
+    display: str = ""
 
     @property
     def path(self) -> Path:
         return claude.norm(self.dir)
+
+    @property
+    def label(self) -> str:
+        """What text UIs show; the name stays the key for every command, flag and delegate argument."""
+        return self.display or self.name
 
     def allows_model(self, family: str | None) -> bool:
         if not family or not self.models:
@@ -105,7 +111,7 @@ def _acct_from(name: str, d: dict) -> Account:
     return Account(
         name=name, dir=str(d.get("dir", "")), email=str(d.get("email", "")),
         models=list(d["models"]) if d.get("models") else None, enabled=bool(d.get("enabled", True)),
-        pool=bool(d.get("pool", True)),
+        pool=bool(d.get("pool", True)), display=str(d.get("display") or ""),
     )
 
 
@@ -174,6 +180,8 @@ def to_toml(cfg: Config) -> str:
     for a in cfg.accounts.values():
         lines += [f"[accounts.{a.name}]" if a.name.replace("-", "").replace("_", "").isalnum() else f'[accounts.{json.dumps(a.name)}]',
                   f"dir = {_v(a.dir)}", f"email = {_v(a.email)}"]
+        if a.display:
+            lines.append(f"display = {_v(a.display)}")
         if a.models:
             lines.append(f"models = {_v(a.models)}")
         if not a.enabled:
