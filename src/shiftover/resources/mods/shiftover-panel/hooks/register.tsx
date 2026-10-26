@@ -15,19 +15,28 @@ const PANE = 'shiftover-panel'
 const TITLE = 'Shiftover'
 const JOBS_MS = 10_000
 const ACCOUNTS_MS = 60_000
+// A read that failed, or left the server's next read in the past, is tried
+// again after 30 s, then twice as long each time up to five minutes, plus up
+// to a fifth more at random, so panes in other tabs fall out of step.
 const ACCOUNTS_RETRY_MS = 30_000
-const FRAME_MS = 100
+const ACCOUNTS_RETRY_MAX_MS = 5 * 60_000
+const ACCOUNTS_RETRY_JITTER = 0.2
+// Four spinner frames a second keep a pane in every tab cheap to redraw.
+const FRAME_MS = 250
 const MIN_FRAME_MS = 67
 const WAITING_BLINK_MS = 600
 const WAITING_BORDER_MS = 10_000
 const WAITING_BORDER_FLASH_MS = 1_000
 const CURRENT_COLOR: Color = 'claude'
-// The theme's dim color: a muted row inverts to a soft grey bar.
+// The theme's dim color: a muted capsule inverts to a soft grey block.
 const MUTED: Color = 'inactive'
 const POP_MS = 250
 const FINISH_MS = 2_000
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 const CAPSULES_SHOWN = 3
+// The jobs kept: every running one, then those finished within a day.
+const JOBS_KEPT = 10
+const JOBS_KEPT_MS = 24 * 60 * 60_000
 const UNVERIFIED_RUNNING_MS = 2 * 60 * 60 * 1000
 const RESET_GROUP_MS = 60 * 60_000
 const TAIL_BYTES = 256 * 1024
@@ -45,7 +54,7 @@ const NO_AGENTS: AgentsSnapshot = { list: [], at: 0, error: null }
 // Bump a tag when its snapshot's fields change: what an earlier version
 // stored outlives a reload, and the tag is how the new code declines it.
 const accounts = atom({ plugin: 'shiftover-panel', key: 'accounts' } as const, NO_ACCOUNTS, {
-  shape: 'accounts-1',
+  shape: 'accounts-2',
 })
 const jobs = atom({ plugin: 'shiftover-panel', key: 'jobs' } as const, NO_JOBS, { shape: 'jobs-1' })
 const isDismissed = atom({ plugin: 'shiftover-panel', key: 'isDismissed' } as const, false)
@@ -55,7 +64,7 @@ const chats = atom({ plugin: 'shiftover-panel', key: 'chats' } as const, NO_CHAT
 const agents = atom({ plugin: 'shiftover-panel', key: 'agents' } as const, NO_AGENTS, { shape: 'agents-1' })
 
 // What the module keeps between timer ticks; a reload starts it over.
-type Files = { home: string; jobsDir: string; configFile: string; bin: string }
+type Files = { home: string; cacheDir: string; jobsDir: string; configFile: string; bin: string }
 // The backend stays here, out of the stored Job shape.
 type CachedJob = { mtimeMs: number; size: number; job: Job | null; backend: string }
 type CachedOut = { mtimeMs: number; size: number; verdict: string | null }
@@ -85,6 +94,11 @@ let isReadingCodex = false
 let agentsGeneration = 0
 let accountsTriedAt = Number.NEGATIVE_INFINITY
 let accountsRetryAt = Number.NEGATIVE_INFINITY
+let codexTriedAt = Number.NEGATIVE_INFINITY
+// Stale or failed account reads in a row: how far the next retry backs off.
+let accountsFailures = 0
+// A tick skipped while no surface showed the pane: its next drawing catches up.
+let missedTick = false
 const jobFiles = new Map<string, CachedJob>()
 const jobOuts = new Map<string, CachedOut>()
 
@@ -118,6 +132,7 @@ function parseLimit(row: Record<string, unknown>): Limit[] {
   return [{ kind: asText(row.kind), model: asText(row.model), used, resetsAtMs: toEpochMs(row.resets_at) }]
 }
 
+// The email shiftover reports stays out: any plugin may read $.state.
 function parseAccounts(stdout: string): Account[] {
   const data: unknown = JSON.parse(stdout)
   if (!Array.isArray(data)) throw new Error('shiftover status: liste bekleniyordu')
@@ -125,7 +140,6 @@ function parseAccounts(stdout: string): Account[] {
     .filter(isRecord)
     .map(row => ({
       name: asText(row.name),
-      email: asText(row.email),
       dir: asText(row.dir),
       nextRefreshAtMs: toEpochMs(row.next_refresh_at),
       fetchedAtMs: toEpochMs(row.fetched_at),
@@ -135,10 +149,17 @@ function parseAccounts(stdout: string): Account[] {
     .filter(account => account.name !== '')
 }
 
+// The server's earliest next read. An account it could not read may keep a
+// target that never moves on: that one schedules nothing.
 function nextAccountRefresh(list: Account[]): number | null {
-  const times = list.flatMap(account => typeof account.nextRefreshAtMs === 'number' &&
+  const times = list.flatMap(account => account.err === null && typeof account.nextRefreshAtMs === 'number' &&
     Number.isFinite(account.nextRefreshAtMs) ? [account.nextRefreshAtMs] : [])
   return times.length === 0 ? null : Math.min(...times)
+}
+
+function retryDelay(failures: number): number {
+  const delay = Math.min(ACCOUNTS_RETRY_MAX_MS, ACCOUNTS_RETRY_MS * 2 ** Math.max(0, failures - 1))
+  return Math.round(delay * (1 + ACCOUNTS_RETRY_JITTER * Math.random()))
 }
 
 function parseJob(raw: string, fileName: string): Pick<CachedJob, 'job' | 'backend'> | null {
@@ -192,18 +213,19 @@ function outcomeOf(tail: string, backend: string, truncated: boolean): string | 
 
 async function locate($: EngineInterface): Promise<Files> {
   if (files !== null) return files
-  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
+  if (!(await isVisible($))) throw new Error('panel yerleştirilmedi')
   const home = (await $.env.get('HOME')) ?? ''
   if (home === '') throw new Error('HOME tanımsız')
-  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
+  if (!(await isVisible($))) throw new Error('panel yerleştirilmedi')
   const cache = (await $.env.get('XDG_CACHE_HOME')) || `${home}/.cache`
-  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
+  if (!(await isVisible($))) throw new Error('panel yerleştirilmedi')
   const config = (await $.env.get('XDG_CONFIG_HOME')) || `${home}/.config`
   const local = `${home}/.local/bin/shiftover`
-  if (!(await isPlaced($))) throw new Error('panel yerleştirilmedi')
+  if (!(await isVisible($))) throw new Error('panel yerleştirilmedi')
   const hasLocal = await $.fs.exists(local).catch(() => false)
   files = {
     home,
+    cacheDir: `${cache}/shiftover`,
     jobsDir: `${cache}/shiftover/jobs`,
     configFile: `${config}/shiftover/config.toml`,
     bin: hasLocal ? local : 'shiftover',
@@ -211,12 +233,17 @@ async function locate($: EngineInterface): Promise<Files> {
   return files
 }
 
+// A write draws every site that reads the value again: one that would change
+// nothing but its read time is skipped, so `at` is the last read that did.
+const isSame = <T extends { at: number }>(held: T, next: T): boolean =>
+  JSON.stringify({ ...held, at: 0 }) === JSON.stringify({ ...next, at: 0 })
+
 const normalizeDir = (dir: string, home: string): string =>
   dir.replace(/^~(?=\/|$)/, home).replace(/\/+$/, '')
 
 async function readMain($: EngineInterface, configFile: string): Promise<string | null> {
   try {
-    if (!(await isPlaced($))) return null
+    if (!(await isVisible($))) return null
     for (const raw of (await $.fs.read(configFile)).split('\n')) {
       const line = raw.trim()
       if (line.startsWith('[')) break
@@ -232,11 +259,11 @@ async function readMain($: EngineInterface, configFile: string): Promise<string 
 // Claude Code reads CLAUDE_CONFIG_DIR, else ~/.claude: the account on that
 // dir is this session's. Then shiftover's own word, then its main account.
 async function currentAccount($: EngineInterface, list: Account[], at: Files): Promise<string | null> {
-  if (!(await isPlaced($))) return null
+  if (!(await isVisible($))) return null
   const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${at.home}/.claude`
   const byDir = list.find(account => normalizeDir(account.dir, at.home) === normalizeDir(dir, at.home))
   if (byDir) return byDir.name
-  if (!(await isPlaced($))) return null
+  if (!(await isVisible($))) return null
   const named = await $.env.get('SHIFTOVER_ACCOUNT')
   if (named && list.some(account => account.name === named)) return named
   const main = await readMain($, at.configFile)
@@ -245,34 +272,44 @@ async function currentAccount($: EngineInterface, list: Account[], at: Files): P
 
 async function refreshAccounts($: EngineInterface): Promise<void> {
   if (isReadingAccounts) return
-  if (!(await isPlaced($)) || isReadingAccounts) return
+  if (!(await isVisible($)) || isReadingAccounts) return
   isReadingAccounts = true
+  // Null while the read never ended: the pane hid on the way.
+  let outcome: 'read' | 'failed' | null = null
   try {
     await reconcileMotion($, true)
     accountsTriedAt = await $.clock.now()
     const at = await locate($)
-    if (!(await isPlaced($))) return
+    if (!(await isVisible($))) return
     const ran = await $.process.run([at.bin, 'status', '--json'], { timeoutMs: 25_000 })
     if (ran.exitCode !== 0) {
       const why = firstLine(ran.stderr)
       throw new Error(`shiftover status ${ran.exitCode}${why === '' ? '' : `: ${why}`}`)
     }
-    if (!(await isPlaced($))) return
+    if (!(await isVisible($))) return
     const list = parseAccounts(ran.stdout)
     const current = await currentAccount($, list, at)
-    if (!(await isPlaced($))) return
+    if (!(await isVisible($))) return
     const now = await $.clock.now()
     const snapshot = { list, current, at: now, error: null }
-    await update($, accounts, () => snapshot)
+    if (!isSame(await read($, accounts), snapshot)) await update($, accounts, () => snapshot)
+    outcome = 'read'
   } catch (err) {
-    if (!(await isPlaced($))) return
+    if (!(await isVisible($))) return
+    outcome = 'failed'
     const error = describe(err)
-    await update($, accounts, held => ({ ...held, error })).catch(() => undefined)
+    if ((await read($, accounts).catch(() => NO_ACCOUNTS)).error !== error) {
+      await update($, accounts, held => ({ ...held, error })).catch(() => undefined)
+    }
   } finally {
     try {
       const now = await $.clock.now()
       const target = nextAccountRefresh((await read($, accounts)).list)
-      accountsRetryAt = target !== null && target <= now ? now + ACCOUNTS_RETRY_MS : Number.NEGATIVE_INFINITY
+      if (outcome !== null) {
+        const isStale = outcome === 'failed' || (target !== null && target <= now)
+        accountsFailures = isStale ? accountsFailures + 1 : 0
+        accountsRetryAt = isStale ? now + retryDelay(accountsFailures) : Number.NEGATIVE_INFINITY
+      }
     } finally {
       isReadingAccounts = false
       await reconcileMotion($, true)
@@ -283,12 +320,12 @@ async function refreshAccounts($: EngineInterface): Promise<void> {
 // Reads only the job files that changed since the last tick, each with the
 // listing's entry for its .out.
 async function readJobs($: EngineInterface, dir: string): Promise<JobRead[]> {
-  if (!(await isPlaced($))) return []
+  if (!(await isVisible($))) return []
   if (!(await $.fs.exists(dir))) {
     jobFiles.clear()
     return []
   }
-  if (!(await isPlaced($))) return []
+  if (!(await isVisible($))) return []
   const listing = (await $.fs.list(dir)).filter(f => f.kind === 'file')
   const entries = listing.filter(f => f.name.endsWith('.json'))
   const outs = new Map(listing.filter(f => f.name.endsWith('.out')).map(f => [f.name, f]))
@@ -298,7 +335,7 @@ async function readJobs($: EngineInterface, dir: string): Promise<JobRead[]> {
     const held = jobFiles.get(entry.name)
     if (held && held.mtimeMs === entry.mtimeMs && held.size === entry.size) continue
     try {
-      if (!(await isPlaced($))) return []
+      if (!(await isVisible($))) return []
       const parsed = parseJob(await $.fs.read(`${dir}/${entry.name}`), entry.name)
       jobFiles.set(entry.name, { mtimeMs: entry.mtimeMs, size: entry.size, job: parsed?.job ?? null,
         backend: parsed?.backend ?? 'claude' })
@@ -322,7 +359,7 @@ async function readOutcomes($: EngineInterface, dir: string, running: JobRead[])
     let held = jobOuts.get(job.id)
     if (held?.size !== out.size || held.mtimeMs !== out.mtimeMs) {
       try {
-        if (!(await isPlaced($))) return outcomes
+        if (!(await isVisible($))) return outcomes
         const ran = await $.process.run(['tail', '-c', String(TAIL_BYTES), '--', `${dir}/${job.id}.out`], {
           timeoutMs: 5_000,
         })
@@ -344,7 +381,7 @@ async function readOutcomes($: EngineInterface, dir: string, running: JobRead[])
 async function livePids($: EngineInterface, pids: number[]): Promise<Set<number> | null> {
   if (pids.length === 0) return new Set()
   try {
-    if (!(await isPlaced($))) return null
+    if (!(await isVisible($))) return null
     const ran = await $.process.run(['ps', '-ww', '-o', 'pid=,stat=,command=', '-p', pids.join(',')], {
       timeoutMs: 5_000,
     })
@@ -362,22 +399,25 @@ async function livePids($: EngineInterface, pids: number[]): Promise<Set<number>
   }
 }
 
-function pickJobs(all: Job[]): Job[] {
+// The jobs directory keeps every job ever run: the state keeps the running
+// ones, then those that ended within a day, newest first, ten in all unless
+// more than ten run. A job with no time at all is older than any day.
+function pickJobs(all: Job[], now: number): Job[] {
   const ended = (job: Job): number => job.finishedMs ?? job.startedMs
   const running = all.filter(job => job.status === 'running').sort((a, b) => b.startedMs - a.startedMs)
   const finished = all
-    .filter(job => job.status !== 'running')
+    .filter(job => job.status !== 'running' && ended(job) > 0 && now - ended(job) <= JOBS_KEPT_MS)
     .sort((a, b) => ended(b) - ended(a))
-  return [...running, ...finished]
+  return [...running, ...finished].slice(0, Math.max(JOBS_KEPT, running.length))
 }
 
 async function refreshJobs($: EngineInterface): Promise<void> {
-  if (isReadingJobs || !(await isPlaced($))) return
+  if (isReadingJobs || !(await isVisible($))) return
   isReadingJobs = true
   try {
     const dir = (await locate($)).jobsDir
     const all = await readJobs($, dir)
-    if (!(await isPlaced($))) return
+    if (!(await isVisible($))) return
     const outcomes = await readOutcomes($, dir, all.filter(({ job }) => job.status === 'running'))
     const pids = all.filter(({ job }) => job.status === 'running' && !outcomes.has(job.id) && job.pid > 0)
       .map(({ job }) => job.pid)
@@ -395,13 +435,15 @@ async function refreshJobs($: EngineInterface): Promise<void> {
       const outcome = outcomes.get(job.id)
       if (outcome !== undefined) return { ...job, status: outcome, finishedMs: job.finishedMs ?? out?.mtimeMs ?? now }
       return isStale(job) ? { ...job, status: 'stale' } : job
-    }))
+    }), now)
     const snapshot = { list, at: now, error: null }
-    observeJobs(snapshot, now, await isPlaced($))
-    await update($, jobs, () => snapshot)
+    observeJobs(snapshot, now, await isVisible($))
+    if (!isSame(await read($, jobs), snapshot)) await update($, jobs, () => snapshot)
   } catch (err) {
     const error = describe(err)
-    await update($, jobs, held => ({ ...held, error })).catch(() => undefined)
+    if ((await read($, jobs).catch(() => NO_JOBS)).error !== error) {
+      await update($, jobs, held => ({ ...held, error })).catch(() => undefined)
+    }
   } finally {
     isReadingJobs = false
     await reconcileMotion($)
@@ -413,12 +455,12 @@ const agentIsRunning = (agent: Pick<PaneAgent, 'status'>): boolean =>
 
 // Even a forced tick may not read agents for an unplaced pane.
 async function refreshAgents($: EngineInterface): Promise<void> {
-  if (isReadingAgents || !(await isPlaced($))) return
+  if (isReadingAgents || !(await isVisible($))) return
   isReadingAgents = true
   const generation = agentsGeneration
   try {
     const listed = await $.agent.list()
-    if (generation !== agentsGeneration || !(await isPlaced($))) return
+    if (generation !== agentsGeneration || !(await isVisible($))) return
     const now = await $.clock.now()
     const held = await read($, agents)
     const previous = new Map(held.list.map(agent => [agent.id, agent]))
@@ -430,28 +472,33 @@ async function refreshAgents($: EngineInterface): Promise<void> {
       }
     })
     const snapshot = { list, at: now, error: null }
-    observeAgents(snapshot, now, await isPlaced($))
-    await update($, agents, () => snapshot)
+    observeAgents(snapshot, now, await isVisible($))
+    if (!isSame(held, snapshot)) await update($, agents, () => snapshot)
   } catch {
-    await update($, agents, held => ({ ...held, error: 'Ajanlar okunamadı' })).catch(() => undefined)
+    const error = 'Ajanlar okunamadı'
+    if ((await read($, agents).catch(() => NO_AGENTS)).error !== error) {
+      await update($, agents, held => ({ ...held, error })).catch(() => undefined)
+    }
   } finally {
     isReadingAgents = false
     await reconcileMotion($)
   }
 }
 
+// No limits found keeps the last ones read: a new session names none until
+// its first turn ends, and a window that has since reset draws as reset. A
+// missing Codex history, never read, is an unreadable-limits row.
 async function refreshCodex($: EngineInterface): Promise<void> {
-  if (isReadingCodex || !(await isPlaced($))) return
+  if (isReadingCodex || !(await isVisible($))) return
   isReadingCodex = true
   try {
     const limits = await readCodexLimits($, (await locate($)).home, await $.clock.now())
+    if (limits === null || !(await isVisible($))) return
     const now = await $.clock.now()
     const snapshot = { limits, at: now, error: null }
-    await update($, codex, () => snapshot)
+    if (!isSame(await read($, codex), snapshot)) await update($, codex, () => snapshot)
   } catch {
-    // A missing Codex history is an unreadable-limits row.
-    const now = await $.clock.now()
-    await update($, codex, () => ({ ...NO_CODEX, at: now }))
+    // An unreadable history keeps what was read before.
   } finally {
     isReadingCodex = false
     await reconcileMotion($)
@@ -459,16 +506,16 @@ async function refreshCodex($: EngineInterface): Promise<void> {
 }
 
 async function refreshConversations($: EngineInterface, force = false): Promise<void> {
-  if (isReadingChats || !(await isPlaced($))) return
+  if (isReadingChats || !(await isVisible($))) return
   isReadingChats = true
   try {
     const at = await locate($)
-    if (!(await isPlaced($))) return
-    const snapshot = await refreshChats($, { home: at.home, configFile: at.configFile,
+    if (!(await isVisible($))) return
+    const snapshot = await refreshChats($, { home: at.home, cacheDir: at.cacheDir, configFile: at.configFile,
       accounts: (await read($, accounts)).list, now: await $.clock.now(), force })
     if (snapshot !== null) {
       observeChats(snapshot)
-      await update($, chats, () => snapshot)
+      if (!isSame(await read($, chats), snapshot)) await update($, chats, () => snapshot)
     }
   } finally {
     isReadingChats = false
@@ -478,9 +525,11 @@ async function refreshConversations($: EngineInterface, force = false): Promise<
 
 // MARK: - Timers
 
-async function isPlaced($: EngineInterface): Promise<boolean> {
+// Work and motion only for a pane a surface places and shows: one waiting
+// unplaced, or behind another pane's tab, reads and animates nothing.
+async function isVisible($: EngineInterface): Promise<boolean> {
   try {
-    return (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
+    return (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced && pane.isShown)
   } catch {
     return false
   }
@@ -550,11 +599,11 @@ function observeTaskMotion(now: number, animate: boolean): void {
 async function reconcileMotion($: EngineInterface, repaint = false,
   generation = animationGeneration): Promise<void> {
   try {
-    const [placed, now, held, limits] = await Promise.all([
-      isPlaced($), $.clock.now(), read($, accounts), read($, codex),
+    const [visible, now, held, limits] = await Promise.all([
+      isVisible($), $.clock.now(), read($, accounts), read($, codex),
     ])
     if (generation !== animationGeneration) return
-    if (!placed) {
+    if (!visible) {
       settleMotion()
       return
     }
@@ -571,14 +620,17 @@ async function reconcileMotion($: EngineInterface, repaint = false,
       // Wake at the server target itself, or once the stale-read back-off ends.
       due(refreshAt)
     }
-    const resetLimits = [...held.list.flatMap(account => account.limits),
-      ...limits.limits]
-    if (resetLimits.some(limit => limit.resetsAtMs !== null && limit.resetsAtMs > now)) {
+    const resets = [...held.list.flatMap(account => account.limits), ...limits.limits]
+      .flatMap(limit => limit.resetsAtMs !== null && limit.resetsAtMs > now ? [limit.resetsAtMs] : [])
+    if (resets.length > 0) {
+      // Countdowns change on the minute; a window draws as reset at its time.
       due((Math.floor(now / ACCOUNTS_MS) + 1) * ACCOUNTS_MS)
+      due(Math.min(...resets))
     }
     const shown = tasksOf(motionJobs, motionAgents).slice(0, CAPSULES_SHOWN)
     const spinning = shown.some(taskRunning) || chatsRunning || isReadingAccounts
-    if (spinning) due(now + FRAME_MS)
+    // Each frame lands where every spinner's glyph changes.
+    if (spinning) due((Math.floor(now / FRAME_MS) + 1) * FRAME_MS)
     if (chatsWaiting) {
       due((Math.floor(now / WAITING_BLINK_MS) + 1) * WAITING_BLINK_MS)
       const phase = now % WAITING_BORDER_MS
@@ -591,6 +643,15 @@ async function reconcileMotion($: EngineInterface, repaint = false,
       else if (now < start + POP_MS / 2) due(start + POP_MS / 2)
       else if (now < start + POP_MS) due(start + POP_MS)
       else due(start + FINISH_MS)
+    }
+    // A frame already due paints now, whichever wake reaches it first: a
+    // poll landing on it takes that wait over instead of dropping the frame.
+    if (animationDue <= now) {
+      animation?.cancel()
+      animation = null
+      animationDue = Number.POSITIVE_INFINITY
+      animationGeneration += 1
+      repaint = true
     }
     repaintPending ||= repaint
     if (repaintPending) {
@@ -624,20 +685,23 @@ async function reconcileMotion($: EngineInterface, repaint = false,
   }
 }
 
-// Jobs every tick, accounts once a minute; nothing while no surface draws
-// the pane. A forced refresh changes cadence, never the placement guard.
+// Jobs every tick, accounts and Codex once a minute; nothing while no surface
+// shows the pane. A forced refresh changes cadence, never the placement guard.
 async function tick($: EngineInterface, force: boolean): Promise<void> {
   try {
-    const placed = await isPlaced($)
-    if (!placed) {
+    if (!(await isVisible($))) {
+      missedTick = true
       settleMotion()
       return
     }
+    missedTick = false
     const now = await $.clock.now()
     const isDue = force || (now - accountsTriedAt >= ACCOUNTS_MS && now >= accountsRetryAt)
+    const isCodexDue = force || now - codexTriedAt >= ACCOUNTS_MS
+    if (isCodexDue) codexTriedAt = now
     await Promise.all([
       refreshJobs($), refreshAgents($),
-      isDue ? refreshAccounts($) : undefined, isDue ? refreshCodex($) : undefined,
+      isDue ? refreshAccounts($) : undefined, isCodexDue ? refreshCodex($) : undefined,
       refreshConversations($, force),
     ])
     // Starters of parentless jobs are searched once both lists are fresh.
@@ -768,8 +832,17 @@ function bar(used: number, cells: number, color: Color): Line {
 const severity = (used: number): Color =>
   used >= 90 ? 'error' : used >= 75 ? 'warning' : 'success'
 
+// A window whose reset time has passed has started over: 0% until a read
+// says otherwise.
+const usedNow = (limit: Limit, now: number): number =>
+  limit.resetsAtMs !== null && limit.resetsAtMs <= now ? 0 : limit.used
+
+// A key shiftover is renewing will work again by itself; only an expired one
+// needs the person to log in again.
 function shortError(err: string): string {
+  if (/renewing|yenileniyor/i.test(err)) return 'anahtar yenileniyor'
   if (/401|token expired/i.test(err)) return 'yeniden giriş gerekli'
+  if (/login required|(?<!yeniden )giriş gerekli/i.test(err)) return 'giriş gerekli'
   if (/429/.test(err)) return 'şu an okunamıyor'
   if (/not logged in/i.test(err)) return 'giriş yapılmamış'
   if (/time[ -]?out|timed out/i.test(err)) return 'zaman aşımı'
@@ -787,7 +860,7 @@ function gaugesOf(account: Account, now: number): Gauge[] {
       kind,
       label: isCodex ? minutes === 300 ? '5 saat' : minutes === 10_080 ? 'hafta' : `${Math.round(minutes / 1440)} gün`
         : kind === 'session' ? '5 saat' : kind === 'weekly_all' ? 'hafta' : limit.model || 'Fable',
-      used: limit.used,
+      used: usedNow(limit, now),
       reset: untilReset(limit.resetsAtMs, now),
       resetsAtMs: limit.resetsAtMs,
       countdown: kind === 'session' && limit.resetsAtMs !== null && limit.resetsAtMs > now
@@ -820,13 +893,13 @@ function gaugeColumns(gauges: Gauge[], room: number): Line[] {
 }
 
 const listedAccounts = (snapshot: AccountsSnapshot, limits: CodexSnapshot): Account[] =>
-  [...snapshot.list.filter(account => account.name !== 'codex'), { name: 'codex', email: '', dir: '',
+  [...snapshot.list.filter(account => account.name !== 'codex'), { name: 'codex', dir: '',
     limits: limits.limits, err: limits.error }]
 
-function accountSummary(snapshot: AccountsSnapshot, limits: CodexSnapshot, room: number): Line {
+function accountSummary(snapshot: AccountsSnapshot, limits: CodexSnapshot, room: number, now: number): Line {
   const parts = listedAccounts(snapshot, limits).map((account): Line => {
     const current = account.name === snapshot.current
-    const used = account.limits.length === 0 ? null : Math.max(...account.limits.map(limit => limit.used))
+    const used = account.limits.length === 0 ? null : Math.max(...account.limits.map(limit => usedNow(limit, now)))
     return [account.name === 'codex' ? faint('◎ ') : current ? { text: '● ', color: CURRENT_COLOR } : faint('○ '),
       { text: `${account.name} `, ...(current ? { color: 'text', weight: 'bold' } as const : {}) },
       { text: used === null ? '?' : `${Math.round(clamp(used, 0, 100))}%`,
@@ -980,7 +1053,9 @@ export const register: Register = on => {
       // The pane works without its command.
     }
     if (e.isInteractive) {
-      // The host store belongs to this mod, across reloads and new tabs.
+      // The host store belongs to this mod, across reloads and new tabs. It
+      // is a file under the account's Claude config directory and the engine
+      // offers none shared across accounts: each account keeps its own choice.
       const open = await $.store.get('isAccountsOpen')
       await update($, isAccountsOpen, () => open !== false)
       startPolling($)
@@ -1033,7 +1108,7 @@ export const register: Register = on => {
   // The person's own close holds across a reload of this module.
   on('ui.close', { id: PANE }, async ($, e, next) => {
     const closed = await next(e)
-    if (!(await isPlaced($))) settleMotion()
+    if (!(await isVisible($))) settleMotion()
     if (e.origin.kind === 'person') {
       await update($, isDismissed, () => true).catch(() => undefined)
     }
@@ -1063,8 +1138,8 @@ export const register: Register = on => {
     const padding = width >= 6 ? 1 : 0
     const innerWidth = Math.max(1, width - (bordered ? 2 : 0) - 2 * padding)
     const isPlain = (seg: Seg): boolean => seg.color === undefined && seg.dim !== true && seg.weight === undefined
-    // Hover mutes every run of a pressable row, so the row inverted under the
-    // pointer is one grey bar; focus mutes it at rest for the same reason.
+    // Hover mutes every run of a pressable block, so the block inverted under
+    // the pointer is one grey block; focus mutes it at rest for the same reason.
     const muteHover: TextHoverProps = { color: MUTED }
     const muted = (line: Line): Line => line.map(seg => ({ ...seg, color: MUTED }))
     const draw = (line: Line, room = innerWidth, hover?: TextHoverProps) => (
@@ -1099,12 +1174,18 @@ export const register: Register = on => {
     }
     const capsuleWidth = innerWidth
     const capsuleRoom = Math.max(1, capsuleWidth - 4)
+    // A pressable capsule is one Button holding every line, so a press
+    // anywhere inside its border opens it and no line is selected alone. A
+    // Markdown link would lose the runs' colors, take no focus ring and open
+    // its URL on a modified click. The pointer still inverts the Button: hover
+    // mutes every run, the padding columns included, to one grey block, and
+    // the keyed Box lights the border.
     const capsule = (key: string, first: Line, second: Line | undefined, press?: () => void,
       notes: Line[] = [], capsulePadding = 1, fixedColor?: Color, borderParts: Line[] = []) => {
       const room = Math.max(1, capsuleWidth - 2 - 2 * capsulePadding)
       const lines = [first, ...(second === undefined ? [] : [second]), ...notes]
-      // The ring rests on one of the capsule's line Buttons, `<key>:<line>`.
-      const isFocused = press !== undefined && e.props.isFocused && focusedCapsule?.replace(/:\d+$/, '') === key
+      // The ring rests on the capsule's one Button, keyed as the capsule.
+      const isFocused = press !== undefined && e.props.isFocused && focusedCapsule === key
       const borderColor = fixedColor ?? (isFocused ? 'text' : 'subtle')
       const parts = [...borderParts]
       const borderLine = (): Line => [faint(' '), ...parts.flatMap((part, index) =>
@@ -1113,20 +1194,21 @@ export const register: Register = on => {
       while (parts.length > 0 && lineCells(borderLine()) > capsuleWidth - 4) parts.pop()
       const detail = parts.length === 0 ? [] : borderLine()
       const compact = key.startsWith('account:') ? { gap: 0, paddingY: 0, marginY: 0 } : {}
-      const label = first.map(seg => seg.text).join('')
+      const label = first.map(seg => seg.text).join('').replace(/\s+/g, ' ').trim()
+      // Each line padded across, between padding columns of its own Text.
+      const edge = (): RenderChildren[] => capsulePadding === 0 ? []
+        : [<Text {...(isFocused ? { color: MUTED } : {})} hover={muteHover}>{' '.repeat(capsulePadding)}</Text>]
+      const block = lines.flatMap((line, index): RenderChildren[] => {
+        const fitted = fitLine(line, room)
+        const row = [...fitted, plain(' '.repeat(Math.max(0, room - lineCells(fitted))))]
+        return [...(index === 0 ? [] : ['\n']), ...edge(), draw(isFocused ? muted(row) : row, room, muteHover), ...edge()]
+      })
       return <Box key={`capsule:${key}`} width={capsuleWidth} flexShrink={0} flexDirection="column" position="relative" {...compact}>
         <Box width={capsuleWidth} flexShrink={0} flexDirection="column" borderStyle="round" borderColor={borderColor}
           hover={press !== undefined && fixedColor === undefined ? { borderColor: 'text' } : undefined}
-          paddingX={capsulePadding} {...compact}>
-          {lines.map((line, index) => {
-            const fitted = fitLine(line, room)
-            if (press === undefined) return draw(fitted, room)
-            // Every line is its own Button, padded to press across the capsule.
-            const row = [...fitted, plain(' '.repeat(Math.max(0, room - lineCells(fitted))))]
-            return <Button key={`${key}:${index}`} plain label={label} hover={muteHover} onPress={press}>
-              {draw(isFocused ? muted(row) : row, room, muteHover)}
-            </Button>
-          })}
+          paddingX={press === undefined ? capsulePadding : 0} {...compact}>
+          {press === undefined ? lines.map(line => draw(fitLine(line, room), room))
+            : <Button key={key} plain label={label} hover={muteHover} onPress={press}>{block}</Button>}
         </Box>
         {detail.length === 0 ? null : <Box position="absolute" top={0}
           left={capsuleWidth - 2 - lineCells(detail)} width={lineCells(detail)}>
@@ -1147,6 +1229,12 @@ export const register: Register = on => {
       if (!agentsObserved) observeAgents(roster, now, false)
       observeChats(conversations)
       await reconcileMotion($)
+      // Ticks skipped while no surface showed the pane: once drawn, catch up
+      // at once rather than at the next poll, outside this drawing.
+      if (missedTick) {
+        missedTick = false
+        $.clock.after(1, () => { void tick($, false) })
+      }
       const tasks = tasksOf(listed, roster)
       // Every account shares the capsule's padded inner width.
       const accountRows = accountLines(held, limits, now, capsuleRoom)
@@ -1169,7 +1257,7 @@ export const register: Register = on => {
       const jobRows = tasks.slice(0, CAPSULES_SHOWN).map(task => {
         const [title, metadata] = taskLines(task, now, capsuleRoom)
         return capsule(taskId(task), title, metadata, async () => {
-          if (!(await isPlaced($))) return
+          if (!(await isVisible($))) return
           if (task.kind === 'agent') await $.ui.view({ agentId: task.agent.id })
           else await openDelegate($, task.job, (await read($, chats)).list)
         })
@@ -1180,7 +1268,7 @@ export const register: Register = on => {
             {held.list.length === 0 && held.error !== null ? draw([faint('hesaplar okunamadı')]) : null}
             {accountRows.map(row => capsule(`account:${row.key}`, row.first, row.body[0], undefined,
               [...row.body.slice(1), ...row.notes], 1, undefined, row.resets))}
-          </Box> : draw(accountSummary(held, limits, innerWidth)),
+          </Box> : draw(accountSummary(held, limits, innerWidth, now)),
             isReadingAccounts ? [{ text: spinner(now), color: 'suggestion' }] : [], async () => {
               const open = await update($, isAccountsOpen, value => !value)
               await $.store.set('isAccountsOpen', open)

@@ -19,21 +19,39 @@ const key = (value: string): string => value.toLowerCase()
 const normalizeDir = (value: string, home: string): string =>
   value.replace(/^~(?=\/|$)/, home).replace(/\/+$/, '')
 
-type SourceCache = { file: string; mtimeMs: number; refreshedAt: number; list?: ChatSession[] }
+// The sessions file changes with every hook event of every tab; cmux's tabs
+// and their processes change far less. The file is read again on each change,
+// cmux and ps only every thirty seconds, or at once for a tab or a process no
+// earlier listing saw.
+type SourceCache = { file: string; mtimeMs: number; raw: string; configText: string }
+type TabsCache = { panels: OpenPanel[]; missing: Set<string>; at: number }
+type PidsCache = { checked: Set<number>; alive: Set<number>; at: number }
 type ChatModel = { model: string; effort: string }
 type TranscriptCache = { size: number; mtimeMs: number; value: ChatModel }
 type Starter = { sessionId: string | null; at: number }
 let sourceCache: SourceCache | null = null
+let tabsCache: TabsCache | null = null
+let pidsCache: PidsCache | null = null
+// Counts every change of the three caches above: the last list parsed names
+// the revision and accounts it was parsed from. The last list answered.
+let revision = 0
+let parsed: { list: ChatSession[]; basis: string } | null = null
+let lastList: ChatSession[] = []
 let isReading = false
 let isSearching = false
 let cmux: string | null = null
+// Each chat's place in the order it was first seen: see inSeenOrder.
+const seen = new Map<string, number>()
+let seenCount = 0
 // Transcript search answers by job id, from refreshes and clicks: a found tab
 // holds while open; a miss or a closed tab is searched again after a minute.
 const starters = new Map<string, Starter>()
 const transcripts = new Map<string, TranscriptCache>()
 
-async function isPlaced($: EngineInterface): Promise<boolean> {
-  return $.ui.panes().then(panes => panes.some(pane => pane.id === PANE && pane.isPlaced)).catch(() => false)
+// Work only for a pane a surface places and shows, not one behind another tab.
+async function isVisible($: EngineInterface): Promise<boolean> {
+  return $.ui.panes().then(panes => panes.some(pane => pane.id === PANE && pane.isPlaced && pane.isShown))
+    .catch(() => false)
 }
 
 async function executable($: EngineInterface): Promise<string> {
@@ -67,13 +85,29 @@ export function parsePanels(stdout: string, workspaceId: string): OpenPanel[] {
   return panels
 }
 
+// Claude Code's Notification hook names its kind and says why: a permission
+// prompt or an MCP elicitation asks the person, while the reminder after a
+// minute at an idle prompt (`idle_prompt`) asks nothing new. A record that
+// keeps neither asks only from inside a turn: the reminder follows its end.
+function notificationAsks(row: Record<string, unknown>, lifecycle: string): boolean {
+  const nested = isRecord(row.notification) ? row.notification : {}
+  const first = (...values: unknown[]): string => values.map(text).find(value => value !== '')?.toLowerCase() ?? ''
+  const kind = first(row.notificationType, row.notification_type, nested.notification_type, nested.type)
+  if (kind !== '') return /permission|elicitation|approv/.test(kind)
+  const message = first(row.notificationMessage, row.message, nested.message)
+  if (message !== '') return /permission|approv|needs your (?:input|answer)/.test(message)
+  return row.turnSettled !== true && lifecycle !== 'idle'
+}
+
 export function chatStatus(row: Record<string, unknown>): ChatSession['status'] {
   // cmux currently writes camelCase needsInput and backgroundWorkPending.
   // Notification can accompany idle runtimeStatus while a prompt is waiting.
   const lifecycle = text(row.agentLifecycle).toLowerCase().replace(/[^a-z]/g, '')
   const runtime = text(row.runtimeStatus).toLowerCase().replace(/[^a-z]/g, '')
-  const waiting = /^(waiting(?:for(?:input|user|permission|approval))?|awaiting(?:user)?input|needs(?:input|approval)|permission(?:prompt|required)?|notification)$/
-  if (text(row.hookEventName) === 'Notification' || waiting.test(lifecycle) || waiting.test(runtime)) return 'waiting'
+  const waiting = /^(waiting(?:for(?:input|user|permission|approval))?|awaiting(?:user)?input|needs(?:input|approval)|permission(?:prompt|required)?)$/
+  if (waiting.test(lifecycle) || waiting.test(runtime)) return 'waiting'
+  const isNotified = text(row.hookEventName) === 'Notification' || lifecycle === 'notification' || runtime === 'notification'
+  if (isNotified && notificationAsks(row, lifecycle)) return 'waiting'
   if (lifecycle === 'running' || runtime === 'running') return 'running'
   return 'idle'
 }
@@ -114,12 +148,12 @@ export function parseSessions(raw: string, options: ParseOptions): ChatSession[]
     if (account.dir) names.set(normalizeDir(account.dir, options.home), account.name)
   }
   const chats: ChatSession[] = []
-  const seen = new Set<string>()
+  const seenSurfaces = new Set<string>()
   for (const [id, row] of sessionRecords(raw)) {
     const surfaceId = text(row.surfaceId)
     const panel = panels.get(key(surfaceId))
     const pid = typeof row.pid === 'number' ? row.pid : 0
-    if (!panel || !options.alivePids.has(pid) || seen.has(key(surfaceId))) continue
+    if (!panel || !options.alivePids.has(pid) || seenSurfaces.has(key(surfaceId))) continue
     const launch = isRecord(row.launchCommand) ? row.launchCommand : {}
     const environment = isRecord(launch.environment) ? launch.environment : {}
     const dir = text(environment.CLAUDE_CONFIG_DIR) || `${options.home}/.claude`
@@ -137,11 +171,22 @@ export function parseSessions(raw: string, options: ParseOptions): ChatSession[]
       isCurrent: id === options.currentSessionId || (options.currentSurfaceId !== '' && key(surfaceId) === key(options.currentSurfaceId)),
       transcriptPath: text(row.transcriptPath),
     })
-    seen.add(key(surfaceId))
+    seenSurfaces.add(key(surfaceId))
   }
   const rank = { waiting: 0, running: 1, idle: 2 }
   // A stable sort preserves the source order within each status group.
   return chats.sort((a, b) => rank[a.status] - rank[b.status])
+}
+
+// A chat keeps the place it first took within its status group, whatever
+// order cmux writes its file in: capsules move only when a status changes,
+// so a click lands on the capsule that was under the pointer.
+function inSeenOrder(list: ChatSession[]): ChatSession[] {
+  const ids = new Set(list.map(chat => chat.id))
+  for (const id of [...seen.keys()]) if (!ids.has(id)) seen.delete(id)
+  for (const chat of list) if (!seen.has(chat.id)) seen.set(chat.id, seenCount++)
+  const rank = { waiting: 0, running: 1, idle: 2 }
+  return [...list].sort((a, b) => rank[a.status] - rank[b.status] || (seen.get(a.id) ?? 0) - (seen.get(b.id) ?? 0))
 }
 
 // MARK: - Chat models
@@ -184,13 +229,15 @@ async function transcriptModel($: EngineInterface, path: string): Promise<ChatMo
   }
 }
 
-async function chatModels($: EngineInterface, list: ChatSession[], home: string): Promise<ChatSession[]> {
+// shiftover keeps each session's model under its cache directory, which
+// honours XDG_CACHE_HOME as its jobs do.
+async function chatModels($: EngineInterface, list: ChatSession[], cacheDir: string): Promise<ChatSession[]> {
   const paths = new Set(list.map(chat => chat.transcriptPath))
   for (const path of transcripts.keys()) if (!paths.has(path)) transcripts.delete(path)
   return Promise.all(list.map(async chat => {
     const [last, current] = await Promise.all([
       transcriptModel($, chat.transcriptPath),
-      $.fs.read(`${home}/.cache/shiftover/sessions/${chat.id}.json`).then(raw => {
+      $.fs.read(`${cacheDir}/sessions/${chat.id}.json`).then(raw => {
         const row: unknown = JSON.parse(raw)
         return isRecord(row) && isRecord(row.model) ? row.model : {}
       }).catch(() => ({} as Record<string, unknown>)),
@@ -201,63 +248,95 @@ async function chatModels($: EngineInterface, list: ChatSession[], home: string)
 
 // MARK: - Reading open tabs
 
+async function listTabs($: EngineInterface, bin: string): Promise<OpenPanel[]> {
+  const workspaces = await $.process.run([bin, 'list-workspaces', '--id-format', 'both'], { timeoutMs: TIMEOUT_MS })
+  if (workspaces.exitCode !== 0) throw new Error('sekmeler okunamadı')
+  const panelResults = await Promise.all(parseWorkspaces(workspaces.stdout).map(async workspaceId => {
+    const result = await $.process.run([bin, 'list-panels', '--workspace', workspaceId, '--id-format', 'both'], { timeoutMs: TIMEOUT_MS })
+    if (result.exitCode !== 0) throw new Error('sekmeler okunamadı')
+    return parsePanels(result.stdout, workspaceId)
+  }))
+  return panelResults.flat()
+}
+
+async function alive($: EngineInterface, pids: number[]): Promise<Set<number>> {
+  const found = new Set<number>()
+  if (pids.length === 0) return found
+  const result = await $.process.run(['ps', '-p', pids.join(','), '-o', 'pid='], { timeoutMs: TIMEOUT_MS })
+  if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error('süreçler okunamadı')
+  for (const pid of result.stdout.trim().split(/\s+/)) {
+    const value = Number(pid)
+    if (Number.isInteger(value) && value > 0) found.add(value)
+  }
+  return found
+}
+
+// Null when there is nothing to say, as while the pane is hidden. A failure
+// keeps the last list and names the error; the next tick tries cmux again.
 export async function refreshChats($: EngineInterface, options: {
-  home: string; configFile: string; accounts: Account[]; now: number; force?: boolean
+  home: string; cacheDir: string; configFile: string; accounts: Account[]; now: number; force?: boolean
 }): Promise<ChatsSnapshot | null> {
   if (isReading) return null
   isReading = true
   const path = `${options.home}/.cmuxterm/claude-hook-sessions.json`
+  const force = options.force === true
+  const isDue = (at: number): boolean => force || options.now - at >= REFRESH_MS
   try {
-    if (!(await isPlaced($))) return null
+    if (!(await isVisible($))) return null
     const stat = await $.fs.stat(path)
-    if (!options.force && sourceCache?.file === path && sourceCache.mtimeMs === stat.mtimeMs &&
-      options.now - sourceCache.refreshedAt < REFRESH_MS) {
-      if (sourceCache.list === undefined) return null
-      const list = await chatModels($, sourceCache.list, options.home)
-      return await isPlaced($) ? { list, at: options.now, error: null } : null
+    if (force || sourceCache?.file !== path || sourceCache.mtimeMs !== stat.mtimeMs) {
+      if (!(await isVisible($))) return null
+      const [raw, configText] = await Promise.all([$.fs.read(path), $.fs.read(options.configFile).catch(() => '')])
+      sourceCache = { file: path, mtimeMs: stat.mtimeMs, raw, configText }
+      revision += 1
     }
-    if (!(await isPlaced($))) return null
-    // A temporarily unavailable cmux socket still follows the same cadence.
-    sourceCache = { file: path, mtimeMs: stat.mtimeMs, refreshedAt: options.now }
-    const bin = await executable($)
-    if (!(await isPlaced($))) { sourceCache = null; return null }
-    const [raw, configText, workspaceResult, currentSessionId, currentSurfaceId] = await Promise.all([
-      $.fs.read(path),
-      $.fs.read(options.configFile).catch(() => ''),
-      $.process.run([bin, 'list-workspaces', '--id-format', 'both'], { timeoutMs: TIMEOUT_MS }),
-      $.session.id().catch(() => ''),
-      $.env.get('CMUX_SURFACE_ID').then(value => value ?? '').catch(() => ''),
-    ])
-    if (workspaceResult.exitCode !== 0) throw new Error('sekmeler okunamadı')
-    if (!(await isPlaced($))) { sourceCache = null; return null }
-    const panelResults = await Promise.all(parseWorkspaces(workspaceResult.stdout).map(async workspaceId => {
-      const result = await $.process.run([bin, 'list-panels', '--workspace', workspaceId, '--id-format', 'both'], { timeoutMs: TIMEOUT_MS })
-      if (result.exitCode !== 0) throw new Error('sekmeler okunamadı')
-      return parsePanels(result.stdout, workspaceId)
-    }))
-    const panels = panelResults.flat()
-    const surfaces = new Set(panels.map(panel => key(panel.surfaceId)))
-    const pids = [...new Set(sessionRecords(raw).map(([, row]) =>
-      surfaces.has(key(text(row.surfaceId))) && typeof row.pid === 'number' && Number.isInteger(row.pid) && row.pid > 0 ? row.pid : 0,
+    const source = sourceCache
+    const records = sessionRecords(source.raw)
+    const surfaces = records.map(([, row]) => key(text(row.surfaceId)))
+    const isListed = (tabs: TabsCache, surface: string): boolean =>
+      tabs.missing.has(surface) || tabs.panels.some(panel => key(panel.surfaceId) === surface)
+    let tabs = tabsCache
+    if (tabs === null || isDue(tabs.at) || !surfaces.every(surface => isListed(tabs!, surface))) {
+      const bin = await executable($)
+      if (!(await isVisible($))) return null
+      const panels = await listTabs($, bin)
+      const open = new Set(panels.map(panel => key(panel.surfaceId)))
+      tabs = tabsCache = { panels, missing: new Set(surfaces.filter(surface => !open.has(surface))), at: options.now }
+      revision += 1
+    }
+    const open = new Set(tabs.panels.map(panel => key(panel.surfaceId)))
+    const pids = [...new Set(records.map(([, row]) =>
+      open.has(key(text(row.surfaceId))) && typeof row.pid === 'number' && Number.isInteger(row.pid) && row.pid > 0 ? row.pid : 0,
     ).filter(pid => pid > 0))]
-    const alivePids = new Set<number>()
-    if (pids.length > 0) {
-      if (!(await isPlaced($))) { sourceCache = null; return null }
-      const result = await $.process.run(['ps', '-p', pids.join(','), '-o', 'pid='], { timeoutMs: TIMEOUT_MS })
-      if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error('süreçler okunamadı')
-      for (const pid of result.stdout.trim().split(/\s+/)) {
-        const value = Number(pid)
-        if (Number.isInteger(value) && value > 0) alivePids.add(value)
-      }
+    let checked = pidsCache
+    if (checked === null || isDue(checked.at) || !pids.every(pid => checked!.checked.has(pid))) {
+      if (!(await isVisible($))) return null
+      checked = pidsCache = { checked: new Set(pids), alive: await alive($, pids), at: options.now }
+      revision += 1
     }
-    if (!(await isPlaced($))) { sourceCache = null; return null }
-    const list = parseSessions(raw, { ...options, configText, panels, alivePids, currentSessionId, currentSurfaceId })
-    sourceCache.list = list
-    const modeled = await chatModels($, list, options.home)
-    return await isPlaced($) ? { list: modeled, at: options.now, error: null } : null
+    const basis = `${revision}\n${options.accounts.map(account => `${account.name}=${account.dir}`).join('\n')}`
+    let list = parsed?.basis === basis && !force ? parsed.list : null
+    if (list === null) {
+      if (!(await isVisible($))) return null
+      const [currentSessionId, currentSurfaceId] = await Promise.all([
+        $.session.id().catch(() => ''),
+        $.env.get('CMUX_SURFACE_ID').then(value => value ?? '').catch(() => ''),
+      ])
+      list = inSeenOrder(parseSessions(source.raw, { ...options, configText: source.configText, panels: tabs.panels,
+        alivePids: checked.alive, currentSessionId, currentSurfaceId }))
+      parsed = { list, basis }
+    }
+    const modeled = await chatModels($, list, options.cacheDir)
+    if (!(await isVisible($))) return null
+    lastList = modeled
+    return { list: modeled, at: options.now, error: null }
   } catch {
-    if (!(await isPlaced($))) { sourceCache = null; return null }
-    return { list: [], at: options.now, error: 'sohbetler okunamadı' }
+    // A transient cmux, ps or half-written file: read all again next tick.
+    sourceCache = null
+    tabsCache = null
+    pidsCache = null
+    if (!(await isVisible($))) return null
+    return { list: lastList, at: options.now, error: 'sohbetler okunamadı' }
   } finally {
     isReading = false
   }
@@ -280,21 +359,33 @@ function isSearchDue(jobId: string, chats: ChatSession[], now: number): boolean 
   return now - held.at >= STARTER_RETRY_MS
 }
 
+// The delegate tool answers with its job as JSON, `"job_id": "<id>"`, which a
+// transcript keeps inside an escaped string. Only that answer names the
+// starter: a tab that merely printed the id, as `shiftover jobs` does, not.
+const jobIdPattern = (id: string): string =>
+  `job_id\\\\?"[[:space:]]*:[[:space:]]*\\\\?"${id.replace(/[.[\]()*+?^$|\\{}]/g, '\\$&')}\\\\?"`
+
 // One grep answers every id: the first open chat, in list order, whose
-// transcript holds it, else null. Null when no transcript can be searched.
+// transcript holds its delegate answer, else null. Null when no transcript
+// can be searched.
 async function searchTranscripts($: EngineInterface, ids: string[], chats: ChatSession[]): Promise<Map<string, string | null> | null> {
   const paths = [...new Set(chats.map(chat => chat.transcriptPath).filter(path => path !== ''))]
   if (paths.length === 0) return null
   let stdout = ''
   try {
     // Exit 1 is no match and 2 an unreadable transcript; the output holds.
-    const args = ['-o', '-H', '-F', '-s', ...ids.flatMap(id => ['-e', id]), '--', ...paths]
+    const args = ['-o', '-H', '-E', '-s', ...ids.flatMap(id => ['-e', jobIdPattern(id)]), '--', ...paths]
     stdout = (await $.process.run(['grep', ...args], { timeoutMs: TIMEOUT_MS })).stdout
   } catch { /* A refused search finds no starter. */ }
   const found = new Map<string, Set<string>>()
   for (const line of stdout.split('\n')) {
-    const id = ids.find(candidate => line.endsWith(`:${candidate}`))
-    if (id !== undefined) found.set(id, (found.get(id) ?? new Set<string>()).add(line.slice(0, -id.length - 1)))
+    // Each line is `<path>:<match>`, the match ending in the id and a quote.
+    const path = paths.filter(candidate => line.startsWith(`${candidate}:`))
+      .sort((a, b) => b.length - a.length)[0]
+    if (path === undefined) continue
+    const match = line.slice(path.length + 1).replace(/\\?"$/, '')
+    const id = ids.find(candidate => match.endsWith(`"${candidate}`))
+    if (id !== undefined) found.set(id, (found.get(id) ?? new Set<string>()).add(path))
   }
   return new Map(ids.map(id => [id, chats.find(chat => found.get(id)?.has(chat.transcriptPath))?.id ?? null]))
 }
@@ -316,12 +407,12 @@ export async function refreshStarters($: EngineInterface, jobs: Job[], chats: Ch
   if (isSearching) return false
   isSearching = true
   try {
-    if (!(await isPlaced($))) return false
+    if (!(await isVisible($))) return false
     const now = await $.clock.now()
     const due = running.filter(job => !hasParent(job) && isSearchDue(job.id, chats, now)).map(job => job.id)
     if (due.length === 0) return false
     const found = await searchTranscripts($, due, chats)
-    if (found === null || !(await isPlaced($))) return false
+    if (found === null || !(await isVisible($))) return false
     let isNew = false
     for (const [id, sessionId] of found) {
       isNew ||= sessionId !== null && starters.get(id)?.sessionId !== sessionId
@@ -336,10 +427,10 @@ export async function refreshStarters($: EngineInterface, jobs: Job[], chats: Ch
 // MARK: - Click to jump
 
 export async function focusChat($: EngineInterface, chat: ChatSession): Promise<void> {
-  if (!(await isPlaced($))) return
+  if (!(await isVisible($))) return
   try {
     const bin = await executable($)
-    if (!(await isPlaced($))) return
+    if (!(await isVisible($))) return
     const selected = await $.process.run([bin, 'select-workspace', '--workspace', chat.workspaceId], { timeoutMs: TIMEOUT_MS })
     if (selected.exitCode !== 0) throw new Error('workspace')
     // Selecting another workspace can detach the originating pane. Finish
@@ -352,7 +443,7 @@ export async function focusChat($: EngineInterface, chat: ChatSession): Promise<
 }
 
 export async function openDelegate($: EngineInterface, job: Job, chats: ChatSession[]): Promise<void> {
-  if (!(await isPlaced($))) return
+  if (!(await isVisible($))) return
   let chat = parentChat(job, chats)
   // No open parent: the cached search answer, searched again once it is due.
   // A cached tab that closed is never focused; another may hold its transcript.
@@ -360,7 +451,7 @@ export async function openDelegate($: EngineInterface, job: Job, chats: ChatSess
     const now = await $.clock.now()
     if (isSearchDue(job.id, chats, now)) {
       const found = await searchTranscripts($, [job.id], chats)
-      if (!(await isPlaced($))) return
+      if (!(await isVisible($))) return
       if (found !== null) starters.set(job.id, { sessionId: found.get(job.id) ?? null, at: now })
     }
     chat = starterChat(job.id, chats)

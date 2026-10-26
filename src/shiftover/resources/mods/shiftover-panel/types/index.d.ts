@@ -17,11 +17,11 @@ export type Limit = {
 }
 
 /**
- * One shiftover account and its windows, or why they could not be read.
+ * One shiftover account and its windows, or why they could not be read. Any
+ * plugin may read $.state, so no email is kept: the pane never shows one.
  */
 export type Account = {
   name: string
-  email: string
   /** The account's Claude config directory, absolute. */
   dir: string
   limits: Limit[]
@@ -39,7 +39,7 @@ export type AccountsSnapshot = {
   list: Account[]
   /** The name of the account this session runs on; null when unknown. */
   current: string | null
-  /** The last successful read, in ms since the epoch; 0 before the first. */
+  /** The last read that changed the list, in ms since the epoch; 0 before the first. */
   at: number
   /** Why the last read failed; null when it succeeded. */
   error: string | null
@@ -71,11 +71,12 @@ export type Job = {
 }
 
 /**
- * The jobs the pane lists: the running ones, then the latest finished ones.
+ * The jobs the pane lists: the running ones, then those finished within the
+ * last day, newest first; ten in all unless more than ten run.
  */
 export type JobsSnapshot = {
   list: Job[]
-  /** The last successful read, in ms since the epoch; 0 before the first. */
+  /** The last read that changed the list, in ms since the epoch; 0 before the first. */
   at: number
   /** Why the last read failed; null when it succeeded. */
   error: string | null
